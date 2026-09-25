@@ -90,6 +90,10 @@ class LineEditor:
         self.prev_rows = 0
         self.is_completion_enabled = True
         self.saw_key_press = True
+        # Submitted inputs, recalled with the up/down arrows.
+        self.history: list[str] = []
+        self._history_index: int | None = None
+        self._history_draft = ""
 
         self._prompt = ""
         self._multiline = False
@@ -236,6 +240,8 @@ class LineEditor:
         self.cursor = 0
         self.prev_rows = 0
         self._multiline = False
+        self._history_index = None
+        self._history_draft = ""
         self.start()
         loop = asyncio.get_running_loop()
         self._submit = loop.create_future()
@@ -425,7 +431,10 @@ class LineEditor:
             self.cursor = len(self.line)
             return
         if name in ("up", "down"):
-            self._move_line(name == "up")
+            # Move between the buffer's own lines first; at the edge, recall history.
+            upward = name == "up"
+            if not self._move_line(upward):
+                self._navigate_history(upward)
             return
         if key.ctrl:
             if name == "k":
@@ -442,8 +451,12 @@ class LineEditor:
             self.line = self.line[: self.cursor] + key.character + self.line[self.cursor:]
             self.cursor += 1
 
-    def _move_line(self, upward: bool) -> None:
-        """Move the cursor between the buffer's logical lines."""
+    def _move_line(self, upward: bool) -> bool:
+        """Move the cursor between the buffer's logical lines.
+
+        Returns ``False`` when the buffer has no line that way, which lets the
+        caller fall back to history navigation.
+        """
         before = self.line[: self.cursor]
         segments = before.split("\n")
         column = len(segments[-1])
@@ -451,9 +464,34 @@ class LineEditor:
         target_index = line_index - 1 if upward else line_index + 1
         all_segments = self.line.split("\n")
         if target_index < 0 or target_index >= len(all_segments):
-            return
+            return False
         offset = sum(len(segment) + 1 for segment in all_segments[:target_index])
         self.cursor = min(offset + column, offset + len(all_segments[target_index]))
+        return True
+
+    def _navigate_history(self, upward: bool) -> None:
+        """Recall a previously submitted input, restoring the draft on the way down."""
+        if not self.history:
+            return
+        if upward:
+            if self._history_index is None:
+                self._history_draft = self.line
+                self._history_index = len(self.history) - 1
+            elif self._history_index > 0:
+                self._history_index -= 1
+            else:
+                return
+        else:
+            if self._history_index is None:
+                return
+            if self._history_index >= len(self.history) - 1:
+                self._history_index = None
+                self.line = self._history_draft
+                self.cursor = len(self.line)
+                return
+            self._history_index += 1
+        self.line = self.history[self._history_index]
+        self.cursor = len(self.line)
 
     def _submit_line(self) -> None:
         """Resolve the pending question and clear the buffer for the next prompt.
@@ -468,5 +506,9 @@ class LineEditor:
         submitted = self.line
         self.line = ""
         self.cursor = 0
+        self._history_index = None
+        self._history_draft = ""
+        if submitted.strip() and (not self.history or self.history[-1] != submitted):
+            self.history.append(submitted)
         if future is not None and not future.done():
             future.set_result(submitted)

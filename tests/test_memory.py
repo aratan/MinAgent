@@ -129,21 +129,21 @@ def test_config_enables_memory_and_defaults_its_path(tmp_path):
     config = load_configuration(
         str(tmp_path), cwd=str(tmp_path), env={"OPENAI_MODEL": "m", "MEMORY_ENABLED": "on"}
     )
-    assert config["memory_enabled"] is True
-    assert config["memory_db_path"] == str(tmp_path / ".agents" / "memory" / "memoria.db")
-    assert config["memory_direct_answer"] is True
+    assert config.memory_enabled is True
+    assert config.memory_db_path == str(tmp_path / ".agents" / "memory" / "memoria.db")
+    assert config.memory_direct_answer is True
 
 
 def test_config_leaves_memory_off_by_default(tmp_path):
     config = load_configuration(str(tmp_path), cwd=str(tmp_path), env={"OPENAI_MODEL": "m"})
-    assert config["memory_enabled"] is False
+    assert config.memory_enabled is False
 
 
 def test_config_can_disable_direct_answers(tmp_path):
     config = load_configuration(
         str(tmp_path), cwd=str(tmp_path), env={"OPENAI_MODEL": "m", "MEMORY_DIRECT_ANSWER": "off"}
     )
-    assert config["memory_direct_answer"] is False
+    assert config.memory_direct_answer is False
 
 
 def test_match_ratio_counts_query_tokens_present_in_a_memory():

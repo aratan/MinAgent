@@ -16,7 +16,7 @@ import pytest
 
 from minagent.app import UI_COLORS, MinAgent, build_terminal_tool
 from minagent.attachments import prepare_user_message
-from minagent.config import load_configuration, parse_directory_entry_limit
+from minagent.config import Config, load_configuration, parse_directory_entry_limit
 from minagent.errors import AgentError
 from minagent.context import chunk_summary_transcript
 from minagent.editor import (
@@ -722,6 +722,51 @@ async def test_submitting_a_line_clears_the_buffer_for_the_next_prompt():
     editor._dispatch(editor._parse("x")[0])
     assert editor.line == ""
     assert len(output.text) == painted, "a key sent without a pending prompt repainted the line"
+
+
+async def test_history_records_submissions_and_skips_blank_lines():
+    """Only real inputs are recalled; blank turns are not history."""
+    output = FakeOutput(80)
+    editor = LineEditor(output, sys.stdin)
+    for value in ("first", "second", "second", "  ", ""):
+        editor.line = value
+        editor.cursor = len(value)
+        editor._submit = asyncio.get_running_loop().create_future()
+        editor._dispatch(editor._parse("\r")[0])
+    assert editor.history == ["first", "second"]
+
+
+def test_up_arrow_recalls_history_and_down_restores_the_draft():
+    output = FakeOutput(80)
+    editor = LineEditor(output, sys.stdin)
+    editor.history = ["/context", "hello"]
+    editor.line = "draft"
+    editor.cursor = len("draft")
+
+    editor._apply_default(editor._parse("\x1b[A")[0])
+    assert editor.line == "hello" and editor.cursor == len("hello")
+    editor._apply_default(editor._parse("\x1b[A")[0])
+    assert editor.line == "/context"
+    # At the oldest entry, another up is a no-op rather than wrapping around.
+    editor._apply_default(editor._parse("\x1b[A")[0])
+    assert editor.line == "/context"
+    editor._apply_default(editor._parse("\x1b[B")[0])
+    assert editor.line == "hello"
+    editor._apply_default(editor._parse("\x1b[B")[0])
+    assert editor.line == "draft"
+
+
+def test_up_arrow_moves_between_buffer_lines_before_recalling_history():
+    """Inside a multiline buffer the arrows edit the text, not the history."""
+    output = FakeOutput(80)
+    editor = LineEditor(output, sys.stdin)
+    editor.history = ["old"]
+    editor.line = "a\nb"
+    editor.cursor = len("a\nb")
+    editor._apply_default(editor._parse("\x1b[A")[0])
+    assert editor.line == "a\nb" and editor.cursor == len("a")
+    editor._apply_default(editor._parse("\x1b[A")[0])
+    assert editor.line == "old"
 
 
 def test_prompt_mode_keeps_the_carriage_return_the_ui_needs():
@@ -1451,7 +1496,7 @@ def test_interrupted_streaming_bubble_is_labelled_incomplete():
     assert "incomplete" in output.text + "".join(buffer)
 
 
-def _configuration(tmp_path, **env: str) -> dict[str, Any]:
+def _configuration(tmp_path, **env: str) -> Config:
     return load_configuration(
         application_root=str(tmp_path),
         cwd=str(tmp_path),
@@ -1460,12 +1505,12 @@ def _configuration(tmp_path, **env: str) -> dict[str, Any]:
 
 
 def test_endpoint_timeout_defaults_to_seven_minutes(tmp_path):
-    assert _configuration(tmp_path)["endpoint_timeout_ms"] == 7 * 60 * 1000
+    assert _configuration(tmp_path).endpoint_timeout_ms == 7 * 60 * 1000
 
 
 def test_endpoint_timeout_is_configurable_in_seconds(tmp_path):
     config = _configuration(tmp_path, OPENAI_TIMEOUT_SECONDS="30")
-    assert config["endpoint_timeout_ms"] == 30_000
+    assert config.endpoint_timeout_ms == 30_000
 
 
 def test_endpoint_timeout_rejects_a_non_positive_value(tmp_path):
@@ -1475,14 +1520,14 @@ def test_endpoint_timeout_rejects_a_non_positive_value(tmp_path):
 
 def test_extension_timeouts_default_to_seven_minutes(tmp_path):
     config = _configuration(tmp_path)
-    assert config["mcp_timeout_ms"] == 7 * 60 * 1000
-    assert config["terminal_timeout_seconds"] == 7 * 60
+    assert config.mcp_timeout_ms == 7 * 60 * 1000
+    assert config.terminal_timeout_seconds == 7 * 60
 
 
 def test_extension_timeouts_are_configurable_in_seconds(tmp_path):
     config = _configuration(tmp_path, MCP_TIMEOUT_SECONDS="5", TERMINAL_TIMEOUT_SECONDS="30")
-    assert config["mcp_timeout_ms"] == 5_000
-    assert config["terminal_timeout_seconds"] == 30
+    assert config.mcp_timeout_ms == 5_000
+    assert config.terminal_timeout_seconds == 30
 
 
 def test_extension_timeouts_reject_a_non_positive_value(tmp_path):

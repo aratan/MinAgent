@@ -245,6 +245,13 @@ async def read_streaming_response(
     return {"payload": payload, "message": message}
 
 
+def _models_url(endpoint: str) -> str:
+    """Derive the OpenAI-compatible ``/models`` URL from the chat endpoint."""
+    if endpoint.endswith("/chat/completions"):
+        return f"{endpoint[: -len('/chat/completions')]}/models"
+    return f"{endpoint.rstrip('/')}/models"
+
+
 async def _iter_chunks(response: Any) -> AsyncIterator[bytes]:
     """Iterate a response body as bytes, accepting httpx or a plain test double."""
     if hasattr(response, "aiter_bytes"):
@@ -266,6 +273,7 @@ class OpenAiClient:
         tools: Sequence[dict[str, Any]],
         timeout_ms: int = DEFAULT_TIMEOUT_MS,
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         if not endpoint or not model:
             raise AgentError("OpenAI client configuration is incomplete.")
@@ -275,6 +283,40 @@ class OpenAiClient:
         self.tools = list(tools)
         self.timeout_ms = timeout_ms
         self.max_response_bytes = max_response_bytes
+        self.transport = transport
+
+    async def list_models(self) -> list[str]:
+        """Return the model identifiers the endpoint advertises.
+
+        Uses the OpenAI-compatible ``/models`` listing, which Ollama serves at
+        ``/v1/models`` and llama.cpp serves at ``/v1/models`` too.
+        """
+        headers = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        timeout = httpx.Timeout(self.timeout_ms / 1000) if self.timeout_ms > 0 else httpx.Timeout(None)
+        try:
+            async with httpx.AsyncClient(
+                timeout=timeout, follow_redirects=False, transport=self.transport
+            ) as client:
+                response = await client.get(_models_url(self.endpoint), headers=headers)
+        except httpx.HTTPError as error:
+            raise AgentError(f"Could not reach the endpoint to list models: {error}") from error
+        if response.status_code >= 400:
+            raise AgentError(f"Endpoint returned HTTP {response.status_code} when listing models.")
+        try:
+            payload = response.json()
+        except ValueError:
+            raise AgentError("Endpoint returned an invalid model list.") from None
+        items = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            raise AgentError("Endpoint returned an unexpected model list.")
+        models: list[str] = []
+        for item in items:
+            identifier = item.get("id") if isinstance(item, dict) else None
+            if isinstance(identifier, str) and identifier:
+                models.append(identifier)
+        return models
 
     async def complete(
         self,

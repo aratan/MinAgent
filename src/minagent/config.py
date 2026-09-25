@@ -9,7 +9,8 @@ from __future__ import annotations
 import os
 import re
 import sys
-from typing import Any, MutableMapping
+from dataclasses import dataclass
+from typing import MutableMapping
 from urllib.parse import urlsplit, urlunsplit
 
 from .errors import AgentError, find_application_root
@@ -143,11 +144,47 @@ def make_endpoint(base_url: str) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, trimmed, parsed.query, ""))
 
 
+@dataclass(frozen=True, slots=True)
+class Config:
+    """Validated MinAgent configuration.
+
+    Immutable and explicitly typed, so a mistyped setting name fails at
+    import/type-check time instead of surfacing as a ``KeyError`` at runtime.
+    """
+
+    application_root: str
+    root_directory: str
+    workspace_name: str
+    endpoint: str
+    api_key: str | None
+    model: str
+    context_window: int
+    endpoint_timeout_ms: int
+    input_modalities: list[str]
+    show_reasoning: bool
+    compaction_reserve_tokens: int
+    compaction_keep_recent_tokens: int
+    workspace_list_limit: int
+    terminal_mode: str
+    terminal_command_shell: str
+    terminal_timeout_seconds: int
+    mcp_timeout_ms: int
+    skills_enabled: bool
+    mcp_enabled: bool
+    memory_enabled: bool
+    memory_db_path: str
+    memory_direct_answer: bool
+    web_search_enabled: bool
+    ollama_api_key: str | None
+    web_search_base_url: str
+    web_search_timeout_seconds: int
+
+
 def load_configuration(
     application_root: str | None = None,
     cwd: str | None = None,
     env: MutableMapping[str, str] | None = None,
-) -> dict[str, Any]:
+) -> Config:
     """Load and validate the full MinAgent configuration."""
     assert_supported_python_version()
     root = application_root or find_application_root()
@@ -189,40 +226,40 @@ def load_configuration(
     else:
         terminal_shell = "/bin/sh"
 
-    return {
-        "application_root": root,
-        "root_directory": root_directory,
-        "workspace_name": workspace_name,
-        "endpoint": make_endpoint(environment.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"),
-        "api_key": (environment.get("OPENAI_API_KEY") or "").strip() or None,
-        "model": model,
-        "context_window": context_window,
-        "endpoint_timeout_ms": endpoint_timeout_seconds * 1000,
-        "input_modalities": parse_input_modalities(environment.get("OPENAI_INPUT")),
-        "compaction_reserve_tokens": min(16384, context_window // 8),
-        "compaction_keep_recent_tokens": min(20000, context_window // 8),
-        "workspace_list_limit": parse_directory_entry_limit(environment.get("WORKSPACE_LIST_LIMIT")),
-        "terminal_mode": parse_terminal_mode(environment.get("TERMINAL_MODE") or "ask"),
-        "terminal_command_shell": terminal_shell,
-        "terminal_timeout_seconds": terminal_timeout_seconds,
-        "mcp_timeout_ms": mcp_timeout_seconds * 1000,
-        "skills_enabled": parse_boolean_setting(environment.get("SKILLS_ENABLED"), "SKILLS_ENABLED", False),
-        "show_reasoning": parse_boolean_setting(
+    return Config(
+        application_root=root,
+        root_directory=root_directory,
+        workspace_name=workspace_name,
+        endpoint=make_endpoint(environment.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"),
+        api_key=(environment.get("OPENAI_API_KEY") or "").strip() or None,
+        model=model,
+        context_window=context_window,
+        endpoint_timeout_ms=endpoint_timeout_seconds * 1000,
+        input_modalities=parse_input_modalities(environment.get("OPENAI_INPUT")),
+        compaction_reserve_tokens=min(16384, context_window // 8),
+        compaction_keep_recent_tokens=min(20000, context_window // 8),
+        workspace_list_limit=parse_directory_entry_limit(environment.get("WORKSPACE_LIST_LIMIT")),
+        terminal_mode=parse_terminal_mode(environment.get("TERMINAL_MODE") or "ask"),
+        terminal_command_shell=terminal_shell,
+        terminal_timeout_seconds=terminal_timeout_seconds,
+        mcp_timeout_ms=mcp_timeout_seconds * 1000,
+        skills_enabled=parse_boolean_setting(environment.get("SKILLS_ENABLED"), "SKILLS_ENABLED", False),
+        show_reasoning=parse_boolean_setting(
             environment.get("OPENAI_SHOW_REASONING"), "OPENAI_SHOW_REASONING", False
         ),
-        "mcp_enabled": parse_boolean_setting(environment.get("MCP_ENABLED"), "MCP_ENABLED", False),
-        "memory_enabled": parse_boolean_setting(environment.get("MEMORY_ENABLED"), "MEMORY_ENABLED", False),
-        "memory_db_path": (environment.get("MEMORY_DB_PATH") or "").strip()
+        mcp_enabled=parse_boolean_setting(environment.get("MCP_ENABLED"), "MCP_ENABLED", False),
+        memory_enabled=parse_boolean_setting(environment.get("MEMORY_ENABLED"), "MEMORY_ENABLED", False),
+        memory_db_path=(environment.get("MEMORY_DB_PATH") or "").strip()
         or os.path.join(root, ".agents", "memory", "memoria.db"),
-        "memory_direct_answer": parse_boolean_setting(
+        memory_direct_answer=parse_boolean_setting(
             environment.get("MEMORY_DIRECT_ANSWER"), "MEMORY_DIRECT_ANSWER", True
         ),
-        "web_search_enabled": parse_boolean_setting(
+        web_search_enabled=parse_boolean_setting(
             environment.get("WEB_SEARCH_ENABLED"), "WEB_SEARCH_ENABLED", False
         ),
-        "ollama_api_key": (environment.get("OLLAMA_API_KEY") or "").strip() or None,
-        "web_search_base_url": (environment.get("WEB_SEARCH_BASE_URL") or "https://ollama.com/api")
+        ollama_api_key=(environment.get("OLLAMA_API_KEY") or "").strip() or None,
+        web_search_base_url=(environment.get("WEB_SEARCH_BASE_URL") or "https://ollama.com/api")
         .strip()
         .rstrip("/"),
-        "web_search_timeout_seconds": web_search_timeout_seconds,
-    }
+        web_search_timeout_seconds=web_search_timeout_seconds,
+    )

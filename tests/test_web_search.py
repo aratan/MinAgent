@@ -118,16 +118,16 @@ def test_config_enables_web_search_with_ollama_defaults(tmp_path):
         cwd=str(tmp_path),
         env={"OPENAI_MODEL": "m", "WEB_SEARCH_ENABLED": "on", "OLLAMA_API_KEY": "secret"},
     )
-    assert config["web_search_enabled"] is True
-    assert config["ollama_api_key"] == "secret"
-    assert config["web_search_base_url"] == "https://ollama.com/api"
-    assert config["web_search_timeout_seconds"] == 120
+    assert config.web_search_enabled is True
+    assert config.ollama_api_key == "secret"
+    assert config.web_search_base_url == "https://ollama.com/api"
+    assert config.web_search_timeout_seconds == 120
 
 
 def test_config_leaves_web_search_off_by_default(tmp_path):
     config = load_configuration(str(tmp_path), cwd=str(tmp_path), env={"OPENAI_MODEL": "m"})
-    assert config["web_search_enabled"] is False
-    assert config["ollama_api_key"] is None
+    assert config.web_search_enabled is False
+    assert config.ollama_api_key is None
 
 
 def _web_app(tmp_path) -> MinAgent:

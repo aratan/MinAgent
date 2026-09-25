@@ -16,7 +16,7 @@ from datetime import datetime
 from typing import Any, Awaitable, Callable, Sequence
 
 from .attachments import prepare_user_message as prepare_attachments
-from .config import load_configuration
+from .config import Config, load_configuration
 from .context import (
     SUMMARY_INSTRUCTIONS,
     chunk_summary_transcript,
@@ -123,6 +123,7 @@ _SKILLS_COMMAND = re.compile(r"^\/skills(?:\s+([\s\S]*))?$", re.IGNORECASE)
 _SKILL_COMMAND = re.compile(r"^\/skill(?:\s+([\s\S]*))?$", re.IGNORECASE)
 _MEMORY_COMMAND = re.compile(r"^\/memory(?:\s+([\s\S]*))?$", re.IGNORECASE)
 _DOCTOR_COMMAND = re.compile(r"^\/doctor(?:\s+([\s\S]*))?$", re.IGNORECASE)
+_MODEL_COMMAND = re.compile(r"^\/model(?:\s+([\s\S]*))?$", re.IGNORECASE)
 _FENCE_STRIP = re.compile(r"^```(?:markdown|md)?\s*\n", re.IGNORECASE)
 _FENCE_STRIP_END = re.compile(r"\n```\s*$")
 _DENIED_RESULT = re.compile(r"^(?:Permission denied by the user|MCP call denied by the user)", re.IGNORECASE)
@@ -173,6 +174,7 @@ SLASH_COMMANDS = [
     {"name": "skill", "description": "Draft a new skill from a description"},
     {"name": "memory", "description": "Show what MinAgent has learned, or forget an entry"},
     {"name": "doctor", "description": "Check the model, context window, and fixed prompt"},
+    {"name": "model", "description": "List the endpoint's models, or switch to one"},
     {"name": "new", "description": "Start a new conversation and clear the screen"},
     {"name": "exit", "description": "Exit MinAgent"},
 ]
@@ -333,6 +335,7 @@ class MinAgent:
         self._use_color = bool(getattr(self._stdout, "isatty", lambda: False)()) and "NO_COLOR" not in os.environ
         self.tools = build_tools()
 
+        self.config: Config | None = None
         self.application_root = ""
         self.root_directory = ""
         self.workspace_name = ""
@@ -445,32 +448,33 @@ class MinAgent:
     async def initialize_configuration(self) -> None:
         """Load configuration and build the clients the session needs."""
         config = load_configuration(find_application_root())
-        self.application_root = config["application_root"]
-        self.root_directory = config["root_directory"]
-        self.workspace_name = config["workspace_name"]
-        self.endpoint = config["endpoint"]
-        self.api_key = config["api_key"]
-        self.model = config["model"]
-        self.context_window = config["context_window"]
-        self.endpoint_timeout_ms = config["endpoint_timeout_ms"]
-        self.input_modalities = config["input_modalities"]
-        self.show_reasoning = config["show_reasoning"]
-        self.compaction_reserve_tokens = config["compaction_reserve_tokens"]
-        self.compaction_keep_recent_tokens = config["compaction_keep_recent_tokens"]
-        self.workspace_list_limit = config["workspace_list_limit"]
-        self.terminal_mode = config["terminal_mode"]
-        self.terminal_command_shell = config["terminal_command_shell"]
-        self.terminal_timeout_seconds = config["terminal_timeout_seconds"]
-        self.mcp_timeout_ms = config["mcp_timeout_ms"]
-        self.skills_enabled = config["skills_enabled"]
-        self.mcp_enabled = config["mcp_enabled"]
-        self.memory_enabled = config["memory_enabled"]
-        self.memory_db_path = config["memory_db_path"]
-        self.memory_direct_answer = config["memory_direct_answer"]
-        self.web_search_enabled = config["web_search_enabled"]
-        self.ollama_api_key = config["ollama_api_key"]
-        self.web_search_base_url = config["web_search_base_url"]
-        self.web_search_timeout_seconds = config["web_search_timeout_seconds"]
+        self.config = config
+        self.application_root = config.application_root
+        self.root_directory = config.root_directory
+        self.workspace_name = config.workspace_name
+        self.endpoint = config.endpoint
+        self.api_key = config.api_key
+        self.model = config.model
+        self.context_window = config.context_window
+        self.endpoint_timeout_ms = config.endpoint_timeout_ms
+        self.input_modalities = config.input_modalities
+        self.show_reasoning = config.show_reasoning
+        self.compaction_reserve_tokens = config.compaction_reserve_tokens
+        self.compaction_keep_recent_tokens = config.compaction_keep_recent_tokens
+        self.workspace_list_limit = config.workspace_list_limit
+        self.terminal_mode = config.terminal_mode
+        self.terminal_command_shell = config.terminal_command_shell
+        self.terminal_timeout_seconds = config.terminal_timeout_seconds
+        self.mcp_timeout_ms = config.mcp_timeout_ms
+        self.skills_enabled = config.skills_enabled
+        self.mcp_enabled = config.mcp_enabled
+        self.memory_enabled = config.memory_enabled
+        self.memory_db_path = config.memory_db_path
+        self.memory_direct_answer = config.memory_direct_answer
+        self.web_search_enabled = config.web_search_enabled
+        self.ollama_api_key = config.ollama_api_key
+        self.web_search_base_url = config.web_search_base_url
+        self.web_search_timeout_seconds = config.web_search_timeout_seconds
 
         self._use_color = bool(getattr(self._stdout, "isatty", lambda: False)()) and "NO_COLOR" not in os.environ
         # Skills authored at runtime go to the project's own .agents/skills directory.
@@ -1839,6 +1843,59 @@ class MinAgent:
         await self.refresh_workspace_snapshot()
         self.print_doctor_panel()
 
+    def select_model(self, name: str) -> None:
+        """Switch the active model for later requests and report the change."""
+        name = name.strip()
+        if not name:
+            raise AgentError("Usage: /model <name>")
+        if name == self.model:
+            self.ui_print_wrapped((("Already using ", "muted", False), (name, "pale", True)))
+            return
+        self.model = name
+        if self.open_ai_client is not None:
+            self.open_ai_client.model = name
+        # A different model has its own context window and usage accounting.
+        self.last_prompt_tokens = None
+        self.last_usage_message_count = 0
+        self.refresh_system_prompt()
+        note = ""
+        hint = model_context_hint(name)
+        if hint is not None:
+            note = f" · effective window {self._token_count(self.effective_context_window())} tokens"
+        self.ui_print_wrapped((("Model switched to ", "muted", False), (name, "pale", True), (note, "muted", False)))
+
+    async def handle_model_command(self, argument: str) -> None:
+        """Run ``/model``: list the endpoint's models, or switch to the one given."""
+        argument = argument.strip()
+        if argument:
+            self.select_model(argument)
+            return
+        try:
+            models = await self.open_ai_client.list_models()
+        except AgentError as error:
+            self.ui_print_wrapped((("Could not list models: ", "warning", False), (str(error), "pale", False)))
+            self.ui_print_wrapped(
+                (
+                    ("Current model ", "muted", False),
+                    (self.model, "pale", True),
+                    (" · switch with ", "muted", False),
+                    ("/model <name>", "cyan", False),
+                )
+            )
+            return
+        self.print("")
+        self.ui_print_wrapped((("╭─ MODELS", "magenta", True),))
+        if not models:
+            self.ui_print_wrapped((("│ ", "magenta", False), ("The endpoint reported no models.", "muted", False)))
+        for name in models:
+            if name == self.model:
+                self.ui_print_wrapped(
+                    (("│ ", "magenta", False), ("● ", "cyan", False), (name, "cyan", True), ("  current", "muted", False))
+                )
+            else:
+                self.ui_print_wrapped((("│ ", "magenta", False), ("○ ", "muted", False), (name, "pale", False)))
+        self.ui_print_wrapped((("╰─ ", "magenta", False), ("/model <name>", "muted", False)))
+
     def prompt_overhead_warning(self) -> str:
         """Describe a fixed prompt that crowds the configured window, or return ""."""
         if self.context_window <= 0:
@@ -2438,6 +2495,7 @@ class MinAgent:
                     skill_match = _SKILL_COMMAND.match(text_input)
                     memory_match = _MEMORY_COMMAND.match(text_input)
                     doctor_match = _DOCTOR_COMMAND.match(text_input)
+                    model_match = _MODEL_COMMAND.match(text_input)
                     try:
                         if prompt.lower() == "/context":
                             state["selected_files"].clear()
@@ -2504,6 +2562,12 @@ class MinAgent:
                             self.clear_submitted_input(text_input, PROMPT_VISIBLE_LENGTH, input_rows_to_clear)
                             self.print_user_bubble(text_input)
                             await self.handle_doctor_command(doctor_match.group(1) or "")
+                            continue
+                        if model_match:
+                            state["selected_files"].clear()
+                            self.clear_submitted_input(text_input, PROMPT_VISIBLE_LENGTH, input_rows_to_clear)
+                            self.print_user_bubble(text_input)
+                            await self.handle_model_command(model_match.group(1) or "")
                             continue
                         if init_match:
                             state["selected_files"].clear()

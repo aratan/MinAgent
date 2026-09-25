@@ -94,7 +94,7 @@ When enabled, the inventory is refreshed before each model request. If the works
 
 ## Input, multiline text, and file attachments
 
-Press `Ctrl+J` to insert a newline without sending the message. Multiline text pasted into the prompt keeps its line breaks and does not submit one request per line. Press Enter to send.
+Press `Ctrl+J` to insert a newline without sending the message. Multiline text pasted into the prompt keeps its line breaks and does not submit one request per line. Press Enter to send. Press ↑/↓ to recall previous inputs: the arrows first move between the buffer's own lines, then step back through the session's submitted inputs, and stepping past the newest entry restores what you were typing. While `@` or `/` autocomplete is open, ↑/↓ select a candidate instead.
 
 While a response is streaming the prompt is not waiting for input, so keystrokes are ignored rather than collected into the next line; `Esc` still stops the request. A lone `Esc` is recognised after a 50 ms grace period, which is what tells it apart from the escape sequences that arrow keys and other special keys send.
 
@@ -114,6 +114,8 @@ Type `/` to open command autocomplete. Use ↑/↓ to choose a command and Enter
 - `/skills [reload | show <name> | delete <name>]`: list the registered skills, force a rescan, print one skill's instructions, or delete a skill that lives inside the workspace.
 - `/memory [forget <id>]`: show how many memories exist, their success and reuse counts, and the strongest entries; `forget` deletes one entry.
 - `/skill <what it should do>`: ask the model to draft a `SKILL.md` for that capability, register it immediately, and report the resulting name and path. An unfinished draft is reported; nothing is registered unless it validates.
+- `/model [name]`: list the models the endpoint advertises through its OpenAI-compatible `/models` endpoint (Ollama and llama.cpp both expose it), marking the current one, or switch to `name` when given. Switching is in-session only; it does not edit `.env`.
+- `/doctor`: check the model, the context window, and the fixed prompt overhead.
 - `/new`: clear the screen and start a new conversation.
 - `/exit`: close MinAgent.
 
