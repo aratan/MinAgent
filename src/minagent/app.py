@@ -1584,7 +1584,7 @@ class MinAgent:
         signal: CancellationToken | None = None,
     ) -> str:
         """Summarize history, chunking the transcript when it exceeds one request."""
-        max_input_chars = self.context_window * 7 // 10
+        max_input_chars = self.effective_context_window() * 7 // 10
         summary_allowance = min(16_000, int(max_input_chars) // 4)
         transcript_allowance = (
             int(max_input_chars) - len(SUMMARY_INSTRUCTIONS) - summary_allowance - len(custom_instructions or "") - 1500
@@ -1613,7 +1613,7 @@ class MinAgent:
                 256,
                 min(
                     int(0.8 * self.compaction_reserve_tokens),
-                    self.context_window // 8,
+                    self.effective_context_window() // 8,
                     summary_allowance // 3,
                 ),
             )
@@ -1935,8 +1935,15 @@ class MinAgent:
             self.ui_print_wrapped((("Prompt size ", "warning", True), (note, "warning", False)))
 
     async def compact_automatically_if_needed(self, signal: CancellationToken | None) -> None:
-        """Compact history when the estimated context passes the threshold."""
-        threshold = self.context_window - self.compaction_reserve_tokens
+        """Compact history when the estimated context passes the threshold.
+
+        The budget follows the window actually usable by the model, so a model
+        name that states a smaller window than OPENAI_CONTEXT_WINDOW still
+        compacts before the server truncates the prompt.
+        """
+        window = self.effective_context_window()
+        reserve = min(self.compaction_reserve_tokens, max(1, window // 8))
+        threshold = window - reserve
         fixed_context_tokens = self.fixed_context_tokens()
         if fixed_context_tokens >= threshold:
             raise AgentError(
@@ -1949,7 +1956,8 @@ class MinAgent:
         if estimated_tokens <= threshold:
             return
         conversation_messages = self.messages[1:]
-        cut_index = find_compaction_cut_point(conversation_messages, self.compaction_keep_recent_tokens)
+        keep_recent = min(self.compaction_keep_recent_tokens, max(1, window // 8))
+        cut_index = find_compaction_cut_point(conversation_messages, keep_recent)
         if cut_index <= 0:
             raise AgentError(
                 "The current request and recent conversation exceed the compaction threshold; send a shorter request or reduce the retained conversation."

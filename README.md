@@ -119,7 +119,7 @@ Type `/` to open command autocomplete. Use ↑/↓ to choose a command and Enter
 - `/new`: clear the screen and start a new conversation.
 - `/exit`: close MinAgent.
 
-Compaction also runs automatically as the configured context window fills. The summary preserves file paths, decisions, unresolved work, user preferences, and verification state. It reduces conversation history; the system prompt, workspace guidance, inventory, and tool schemas remain. `/compact` reports both history and total context before and after, and `/context` shows the fixed prompt and tool-schema estimates.
+Compaction also runs automatically as the usable context window fills. The usable window is the smaller of `OPENAI_CONTEXT_WINDOW` and any size stated by the model name (for example `...-8k`), so a model whose name states a smaller window compacts before the server truncates the prompt. The summary preserves file paths, decisions, unresolved work, user preferences, and verification state. It reduces conversation history; the system prompt, workspace guidance, inventory, and tool schemas remain. `/compact` reports both history and total context before and after, and `/context` shows the fixed prompt and tool-schema estimates.
 
 ## Workspace tools
 

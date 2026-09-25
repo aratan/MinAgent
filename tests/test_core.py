@@ -534,6 +534,43 @@ def test_compaction_splits_long_transcripts_into_bounded_requests():
     assert chunks[0].startswith("[user]")
 
 
+async def test_automatic_compaction_uses_the_model_named_window():
+    """The budget must follow the window the model states, not OPENAI_CONTEXT_WINDOW.
+
+    The model name says 8k while the configured window is 32768, so a threshold
+    taken from the configured value would let the server truncate the request
+    before compaction ever ran.
+    """
+    app, output = _make_app(80)  # model "bonsai27b-8k:latest"
+    assert app.context_window == 32768
+    assert app.effective_context_window() == 8192
+    app.compaction_reserve_tokens = 4096
+    app.compaction_keep_recent_tokens = 4096
+    app.messages.extend(
+        {"role": "user" if index % 2 else "assistant", "content": "x" * 2000}
+        for index in range(40)
+    )
+    summaries: list[str] = []
+
+    async def fake_summary(*_args, **_kwargs) -> str:
+        summaries.append("summarized")
+        return "earlier history summary"
+
+    app.generate_compaction_summary = fake_summary  # type: ignore[method-assign]
+    await app.compact_automatically_if_needed(None)
+    assert summaries == ["summarized"], "automatic compaction did not run for the model-named window"
+    assert "Automatic compaction" in output.text
+    assert app.compacted_summary == "earlier history summary"
+
+
+async def test_automatic_compaction_skips_a_context_that_fits():
+    app, output = _make_app(80)
+    app.compaction_reserve_tokens = 4096
+    app.messages.append({"role": "user", "content": "hola"})
+    await app.compact_automatically_if_needed(None)
+    assert "Automatic compaction" not in output.text
+
+
 # ----------------------------------------------------------------- secrets
 
 
