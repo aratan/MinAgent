@@ -5,8 +5,25 @@
 # Local MCP configuration may contain commands, paths, headers, or credentials.
 .minagent/mcp.json
 
-# Runtime and editor files
+# Local knowledge memory database and its write-ahead log.
+.minagent/memory.db
+.minagent/memory.db-*
+.agents/memory/*.db
+.agents/memory/*.db-*
+
+# Python / uv
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+
+# Dependencies of the local MCP servers in .agents/mcp/
 node_modules/
+
 *.log
 .DS_Store
 Thumbs.db
