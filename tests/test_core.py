@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from minagent.app import UI_COLORS, MinAgent, build_terminal_tool
+from minagent.app import UI_COLORS, MinAgent, _MISSING_CAPABILITY_REQUEST, build_terminal_tool
 from minagent.attachments import prepare_user_message
 from minagent.config import Config, load_configuration, parse_directory_entry_limit
 from minagent.errors import AgentError
@@ -561,6 +561,18 @@ async def test_automatic_compaction_uses_the_model_named_window():
     assert summaries == ["summarized"], "automatic compaction did not run for the model-named window"
     assert "Automatic compaction" in output.text
     assert app.compacted_summary == "earlier history summary"
+
+
+def test_a_huge_tool_result_is_bounded_to_the_window():
+    """One command must not be able to fill the whole context window on its own."""
+    app, _output = _make_app(80)  # effective window 8192
+    assert app.effective_context_window() == 8192
+    bounded = app.bound_tool_result("x" * 50_000)
+    assert len(bounded) < 50_000
+    assert "tool output truncated" in bounded
+    assert bounded.startswith("x" * 100)
+    # A result that already fits is returned untouched.
+    assert app.bound_tool_result("hola") == "hola"
 
 
 async def test_automatic_compaction_skips_a_context_that_fits():
@@ -1263,6 +1275,27 @@ async def test_a_refusal_without_tool_calls_is_retried_with_the_available_tools(
     assert len(notes) == 1
     assert "run_terminal" in notes[0] and "write_skill" in notes[0]
     assert "Fri Sep 25 18:03:12 CEST 2026" in [m["content"] for m in app.messages if m["role"] == "tool"]
+
+
+@pytest.mark.parametrize(
+    "phrasing",
+    [
+        "No tengo acceso al sistema.",
+        "Lo siento, no tengo capacidad para acceder a internet ni ejecutar comandos.",
+        "No puedo ejecutar comandos de terminal.",
+        "No puedo buscar en internet noticias de hoy.",
+        "I cannot access the internet or run commands.",
+        "I don't have the ability to browse the web.",
+        "I am unable to reach the network.",
+    ],
+)
+def test_capability_refusals_are_detected_in_spanish_and_english(phrasing):
+    assert _MISSING_CAPABILITY_REQUEST.search(phrasing), phrasing
+
+
+def test_a_normal_answer_is_not_mistaken_for_a_refusal():
+    assert not _MISSING_CAPABILITY_REQUEST.search("He resumido las tres noticias principales.")
+    assert not _MISSING_CAPABILITY_REQUEST.search("The build passes and the tests are green.")
 
 
 async def test_a_second_refusal_is_returned_instead_of_looping(tmp_path, monkeypatch):

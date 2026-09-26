@@ -131,11 +131,21 @@ _FENCE_STRIP = re.compile(r"^```(?:markdown|md)?\s*\n", re.IGNORECASE)
 _FENCE_STRIP_END = re.compile(r"\n```\s*$")
 _DENIED_RESULT = re.compile(r"^(?:Permission denied by the user|MCP call denied by the user)", re.IGNORECASE)
 
-# A reply that refuses work the tools can already do ("no tengo acceso al sistema").
+# A reply that refuses work the tools can already do. Covers the common Spanish
+# and English phrasings for "I cannot access the internet / run commands", not
+# only the literal "no tengo acceso", so the corrective nudge actually fires.
 _MISSING_CAPABILITY_REQUEST = re.compile(
     r"(?:"
-    r"no tengo acceso|no puedo acceder|no dispongo de acceso|no tengo forma de acceder|"
-    r"i (?:do not|don't) have access|i (?:cannot|can't) access|have no access to|no access to"
+    r"no tengo (?:acceso|capacidad|habilidad|forma de acceder|conexi[oó]n)"
+    r"|no puedo (?:acceder|conectarme|navegar|buscar en (?:internet|la web|la red)"
+    r"|ejecutar (?:comandos|el terminal)|usar (?:el terminal|la terminal))"
+    r"|no dispongo de acceso|no soy capaz de (?:acceder|ejecutar|navegar)"
+    r"|sin acceso a (?:internet|la red)"
+    r"|i (?:do not|don't) have (?:access|the ability|any way)"
+    r"|i (?:cannot|can't|am unable to|'m unable to) (?:access|run|execute|browse|reach|connect)"
+    r"|i lack (?:access|the ability)"
+    r"|no (?:internet|web|network) access"
+    r"|unable to (?:access|browse|run|execute)"
     r")",
     re.IGNORECASE,
 )
@@ -1121,7 +1131,8 @@ class MinAgent:
         if self.terminal_mode != "off":
             lines.append(
                 "run_terminal runs shell commands on this host: use it for the clock (`date`), the environment, "
-                "installed programs, or a network check."
+                "installed programs, and network work such as `curl` for an HTTP request or an RSS feed. "
+                "It does reach the internet when the host does."
             )
         if self.skills_enabled:
             lines.append(
@@ -1670,6 +1681,26 @@ class MinAgent:
         self._stdout.write("\x1b[2J\x1b[H")
         self.print_startup_panel()
         self.ui_print_wrapped((("◆ New conversation ready.", "cyan", True),))
+
+    def bound_tool_result(self, text: str) -> str:
+        """Keep one tool result from filling the whole context window.
+
+        A single command can emit tens of thousands of characters, which alone
+        exceeds a small window and would force a compaction before the model can
+        answer. Results are capped to roughly a quarter of the usable window
+        (four characters per token), with a note so the model knows to narrow it.
+        """
+        window = self.effective_context_window()
+        if window <= 0:
+            return text
+        max_chars = max(4000, window)
+        if len(text) <= max_chars:
+            return text
+        return (
+            text[:max_chars]
+            + f"\n\n[tool output truncated to {max_chars} characters to fit the {window}-token context "
+            "window; narrow the command or read in parts]"
+        )
 
     def fixed_context_tokens(self) -> int:
         """Approximate the tokens sent with every request, whatever the conversation holds."""
@@ -2459,13 +2490,17 @@ class MinAgent:
                 if isinstance(result, str) and _DENIED_RESULT.match(result):
                     denied_tool_calls += 1
                 if isinstance(result, dict) and "tool_text" in result:
-                    self.messages.append({"role": "tool", "tool_call_id": call_id, "content": result["tool_text"]})
+                    self.messages.append(
+                        {"role": "tool", "tool_call_id": call_id, "content": self.bound_tool_result(result["tool_text"])}
+                    )
                     if result.get("image"):
                         pending_images.append(result["image"])
                     if isinstance(result.get("images"), list):
                         pending_images.extend(result["images"])
                 else:
-                    self.messages.append({"role": "tool", "tool_call_id": call_id, "content": str(result)})
+                    self.messages.append(
+                        {"role": "tool", "tool_call_id": call_id, "content": self.bound_tool_result(str(result))}
+                    )
                 if (signal is not None and signal.cancelled) and call_index + 1 < len(calls):
                     self._append_canceled_tool_messages(calls[call_index + 1:])
                     break
