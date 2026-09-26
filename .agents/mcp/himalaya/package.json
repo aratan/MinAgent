@@ -1,0 +1,12 @@
+{
+  "name": "himalaya-mcp-server",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Servidor MCP STDIO que expone la CLI himalaya v2 como herramientas para MinAgent.",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "//": "El SDK de MCP y zod se resuelven desde ../package.json, que es quien los instala."
+}
