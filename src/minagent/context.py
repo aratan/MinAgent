@@ -7,6 +7,8 @@ conversation inside the configured context window.
 
 from __future__ import annotations
 
+import json
+import re
 from collections.abc import Sequence
 from typing import Any
 
@@ -14,6 +16,42 @@ from .errors import AgentError
 from .jsutil import byte_length, json_stringify
 
 DEFAULT_IMAGE_TOKEN_ESTIMATE = 4800
+
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_TRAILING_SPACES = re.compile(r"[ \t]+\n")
+_MULTI_BLANK = re.compile(r"\n{3,}")
+_LONG_SPACES = re.compile(r"[ \t]{2,}")
+
+
+def _minify_json(text: str) -> str:
+    """Re-serialise a whole-JSON payload compactly when that is clearly smaller."""
+    stripped = text.strip()
+    if len(stripped) < 200 or stripped[0] not in "[{":
+        return text
+    try:
+        parsed = json.loads(stripped)
+    except ValueError:
+        return text
+    compact = json_stringify(parsed)
+    return compact if len(compact) < len(text) else text
+
+
+def compress_for_context(text: str) -> str:
+    """Shrink text without losing meaning so more of it fits the context window.
+
+    Strips ANSI colour, normalises line endings, removes trailing and repeated
+    spaces, collapses runs of blank lines, and minifies pretty-printed JSON.
+    These are lossless for meaning, unlike truncation, and cut common tool output
+    (tables, diffs, JSON dumps) by a meaningful share.
+    """
+    if not text:
+        return text
+    text = _ANSI.sub("", text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = _TRAILING_SPACES.sub("\n", text)
+    text = _MULTI_BLANK.sub("\n\n", text)
+    text = _LONG_SPACES.sub(" ", text)
+    return _minify_json(text)
 
 SUMMARY_INSTRUCTIONS = """Create a concise checkpoint. Use these sections:
 
@@ -83,8 +121,10 @@ def serialize_for_summary(conversation_messages: Sequence[dict[str, Any]]) -> st
                 if isinstance(call, dict)
             ]
             content += f"{chr(10) if content else ''}[Tool calls: {'; '.join(calls)}]"
-        if message.get("role") == "tool" and len(content) > 2000:
-            content = f"{content[:2000]}\n[Tool result truncated for compaction.]"
+        if message.get("role") == "tool":
+            content = compress_for_context(content)
+            if len(content) > 2000:
+                content = f"{content[:2000]}\n[Tool result truncated for compaction.]"
         rendered.append(f"[{message.get('role')}] {content}")
     return "\n\n".join(rendered)
 

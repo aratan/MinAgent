@@ -17,7 +17,7 @@ import pytest
 from minagent.app import _MISSING_CAPABILITY_REQUEST, UI_COLORS, MinAgent, build_terminal_tool
 from minagent.attachments import prepare_user_message
 from minagent.config import Config, load_configuration, parse_directory_entry_limit
-from minagent.context import chunk_summary_transcript
+from minagent.context import chunk_summary_transcript, compress_for_context
 from minagent.editor import (
     AUTOCOMPLETE_PANEL_ROWS,
     Key,
@@ -574,6 +574,33 @@ def test_a_huge_tool_result_is_bounded_to_the_window():
     assert bounded.startswith("x" * 100)
     # A result that already fits is returned untouched.
     assert app.bound_tool_result("hola") == "hola"
+
+
+def test_a_truncated_tool_result_keeps_the_tail_for_the_error():
+    app, _output = _make_app(80)
+    bounded = app.bound_tool_result("START" + "x" * 30_000 + "FAILED: no such file")
+    assert bounded.startswith("START")
+    assert bounded.rstrip().endswith("FAILED: no such file")
+    assert "characters omitted" in bounded
+
+
+def test_context_compression_strips_ansi_and_collapses_whitespace():
+    raw = "\x1b[31mred\x1b[0m\n\n\n\nline   with    spaces  \n"
+    out = compress_for_context(raw)
+    assert "\x1b" not in out
+    assert "line with spaces" in out
+    assert "\n\n\n" not in out
+
+
+def test_context_compression_minifies_a_json_payload():
+    raw = json.dumps({"a": 1, "items": list(range(60))}, indent=4)
+    assert len(raw) >= 200
+    out = compress_for_context(raw)
+    assert out == '{"a":1,"items":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59]}'
+
+
+def test_context_compression_leaves_plain_text_intact():
+    assert compress_for_context("hola mundo") == "hola mundo"
 
 
 async def test_automatic_compaction_skips_a_context_that_fits():

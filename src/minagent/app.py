@@ -21,6 +21,7 @@ from .config import Config, load_configuration
 from .context import (
     SUMMARY_INSTRUCTIONS,
     chunk_summary_transcript,
+    compress_for_context,
     estimate_message_tokens,
     estimate_text_tokens,
     find_compaction_cut_point,
@@ -1490,8 +1491,12 @@ class MinAgent:
         display_label: str = "Compaction",
         signal: CancellationToken | None = None,
     ) -> str:
-        """Summarize history, chunking the transcript when it exceeds one request."""
-        max_input_chars = self.effective_context_window() * 7 // 10
+        """Summarize history, chunking the transcript when it exceeds one request.
+
+        ``max_input_chars`` is a character budget, so the token window is scaled
+        by roughly four characters per token before taking the 70% share.
+        """
+        max_input_chars = self.effective_context_window() * 4 * 7 // 10
         summary_allowance = min(16_000, int(max_input_chars) // 4)
         transcript_allowance = (
             int(max_input_chars) - len(SUMMARY_INSTRUCTIONS) - summary_allowance - len(custom_instructions or "") - 1500
@@ -1579,16 +1584,21 @@ class MinAgent:
         answer. Results are capped to roughly a quarter of the usable window
         (four characters per token), with a note so the model knows to narrow it.
         """
+        text = compress_for_context(text)
         window = self.effective_context_window()
         if window <= 0:
             return text
         max_chars = max(4000, window)
         if len(text) <= max_chars:
             return text
+        head = max_chars * 3 // 4
+        tail = max_chars - head
+        omitted = len(text) - max_chars
         return (
-            text[:max_chars]
-            + f"\n\n[tool output truncated to {max_chars} characters to fit the {window}-token context "
-            "window; narrow the command or read in parts]"
+            text[:head]
+            + f"\n\n[tool output truncated: {omitted} characters omitted to fit the {window}-token "
+            "context window; narrow the command or read in parts]\n\n"
+            + text[-tail:]
         )
 
     def fixed_context_tokens(self) -> int:
@@ -2008,10 +2018,22 @@ class MinAgent:
             ((f"Automatic compaction · ~{self._token_count(estimated_tokens)} tokens", "magenta", True),)
         )
         self.ui_print_wrapped((("Summarizing earlier history.", "muted", False),))
-        summary = await self.generate_compaction_summary(
-            conversation_messages[:cut_index], self.compacted_summary, "", "Automatic compaction", signal
-        )
         recent_messages = conversation_messages[cut_index:]
+        try:
+            summary = await self.generate_compaction_summary(
+                conversation_messages[:cut_index], self.compacted_summary, "", "Automatic compaction", signal
+            )
+        except AgentError as error:
+            # A failed summary must not end the turn: drop the summarized part and
+            # keep the previous summary so the request can still go out.
+            self.ui_print_wrapped(
+                (
+                    ("Could not summarize the older history (", "warning", False),
+                    (str(error), "pale", False),
+                    ("); dropping it for this turn instead.", "warning", False),
+                )
+            )
+            summary = self.compacted_summary
         self.replace_conversation(recent_messages, summary)
         compacted_tokens = self.estimate_current_context_tokens()
         self.ui_print_wrapped(

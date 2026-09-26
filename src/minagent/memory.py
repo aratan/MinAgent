@@ -68,6 +68,8 @@ CREATE TABLE IF NOT EXISTS memories (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS memories_kind_title ON memories(kind, title_key);
 CREATE INDEX IF NOT EXISTS memories_confidence ON memories(confidence DESC);
+CREATE INDEX IF NOT EXISTS memories_updated ON memories(updated_at DESC);
+CREATE INDEX IF NOT EXISTS memories_last_used ON memories(last_used_at);
 CREATE TABLE IF NOT EXISTS outcomes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
@@ -201,7 +203,11 @@ class MemoryStore:
         connection.row_factory = sqlite3.Row
         try:
             connection.execute("PRAGMA journal_mode=WAL")
+            # NORMAL is durable with WAL and much faster than the FULL default.
+            connection.execute("PRAGMA synchronous=NORMAL")
             connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute("PRAGMA busy_timeout=5000")
+            connection.execute("PRAGMA temp_store=MEMORY")
             yield connection
             connection.commit()
         finally:
@@ -228,8 +234,23 @@ class MemoryStore:
                     self.fts_enabled = True
                 except sqlite3.OperationalError:
                     self.fts_enabled = False
+            self._maintenance_sync()
         except sqlite3.Error as error:
             raise AgentError(f"Could not open the memory database: {error}") from error
+
+    def _maintenance_sync(self) -> None:
+        """Refresh planner statistics and reclaim space when the file is bloated."""
+        connection = sqlite3.connect(self.path, timeout=10)
+        try:
+            connection.execute("PRAGMA optimize")
+            page_count = connection.execute("PRAGMA page_count").fetchone()[0]
+            free_pages = connection.execute("PRAGMA freelist_count").fetchone()[0]
+            if page_count and free_pages / page_count > 0.2:
+                connection.execute("VACUUM")
+        except sqlite3.Error:
+            pass
+        finally:
+            connection.close()
 
     # ------------------------------------------------------------- search
 
