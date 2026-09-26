@@ -14,7 +14,13 @@ from typing import Any
 
 import pytest
 
-from minagent.app import _MISSING_CAPABILITY_REQUEST, UI_COLORS, MinAgent, build_terminal_tool
+from minagent.app import (
+    _ANNOUNCED_ACTION,
+    _MISSING_CAPABILITY_REQUEST,
+    UI_COLORS,
+    MinAgent,
+    build_terminal_tool,
+)
 from minagent.attachments import prepare_user_message
 from minagent.config import Config, load_configuration, parse_directory_entry_limit
 from minagent.context import chunk_summary_transcript, compress_for_context
@@ -1341,6 +1347,60 @@ async def test_a_second_refusal_is_returned_instead_of_looping(tmp_path, monkeyp
     )
     assert await app.request_assistant_turn(None) == refusal
     notes = [message for message in app.messages if message["role"] == "user" and "system-note" in str(message["content"])]
+    assert len(notes) == 1
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Voy a listar los correos de tu bandeja Inbox.",
+        "Primero comprobaré la cuenta. A continuación listaré los mensajes.",
+        "I'll read your inbox now.",
+        "Let me fetch the messages.",
+    ],
+)
+def test_announced_plans_are_detected(text):
+    assert _ANNOUNCED_ACTION.search(text), text
+
+
+async def test_an_announced_plan_without_a_tool_call_is_retried(tmp_path, monkeypatch):
+    """A model that describes the work instead of doing it is nudged once."""
+    app, commands = _refusal_app(tmp_path, monkeypatch)
+    await app.initialize_optional_features()
+    app.messages.append({"role": "user", "content": "Lee mi correo con himalaya."})
+    _queued_responses(
+        app,
+        monkeypatch,
+        [
+            {
+                "payload": {"usage": {}},
+                "message": {"content": "Voy a listar los correos de tu bandeja Inbox.", "tool_calls": []},
+            },
+            {
+                "payload": {"usage": {}},
+                "message": {
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "function": {
+                                "name": "run_terminal",
+                                "arguments": json.dumps({"command": "himalaya envelope list -m Inbox -s 3"}),
+                            },
+                        }
+                    ],
+                },
+            },
+            {"payload": {"usage": {}}, "message": {"content": "Estos son tus correos.", "tool_calls": []}},
+        ],
+    )
+    assert await app.request_assistant_turn(None) == "Estos son tus correos."
+    assert commands == ["himalaya envelope list -m Inbox -s 3"]
+    notes = [
+        message
+        for message in app.messages
+        if message["role"] == "user" and "system-note" in str(message["content"])
+    ]
     assert len(notes) == 1
 
 

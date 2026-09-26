@@ -161,6 +161,17 @@ _MISSING_CAPABILITY_REQUEST = re.compile(
     re.IGNORECASE,
 )
 
+# A reply that announces the next step but never calls a tool ("voy a listar...").
+_ANNOUNCED_ACTION = re.compile(
+    r"(?:"
+    r"\bvoy a \w+|\bprocedo a \w+|\ba continuaci[oó]n\b"
+    r"|\bi(?:'ll| will) (?:search|list|read|run|check|fetch|open|use|review|look)"
+    r"|\blet me (?:search|list|read|run|check|fetch|open|look)"
+    r"|\bi'?m going to\b"
+    r")",
+    re.IGNORECASE,
+)
+
 FILE_TOOL_LABELS = {
     "list_directory": "List directory",
     "read_file": "Read file",
@@ -1037,6 +1048,17 @@ class MinAgent:
             "Answer the original request now with a tool, and report missing access only after a tool call actually failed.</system-note>"
         )
         return " ".join(lines)
+
+    def plan_without_action_note(self) -> str:
+        """Corrective follow-up when the model described the work but called no tool."""
+        names = [
+            tool["function"]["name"] for tool in self.tools if tool.get("function", {}).get("name")
+        ]
+        return (
+            "<system-note>Your last reply described what you would do but called no tool, so nothing ran. "
+            f"Call the tool now instead of restating the plan. Tools available: {', '.join(names)}. "
+            "After the tool result, answer the original request.</system-note>"
+        )
 
     def describe_terminal_environment(self) -> str:
         """Describe the host so the model uses the right shell syntax."""
@@ -2189,6 +2211,7 @@ class MinAgent:
         """Run one assistant turn, dispatching tool calls until it finishes."""
         empty_response_retries = 0
         capability_retries = 0
+        action_retries = 0
         tool_calls_this_turn = 0
         continued_text = ""
         continuations = 0
@@ -2348,6 +2371,19 @@ class MinAgent:
                     self.messages.append({"role": "user", "content": self.missing_capability_note()})
                     self.ui_print_wrapped(
                         (("No tool was used; asking the model to use the available tools instead.", "warning", False),)
+                    )
+                    continue
+                if (
+                    tool_calls_this_turn == 0
+                    and action_retries == 0
+                    and _ANNOUNCED_ACTION.search(final_text)
+                ):
+                    # The model described the work but ran nothing; ask once for the tool call.
+                    action_retries += 1
+                    self.messages.append({"role": "assistant", "content": message.get("content") or final_text})
+                    self.messages.append({"role": "user", "content": self.plan_without_action_note()})
+                    self.ui_print_wrapped(
+                        (("The model described the work without doing it; asking it to call the tool now.", "warning", False),)
                     )
                     continue
                 if final_text and not streamed_output.has_output:
