@@ -131,3 +131,42 @@ def build_terminal_tool() -> dict[str, Any]:
             },
         },
     }
+
+
+def build_tool_output_recall_tool() -> dict[str, Any]:
+    """The schema for reading back an archived tool result.
+
+    A result too large for the context window is stored in full and replaced by
+    a preview that names its id, so the model can retrieve any part of it
+    instead of working from a permanently lossy summary.
+    """
+    return {
+        "type": "function",
+        "function": {
+            "name": "recall_tool_output",
+            "description": (
+                "Read back a tool result that was too large to keep in the conversation. A truncated "
+                "result ends with a note naming its id; pass that id here, with an offset and limit, "
+                "to read any character range of the original output. Reread before assuming what a "
+                "truncated result said."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "The archived output id from the truncation note"},
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "First character to return, starting at 0",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 40000,
+                        "description": "Maximum number of characters to return; defaults to 8000",
+                    },
+                },
+                "required": ["id"],
+            },
+        },
+    }

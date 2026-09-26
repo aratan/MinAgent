@@ -41,6 +41,7 @@ OPENAI_TIMEOUT_SECONDS=420
 MCP_TIMEOUT_SECONDS=420
 TERMINAL_TIMEOUT_SECONDS=420
 MAX_TOOL_ROUNDS=64
+TOOL_PREVIEW_CHARS=12000
 OPENAI_SHOW_REASONING=off
 WORKSPACE_LIST_LIMIT=0
 TERMINAL_MODE=off
@@ -50,7 +51,7 @@ MEMORY_ENABLED=off
 WEB_SEARCH_ENABLED=off
 ```
 
-`OPENAI_MODEL` is required. `OPENAI_BASE_URL` defaults to `https://api.openai.com/v1` and is normalized to the `/chat/completions` endpoint. `OPENAI_API_KEY` is optional. `OPENAI_TIMEOUT_SECONDS`, `MCP_TIMEOUT_SECONDS`, and `TERMINAL_TIMEOUT_SECONDS` are positive integers in seconds and default to `420` (seven minutes); they bound one endpoint request, one MCP request, and one shell command respectively. `MAX_TOOL_ROUNDS` is a positive integer bounding how many tool-call rounds one turn may run before stopping, and defaults to `64`.
+`OPENAI_MODEL` is required. `OPENAI_BASE_URL` defaults to `https://api.openai.com/v1` and is normalized to the `/chat/completions` endpoint. `OPENAI_API_KEY` is optional. `OPENAI_TIMEOUT_SECONDS`, `MCP_TIMEOUT_SECONDS`, and `TERMINAL_TIMEOUT_SECONDS` are positive integers in seconds and default to `420` (seven minutes); they bound one endpoint request, one MCP request, and one shell command respectively. `MAX_TOOL_ROUNDS` is a positive integer bounding how many tool-call rounds one turn may run before stopping, and defaults to `64`. `TOOL_PREVIEW_CHARS` is a positive integer bounding the inline preview of an oversized tool result, and defaults to `12000`.
 
 Boolean settings use only `on` and `off`:
 
@@ -87,7 +88,9 @@ When `OPENAI_SHOW_REASONING=on` and the endpoint supplies a supported reasoning 
 
 The model chooses when it needs workspace contents. With `WORKSPACE_LIST_LIMIT=0`, no recursive inventory is injected, while `@` file autocomplete remains available from a bounded local index. The model can call `list_directory` to inspect a specific directory's immediate entries. Otherwise, the inventory supplies paths but no file contents. MinAgent does not force an initial `read_file` call merely because files exist. When a request depends on project files, the model should call `read_file` before planning, diagnosing, or changing them. `list_directory` includes hidden entries, does not recurse, and returns at most 500 entries by default. Successful edits and writes are verified internally by MinAgent; the model does not need to read the same file back. After a failed edit, reread the file before retrying so the new edit is based on its current contents.
 
-MinAgent verifies the persisted contents before a successful edit or write tool reports completion. A model response may request at most 16 tool calls; a turn may use at most `MAX_TOOL_ROUNDS` tool rounds (64 by default). Tool output stored in the conversation is compressed first (ANSI colour stripped, line endings normalised, blank-line and space runs collapsed, whole-JSON payloads minified) and, when it still exceeds a quarter of the usable window, truncated keeping both the head and the tail so a trailing error survives.
+MinAgent verifies the persisted contents before a successful edit or write tool reports completion. A model response may request at most 16 tool calls; a turn may use at most `MAX_TOOL_ROUNDS` tool rounds (64 by default). Tool output stored in the conversation is compressed first (ANSI colour stripped, line endings normalised, blank-line and space runs collapsed, whole-JSON payloads minified) and, when it still exceeds `TOOL_PREVIEW_CHARS`, reduced to a head-and-tail preview. The omitted text is not discarded: it is stored zlib-compressed under `.minagent/tool-outputs/`, and the truncation note names an id the model passes to `recall_tool_output` to read any character range of the original back. Recall is exact, so a result is never permanently lost, and a single recall is capped so it cannot refill the window the archive just freed.
+
+Keeping the result recoverable is what lets the inline preview stay small. Before, one result was allowed to occupy up to a quarter of the window - roughly 65,000 tokens on the default window - and whatever did not fit was gone. Now a single result costs at most `TOOL_PREVIEW_CHARS` (about 2,800 tokens by default) and the rest is one `recall_tool_output` call away. Compression earns its place here by making the off-window copy cheap to keep: an archive is capped at 64 MB and its oldest entries are pruned past that, a single result over 8 MB is not archived at all, and a session with no archive root falls back to the old truncation.
 
 When the fixed prompt - system sections plus tool schemas - already uses at least 70% of the configured context window, startup prints a warning naming the components responsible and the settings that shrink them. If it reaches the compaction budget, the warning says the next request will be refused. Either way the cause is actionable before the first request, instead of an endpoint silently truncating the prompt.
 

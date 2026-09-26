@@ -17,7 +17,7 @@ from datetime import datetime
 from typing import Any
 
 from .attachments import prepare_user_message as prepare_attachments
-from .config import DEFAULT_MAX_TOOL_ROUNDS, Config, load_configuration
+from .config import DEFAULT_MAX_TOOL_ROUNDS, DEFAULT_TOOL_PREVIEW_CHARS, Config, load_configuration
 from .context import (
     SUMMARY_INSTRUCTIONS,
     chunk_summary_transcript,
@@ -91,7 +91,8 @@ from .terminal_text import (
     wrap_message,
     wrap_styled_segments,
 )
-from .tools import build_terminal_tool, build_tools
+from .tool_archive import DEFAULT_ARCHIVE_RECALL_CHARS, ToolArchive
+from .tools import build_terminal_tool, build_tool_output_recall_tool, build_tools
 from .web_search import (
     DEFAULT_MAX_RESULTS as DEFAULT_WEB_SEARCH_RESULTS,
 )
@@ -244,6 +245,10 @@ class MinAgent:
         self._stdin = stdin or sys.stdin
         self._use_color = bool(getattr(self._stdout, "isatty", lambda: False)()) and "NO_COLOR" not in os.environ
         self.tools = build_tools()
+        # Always available: any tool result can overflow the window, and the
+        # truncation note that names the archive reference is useless unless the
+        # model already knows it can call this.
+        self.tools.append(build_tool_output_recall_tool())
 
         self.config: Config | None = None
         self.application_root = ""
@@ -256,6 +261,8 @@ class MinAgent:
         self.model_context_length: int | None = None
         self.endpoint_timeout_ms = 0
         self.max_tool_rounds = DEFAULT_MAX_TOOL_ROUNDS
+        self.tool_preview_chars = DEFAULT_TOOL_PREVIEW_CHARS
+        self.tool_archive = ToolArchive("")
         self.input_modalities: list[str] = []
         self.show_reasoning = False
         self.compaction_reserve_tokens = 0
@@ -374,6 +381,8 @@ class MinAgent:
         self.context_window = config.context_window
         self.endpoint_timeout_ms = config.endpoint_timeout_ms
         self.max_tool_rounds = config.max_tool_rounds
+        self.tool_preview_chars = config.tool_preview_chars
+        self.tool_archive = ToolArchive(config.application_root)
         self.input_modalities = config.input_modalities
         self.show_reasoning = config.show_reasoning
         self.compaction_reserve_tokens = config.compaction_reserve_tokens
@@ -440,6 +449,7 @@ class MinAgent:
             "Do file and folder work with the tools: write_file creates files (and their parent folders), create_directory creates folders. Never say a file or folder was created, changed, or deleted unless a tool call did it.",
             "Inspect before deleting; never delete the workspace root.",
             "Never claim you lack access to the system, the clock, the network, or a file before trying the closest tool; answer from a tool result, not from an assumption.",
+            "A tool result too large for the context window is shown as a head-and-tail preview whose truncation note names an archived id; call recall_tool_output with that id to read any part of the original, and never guess what the omitted part said.",
         ]
         if self.terminal_mode != "off":
             core.append(
@@ -698,6 +708,19 @@ class MinAgent:
         if not self.memory_enabled or self.memory_store is None:
             raise AgentError("Memory is not enabled for this session.")
         return self.memory_store
+
+    def recall_tool_output(self, args: dict[str, Any]) -> str:
+        """Return a slice of a tool result that was too large to keep inline."""
+        reference = args.get("id")
+        if not isinstance(reference, str) or not reference.strip():
+            raise AgentError("recall_tool_output requires the id from the truncation note.")
+        offset = args.get("offset", 0)
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            raise AgentError("recall_tool_output offset must be a non-negative integer.")
+        limit = args.get("limit", DEFAULT_ARCHIVE_RECALL_CHARS)
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise AgentError("recall_tool_output limit must be a positive integer.")
+        return self.tool_archive.read(reference.strip(), offset, limit)
 
     async def recall_memory(self, args: dict[str, Any]) -> str:
         """Search stored knowledge for the model."""
@@ -1138,6 +1161,8 @@ class MinAgent:
             return await self.run_web_search(args)
         if name == "web_fetch":
             return await self.run_web_fetch(args)
+        if name == "recall_tool_output":
+            return self.recall_tool_output(args)
         if name == "recall":
             return await self.recall_memory(args)
         if name == "remember":
@@ -1604,23 +1629,37 @@ class MinAgent:
 
         A single command can emit tens of thousands of characters, which alone
         exceeds a small window and would force a compaction before the model can
-        answer. Results are capped to roughly a quarter of the usable window
-        (four characters per token), with a note so the model knows to narrow it.
+        answer. Only a bounded preview is kept inline, and the omitted text is
+        archived rather than discarded: the note names the reference so the model
+        can read any of it back. Because nothing is lost, the preview stays small
+        instead of eating a quarter of the window.
         """
         text = compress_for_context(text)
         window = self.effective_context_window()
         if window <= 0:
             return text
-        max_chars = max(4000, window)
+        # Never larger than the window itself, and never more than the configured
+        # preview budget: the archive exists precisely so this can be small.
+        max_chars = max(4000, min(window, self.tool_preview_chars))
         if len(text) <= max_chars:
             return text
         head = max_chars * 3 // 4
         tail = max_chars - head
         omitted = len(text) - max_chars
+        reference = self.tool_archive.store(text)
+        if reference is None:
+            return (
+                text[:head]
+                + f"\n\n[tool output truncated: {omitted} characters omitted to fit the {window}-token "
+                "context window and could not be archived; narrow the command or read in parts]\n\n"
+                + text[-tail:]
+            )
         return (
             text[:head]
-            + f"\n\n[tool output truncated: {omitted} characters omitted to fit the {window}-token "
-            "context window; narrow the command or read in parts]\n\n"
+            + f"\n\n[tool output truncated: {omitted} of {len(text)} characters omitted to fit the "
+            f'{window}-token context window. Nothing was lost: call recall_tool_output with '
+            f'id="{reference}" and an offset/limit to read any part of it, or narrow the command '
+            "if you do not need it.]\n\n"
             + text[-tail:]
         )
 

@@ -11,6 +11,9 @@
 .agents/memory/*.db
 .agents/memory/*.db-*
 
+# Oversized tool results archived outside the context window, so recall works.
+.minagent/tool-outputs/
+
 # Python / uv
 .venv/
 __pycache__/

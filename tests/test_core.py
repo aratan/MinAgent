@@ -48,6 +48,7 @@ from minagent.terminal_text import (
     truncate_terminal_text,
     wrap_styled_segments,
 )
+from minagent.tool_archive import MAX_ARCHIVE_RECALL_CHARS, MAX_ARCHIVED_CHARS, ToolArchive
 from minagent.workspace import WorkspaceAccess
 
 
@@ -588,6 +589,169 @@ def test_a_truncated_tool_result_keeps_the_tail_for_the_error():
     assert bounded.startswith("START")
     assert bounded.rstrip().endswith("FAILED: no such file")
     assert "characters omitted" in bounded
+
+
+def _archiving_app(tmp_path, columns: int = 80) -> MinAgent:
+    """A session whose tool-output archive is isolated in ``tmp_path``."""
+    app, _output = _make_app(columns)
+    app.tool_archive = ToolArchive(str(tmp_path))
+    return app
+
+
+def test_a_truncated_tool_result_is_archived_instead_of_discarded(tmp_path):
+    """The omitted middle must stay reachable, not be thrown away."""
+    app = _archiving_app(tmp_path)
+    evidence = "ENCONTRADO: el fallo esta en la linea 12345"
+    original = "START\n" + ("relleno " * 6000) + f"\n{evidence}\n" + ("cola " * 3000) + "\nFAILED"
+
+    bounded = app.bound_tool_result(original)
+    assert len(bounded) < len(original) // 4, "the preview should be a small fraction of the result"
+    assert 'id="' in bounded, "the note must name the archive reference the model needs"
+    assert evidence not in bounded, "the evidence should be exactly what the preview leaves out"
+
+    reference = bounded.split('id="')[1].split('"')[0]
+    # The evidence sits past the preview, so reaching it needs an offset.
+    at = compress_for_context(original).index(evidence)
+    recalled = app.recall_tool_output({"id": reference, "offset": at, "limit": len(evidence) + 5})
+    assert evidence in recalled, "the archived middle was not recoverable"
+
+
+def test_the_archive_stores_exactly_what_the_model_would_have_seen(tmp_path):
+    """Recall is lossless, so the stored text must be the compressed result verbatim."""
+    import zlib
+
+    app = _archiving_app(tmp_path)
+    original = "\x1b[31mrojo\x1b[0m\n\n\n" + ("dato   con   espacios " * 3000)
+    bounded = app.bound_tool_result(original)
+    reference = bounded.split('id="')[1].split('"')[0]
+
+    path = os.path.join(str(tmp_path), ".minagent", "tool-outputs", f"{reference}.z")
+    with open(path, "rb") as handle:
+        stored = zlib.decompress(handle.read()).decode("utf-8")
+    assert stored == compress_for_context(original)
+
+
+def test_recall_reports_the_full_size_and_honours_the_offset(tmp_path):
+    app = _archiving_app(tmp_path)
+    original = "".join(f"linea {index:06d}\n" for index in range(6000))
+    reference = app.bound_tool_result(original).split('id="')[1].split('"')[0]
+    total = len(compress_for_context(original))
+
+    # Each line is 13 characters, so 1300 lands exactly on the start of a line.
+    recalled = app.recall_tool_output({"id": reference, "offset": 1300, "limit": 26})
+    assert f"characters 1300-1326 of {total}" in recalled
+    assert recalled.endswith("linea 000100\nlinea 000101\n")
+
+
+def test_recall_cannot_walk_out_of_the_archive(tmp_path):
+    app = _archiving_app(tmp_path)
+    for hostile in ("../../../../etc/passwd", "a/b", "", "x" * 200, ".hidden"):
+        with pytest.raises(AgentError):
+            app.recall_tool_output({"id": hostile})
+
+
+def test_recall_validates_its_own_arguments(tmp_path):
+    app = _archiving_app(tmp_path)
+    reference = app.bound_tool_result("x" * 50_000).split('id="')[1].split('"')[0]
+    with pytest.raises(AgentError, match="requires the id"):
+        app.recall_tool_output({"id": "  "})
+    with pytest.raises(AgentError, match="offset"):
+        app.recall_tool_output({"id": reference, "offset": -1})
+    with pytest.raises(AgentError, match="limit"):
+        app.recall_tool_output({"id": reference, "limit": 0})
+
+
+def test_recall_cannot_refill_the_window_it_freed(tmp_path):
+    """One recall is bounded, or the archive would be a slower way to blow up."""
+    app = _archiving_app(tmp_path)
+    original = "y" * 2_000_000
+    reference = app.bound_tool_result(original).split('id="')[1].split('"')[0]
+    recalled = app.recall_tool_output({"id": reference, "limit": 10_000_000})
+    assert len(recalled) <= MAX_ARCHIVE_RECALL_CHARS + 200
+
+
+def test_an_unconfigured_session_keeps_the_old_truncation(tmp_path, monkeypatch):
+    """No archive root means no archive: truncation still has to work."""
+    app, _output = _make_app(80)
+    app.tool_archive = ToolArchive("")
+    bounded = app.bound_tool_result("x" * 50_000)
+    assert "tool output truncated" in bounded
+    assert 'id="' not in bounded
+    assert not os.path.exists(os.path.join(str(tmp_path), ".minagent"))
+
+
+def test_an_oversized_result_is_not_worth_archiving(tmp_path):
+    app = _archiving_app(tmp_path)
+    assert app.tool_archive.store("z" * (MAX_ARCHIVED_CHARS + 1)) is None
+    assert app.tool_archive.stored_bytes() == 0
+
+
+def test_the_recall_tool_is_exposed_to_the_model():
+    app, _output = _make_app(80)
+    names = {tool["function"]["name"] for tool in app.tools}
+    assert "recall_tool_output" in names
+    schema = next(tool for tool in app.tools if tool["function"]["name"] == "recall_tool_output")
+    assert schema["function"]["parameters"]["required"] == ["id"]
+
+
+def test_the_archive_is_pruned_once_it_outgrows_its_budget(tmp_path, monkeypatch):
+    """The archive must not fill the disk; the oldest entries go first."""
+    from minagent import tool_archive as archive_module
+
+    budget = 4000
+    monkeypatch.setattr(archive_module, "MAX_ARCHIVE_BYTES", budget)
+    archive = ToolArchive(str(tmp_path))
+    # Random text does not compress, so the budget is genuinely exceeded.
+    for _ in range(20):
+        assert archive.store(os.urandom(600).hex()) is not None
+
+    entries = archive._entries()
+    assert len(entries) < 20, "pruning removed nothing"
+    assert archive.stored_bytes() <= budget, "pruning left the archive over budget"
+
+
+def test_pruning_keeps_the_newest_entries(tmp_path, monkeypatch):
+    """The reference still in the transcript is the one worth keeping."""
+    from minagent import tool_archive as archive_module
+
+    monkeypatch.setattr(archive_module, "MAX_ARCHIVE_BYTES", 2000)
+    archive = ToolArchive(str(tmp_path))
+    newest = None
+    for _ in range(20):
+        newest = archive.store(os.urandom(600).hex())
+    assert newest is not None
+    assert "characters 0-" in archive.read(newest)
+
+
+def test_a_corrupt_archive_reports_an_error_instead_of_crashing(tmp_path):
+    archive = ToolArchive(str(tmp_path))
+    reference = archive.store("contenido")
+    assert reference is not None
+    path = os.path.join(str(tmp_path), ".minagent", "tool-outputs", f"{reference}.z")
+    with open(path, "wb") as handle:
+        handle.write(b"esto no es zlib")
+
+    with pytest.raises(AgentError, match="corrupt"):
+        archive.read(reference)
+
+
+def test_a_missing_reference_points_back_at_the_command(tmp_path):
+    archive = ToolArchive(str(tmp_path))
+    with pytest.raises(AgentError, match="rerun the command"):
+        archive.read("0badc0de0bad")
+
+
+def test_a_failed_write_does_not_break_the_turn(tmp_path):
+    """A read-only or full disk must fall back to truncation, not raise."""
+    archive = ToolArchive(str(tmp_path))
+    blocked = os.path.join(str(tmp_path), "blocked")
+    os.makedirs(blocked)
+    os.chmod(blocked, 0o500)
+    try:
+        archive = ToolArchive(os.path.join(blocked, "sub"))
+        assert archive.store("no se puede guardar") is None
+    finally:
+        os.chmod(blocked, 0o700)
 
 
 def test_context_compression_strips_ansi_and_collapses_whitespace():
@@ -1687,6 +1851,40 @@ def test_tool_rounds_are_configurable(tmp_path):
 def test_tool_rounds_reject_a_non_positive_value(tmp_path):
     with pytest.raises(AgentError, match="MAX_TOOL_ROUNDS must be a positive integer"):
         _configuration(tmp_path, MAX_TOOL_ROUNDS="0")
+
+
+def test_the_tool_preview_defaults_to_twelve_thousand_characters(tmp_path):
+    assert _configuration(tmp_path).tool_preview_chars == 12000
+
+
+def test_the_tool_preview_is_configurable(tmp_path):
+    assert _configuration(tmp_path, TOOL_PREVIEW_CHARS="2000").tool_preview_chars == 2000
+
+
+def test_the_tool_preview_rejects_a_non_positive_value(tmp_path):
+    with pytest.raises(AgentError, match="TOOL_PREVIEW_CHARS must be a positive integer"):
+        _configuration(tmp_path, TOOL_PREVIEW_CHARS="0")
+
+
+def test_the_preview_is_capped_by_the_configured_budget():
+    """A big window must not let one result eat a quarter of it."""
+    app, _output = _make_app(80)
+    app.model = "modelo-sin-pista-de-tamano"
+    app.model_context_length = None
+    app.context_window = 262144
+    app.tool_preview_chars = 12000
+    assert app.effective_context_window() == 262144
+    bounded = app.bound_tool_result("x" * 500_000)
+    assert len(bounded) <= 12000 + 400, "the inline preview ignored TOOL_PREVIEW_CHARS"
+
+
+def test_the_preview_never_exceeds_the_window_itself(tmp_path):
+    """A tiny window still bounds the result even with a large preview budget."""
+    app, _output = _make_app(80)
+    assert app.effective_context_window() == 8192
+    app.tool_preview_chars = 500_000
+    bounded = app.bound_tool_result("x" * 500_000)
+    assert len(bounded) <= 8192 + 400
 
 
 def test_extension_timeouts_default_to_seven_minutes(tmp_path):
