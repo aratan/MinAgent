@@ -1091,6 +1091,189 @@ def test_reading_a_source_file_of_this_project_keeps_every_line():
         assert not ausentes, f"{modulo.name} lost {len(ausentes)} lines, first: {ausentes[0]!r}"
 
 
+def _respuesta_con_llamadas(*nombres):
+    """A model response that asks for several tools at once."""
+    return {
+        "payload": {"usage": {}, "finish_reason": "tool_calls"},
+        "message": {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": f"c{indice}",
+                    "type": "function",
+                    "function": {"name": nombre, "arguments": json.dumps({"path": "a.py", "command": "date"})},
+                }
+                for indice, nombre in enumerate(nombres)
+            ],
+        },
+    }
+
+
+def _una_vez_tras_las_herramientas(*nombres):
+    """Un falso endpoint que pide herramientas una vez y luego responde con texto."""
+
+    async def falso(messages, options=None):
+        if not falso.pendientes:
+            return {
+                "payload": {"usage": {}, "finish_reason": "stop"},
+                "message": {"role": "assistant", "content": "listo"},
+            }
+        falso.pendientes = False
+        return _respuesta_con_llamadas(*nombres)
+
+    falso.pendientes = True
+    return falso
+
+
+async def test_consecutive_reads_run_together(tmp_path, monkeypatch):
+    """Two reads in one response should overlap, not queue behind each other."""
+    app = _skill_app(tmp_path)
+    en_curso = 0
+    maximo_simultaneo = 0
+
+    async def lectura(args, image_enabled=False):
+        nonlocal en_curso, maximo_simultaneo
+        en_curso += 1
+        maximo_simultaneo = max(maximo_simultaneo, en_curso)
+        try:
+            await asyncio.sleep(0.05)
+            return "contenido"
+        finally:
+            en_curso -= 1
+
+    monkeypatch.setattr(app, "call_chat_completions", _una_vez_tras_las_herramientas("read_file", "read_file"))
+    monkeypatch.setattr(app, "execute_tool", lectura)
+    await app.request_assistant_turn(None)
+
+    assert maximo_simultaneo == 2, "the two reads did not overlap"
+
+
+async def test_a_write_is_never_batched_with_a_read(tmp_path, monkeypatch):
+    """Order matters: nothing that writes may start before an earlier read finishes."""
+    app = _skill_app(tmp_path)
+    orden: list[str] = []
+
+    async def dos_lecturas_y_una_escritura(messages, options=None):
+        if not dos_lecturas_y_una_escritura.pendientes:
+            return {
+                "payload": {"usage": {}, "finish_reason": "stop"},
+                "message": {"role": "assistant", "content": "listo"},
+            }
+        dos_lecturas_y_una_escritura.pendientes = False
+        return _respuesta_con_llamadas("read_file", "read_file", "write_file", "read_file")
+
+    dos_lecturas_y_una_escritura.pendientes = True
+
+    async def ejecucion(name, args):
+        if name == "write_file":
+            orden.append("write")
+            return "escrito"
+        orden.append(f"read:{len([o for o in orden if o.startswith('read')])}")
+        await asyncio.sleep(0.02)
+        return "contenido"
+
+    monkeypatch.setattr(app, "call_chat_completions", dos_lecturas_y_una_escritura)
+    monkeypatch.setattr(app, "execute_tool", ejecucion)
+    await app.request_assistant_turn(None)
+
+    assert orden.index("write") == 2, f"the write ran before the reads finished: {orden}"
+    # The read after the write stayed in the serial tail.
+    assert orden.count("read:2") == 1
+
+
+async def test_one_read_alone_is_not_worth_batching(tmp_path, monkeypatch):
+    app = _skill_app(tmp_path)
+    en_curso = 0
+    maximo = 0
+
+    async def lectura(args, image_enabled=False):
+        nonlocal en_curso, maximo
+        en_curso += 1
+        maximo = max(maximo, en_curso)
+        try:
+            await asyncio.sleep(0.02)
+            return "contenido"
+        finally:
+            en_curso -= 1
+
+    monkeypatch.setattr(app, "call_chat_completions", _una_vez_tras_las_herramientas("read_file"))
+    monkeypatch.setattr(app, "execute_tool", lectura)
+    await app.request_assistant_turn(None)
+    assert maximo == 1
+
+
+async def test_parallel_reads_can_be_turned_off(tmp_path, monkeypatch):
+    app = _skill_app(tmp_path)
+    app.parallel_tools = False
+    en_curso = 0
+    maximo = 0
+
+    async def lectura(args, image_enabled=False):
+        nonlocal en_curso, maximo
+        en_curso += 1
+        maximo = max(maximo, en_curso)
+        try:
+            await asyncio.sleep(0.03)
+            return "contenido"
+        finally:
+            en_curso -= 1
+
+    monkeypatch.setattr(app, "call_chat_completions", _una_vez_tras_las_herramientas("read_file", "read_file"))
+    monkeypatch.setattr(app, "execute_tool", lectura)
+    await app.request_assistant_turn(None)
+    assert maximo == 1, "reads overlapped even with PARALLEL_TOOLS=off"
+
+
+async def test_a_failing_read_does_not_lose_the_others(tmp_path, monkeypatch):
+    """One broken read must not take down the results the rest already produced."""
+    app = _skill_app(tmp_path)
+
+    async def ejecucion(name, args):
+        if not hasattr(ejecucion, "contado"):
+            ejecucion.contado = 0
+        ejecucion.contado += 1
+        if ejecucion.contado == 1:
+            raise AgentError("no such file")
+        return "contenido bueno"
+
+    monkeypatch.setattr(app, "call_chat_completions", _una_vez_tras_las_herramientas("read_file", "read_file"))
+    monkeypatch.setattr(app, "execute_tool", ejecucion)
+    await app.request_assistant_turn(None)
+
+    contenidos = [m.get("content") or "" for m in app.messages if m.get("role") == "tool"]
+    assert any("no such file" in c for c in contenidos), "the failure was not reported"
+    assert any("contenido bueno" in c for c in contenidos), "the other read's result was lost"
+
+
+def test_only_read_only_tools_are_eligible_for_batching():
+    """The allowlist is the safety property; keep it explicit."""
+    from minagent.app import _CONCURRENT_READ_TOOLS
+
+    for nombre in ("read_file", "list_directory", "recall_tool_output", "web_search", "web_fetch"):
+        assert nombre in _CONCURRENT_READ_TOOLS
+    for nombre in (
+        "edit_file",
+        "write_file",
+        "create_directory",
+        "delete_file",
+        "delete_directory",
+        "run_terminal",
+        "remember",
+        "record_outcome",
+        "write_skill",
+        "write_mcp_server",
+    ):
+        assert nombre not in _CONCURRENT_READ_TOOLS, f"{nombre} can change state and must not be batched"
+
+
+def test_parallel_tools_defaults_to_on_and_is_configurable(tmp_path):
+    assert _configuration(tmp_path).parallel_tools is True
+    assert _configuration(tmp_path, PARALLEL_TOOLS="off").parallel_tools is False
+    with pytest.raises(AgentError, match="PARALLEL_TOOLS must be on or off"):
+        _configuration(tmp_path, PARALLEL_TOOLS="si")
+
+
 def test_the_capability_note_points_at_web_search_when_it_is_available():
     """Un modelo que dice 'no tengo noticias' necesita que le digan qué herramienta usar."""
     app, _output = _make_app(100)

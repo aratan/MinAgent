@@ -43,6 +43,7 @@ TERMINAL_TIMEOUT_SECONDS=420
 MAX_TOOL_ROUNDS=64
 TOOL_PREVIEW_CHARS=12000
 TOOL_RESULT_KEEP=3
+PARALLEL_TOOLS=on
 OPENAI_SHOW_REASONING=off
 WORKSPACE_LIST_LIMIT=0
 TERMINAL_MODE=off
@@ -92,6 +93,14 @@ The model chooses when it needs workspace contents. With `WORKSPACE_LIST_LIMIT=0
 MinAgent verifies the persisted contents before a successful edit or write tool reports completion. A model response may request at most 16 tool calls; a turn may use at most `MAX_TOOL_ROUNDS` tool rounds (64 by default). Tool output stored in the conversation is compressed first (ANSI colour stripped, line endings normalised, blank-line and space runs collapsed, whole-JSON payloads minified) and, when it still exceeds `TOOL_PREVIEW_CHARS`, reduced to a head-and-tail preview. The omitted text is not discarded: it is stored zlib-compressed under `.minagent/tool-outputs/`, and the truncation note names an id the model passes to `recall_tool_output` to read any character range of the original back. Recall is exact, so a result is never permanently lost, and a single recall is capped so it cannot refill the window the archive just freed.
 
 Keeping the result recoverable is what lets the inline preview stay small. Before, one result was allowed to occupy up to a quarter of the window - roughly 65,000 tokens on the default window - and whatever did not fit was gone. Now a single result costs at most `TOOL_PREVIEW_CHARS` (about 2,800 tokens by default) and the rest is one `recall_tool_output` call away. Compression earns its place here by making the off-window copy cheap to keep: an archive is capped at 64 MB and its oldest entries are pruned past that, a single result over 8 MB is not archived at all, and a session with no archive root falls back to the old truncation.
+
+## Running reads together
+
+When a response asks for several tools at once, the read-only ones run at the same time instead of queueing behind each other. A turn that read twelve files took eleven times longer than it needed to; now the whole batch costs about one read. Nothing about the context changes - the results still land in the transcript in the order the model asked for them - so this is purely wall clock, and it is the difference between a fifteen second turn and a two second one when the model wants to look at a handful of files.
+
+The safety property is an allowlist, not a denylist. `read_file`, `list_directory`, `recall`, `recall_tool_output`, `load_skill`, `web_search` and `web_fetch` can overlap because none of them changes what another would see. Everything else stays strictly serial and in order: the writing tools, `run_terminal`, the memory writers, the skill and MCP authoring tools, and every MCP tool, whose side effects its own server decides and MinAgent cannot know. The batch also stops at the first call that is not on the list, so a read that follows a write never starts before that write is done. One read alone is not worth batching, and each read settles on its own, so one failing read cannot discard the results the others already produced.
+
+`PARALLEL_TOOLS=off` restores the strictly sequential behaviour.
 
 ## Clearing old tool results
 

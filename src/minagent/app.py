@@ -19,6 +19,7 @@ from typing import Any
 from .attachments import prepare_user_message as prepare_attachments
 from .config import (
     DEFAULT_MAX_TOOL_ROUNDS,
+    DEFAULT_PARALLEL_TOOLS,
     DEFAULT_TOOL_PREVIEW_CHARS,
     DEFAULT_TOOL_RESULT_KEEP,
     Config,
@@ -139,6 +140,22 @@ _COMPACT_COMMAND = re.compile(r"^\/compact(?:\s+([\s\S]*))?$", re.IGNORECASE)
 _USAGE_COMMAND = re.compile(r"^\/usage(?:\s+([\s\S]*))?$", re.IGNORECASE)
 # A tool result that tool result clearing already replaced with a stub.
 _CLEARED_TOOL_RESULT = re.compile(r"\A\[tool result cleared\b")
+# Tools that only read, so several of them can run at the same time without
+# changing what any of them would see. Everything absent from this set keeps
+# running one at a time and in order: the ones that write, the ones that need
+# approval, and every MCP tool, whose side effects its server decides and MinAgent
+# cannot know.
+_CONCURRENT_READ_TOOLS = frozenset(
+    {
+        "read_file",
+        "list_directory",
+        "recall",
+        "recall_tool_output",
+        "load_skill",
+        "web_search",
+        "web_fetch",
+    }
+)
 # The archive reference a truncated result already carries.
 _ARCHIVED_REFERENCE_IN_TEXT = re.compile(r'id="([A-Za-z0-9_-]{1,64})"')
 _INIT_COMMAND = re.compile(r"^\/init(?:\s+([\s\S]*))?$", re.IGNORECASE)
@@ -276,6 +293,7 @@ class MinAgent:
         self.max_tool_rounds = DEFAULT_MAX_TOOL_ROUNDS
         self.tool_preview_chars = DEFAULT_TOOL_PREVIEW_CHARS
         self.tool_result_keep = DEFAULT_TOOL_RESULT_KEEP
+        self.parallel_tools = DEFAULT_PARALLEL_TOOLS
         self.tool_archive = ToolArchive("")
         self.request_cache = RequestCache()
         self.input_modalities: list[str] = []
@@ -406,6 +424,7 @@ class MinAgent:
         self.max_tool_rounds = config.max_tool_rounds
         self.tool_preview_chars = config.tool_preview_chars
         self.tool_result_keep = config.tool_result_keep
+        self.parallel_tools = config.parallel_tools
         self.tool_archive = ToolArchive(config.application_root)
         self.input_modalities = config.input_modalities
         self.show_reasoning = config.show_reasoning
@@ -1286,6 +1305,28 @@ class MinAgent:
                     )
                 )
         return prepared["message"]
+
+    async def _run_read_tool(self, name: str, args: dict[str, Any]) -> Any:
+        """Run one read for the parallel batch, turning failures into text.
+
+        ``asyncio.gather`` would otherwise propagate the first error and lose the
+        results the other reads already produced, so each read settles on its own
+        exactly as it would in the serial path.
+        """
+        try:
+            return await self.execute_tool(name, args)
+        except AgentError as error:
+            detail = error.message
+            uncertain = (
+                " The file may have changed despite this error; inspect it before relying on its contents."
+                if error.may_have_changed
+                else ""
+            )
+            return f"Error: {detail}{uncertain}"
+        except ValueError as error:
+            return f"Error: {error}"
+        except Exception as error:
+            return f"Error: {error}"
 
     async def execute_tool(self, name: str, args: dict[str, Any]) -> Any:
         """Dispatch one tool call, gating privileged tools behind approval."""
@@ -2648,6 +2689,49 @@ class MinAgent:
             self.messages.append({"role": "assistant", "content": message.get("content"), "tool_calls": calls})
             pending_images: list[dict[str, Any]] = []
             denied_tool_calls = 0
+            # Reads that sit together at the front of the response run at the same
+            # time, because nothing between them can change what they would see.
+            # The first call that writes, or that needs approval, ends the batch:
+            # everything from there on runs in order, exactly as before.
+            prefetched: dict[int, Any] = {}
+            if self.parallel_tools and len(calls) > 1 and not (signal is not None and signal.cancelled):
+                batch: list[tuple[int, str, dict[str, Any]]] = []
+                for indice, call in enumerate(calls):
+                    function = call.get("function") or {}
+                    nombre = str(function.get("name") or "")
+                    if nombre not in _CONCURRENT_READ_TOOLS:
+                        break
+                    if self.mcp_connections.get("tool_lookup", {}).get(nombre):
+                        break
+                    try:
+                        argumentos = function.get("arguments") or "{}"
+                        if isinstance(argumentos, str):
+                            argumentos = json.loads(argumentos)
+                        if not isinstance(argumentos, dict):
+                            raise ValueError
+                    except (json.JSONDecodeError, ValueError, TypeError):
+                        # Un argumento ilegible no cancela el lote: ese call se
+                        # ejecuta despues, en serie, donde ya se maneja el error.
+                        break
+                    batch.append((indice, nombre, argumentos))
+
+                if len(batch) > 1:
+                    self.print("")
+                    self.ui_print_wrapped(
+                        (("╭─ ", "magenta", False), (f"LEYENDO {len(batch)} EN PARALELO", "pale", True),)
+                    )
+                    for _indice, nombre, argumentos in batch:
+                        etiqueta = argumentos.get("path") or argumentos.get("query") or argumentos.get("name")
+                        self.ui_print_wrapped(
+                            (("│ ", "magenta", False), (f"{nombre} {etiqueta or ''}".strip(), "muted", False),)
+                        )
+                    resultados = await asyncio.gather(
+                        *(self._run_read_tool(nombre, argumentos) for _indice, nombre, argumentos in batch)
+                    )
+                    for (indice, _nombre, _argumentos), resultado in zip(batch, resultados, strict=True):
+                        prefetched[indice] = resultado
+                    self.print("")
+
             for call_index, call in enumerate(calls):
                 function = call.get("function") or {}
                 name = str(function.get("name") or "")
@@ -2691,7 +2775,12 @@ class MinAgent:
                         self.ui_print_wrapped((("│ ", "magenta", False), (str(subject), "muted", False)))
                     elif mcp_tool and args:
                         self.ui_print_wrapped((("│ ", "magenta", False), (approval_preview(args), "muted", False)))
-                    result = await self.execute_tool(name, args)
+                    if call_index in prefetched:
+                        # Ya se ejecuto en el lote paralelo; solo queda insertarlo
+                        # en su posicion para que el transcript siga en orden.
+                        result = prefetched[call_index]
+                    else:
+                        result = await self.execute_tool(name, args)
                 except AgentError as error:
                     detail = error.message
                     uncertain = (
