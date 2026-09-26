@@ -20,6 +20,9 @@ DEFAULT_MAX_TOOL_ROUNDS = 64
 # Inline characters kept for an oversized tool result. The rest stays in the
 # archive and the model reads it back with recall_tool_output.
 DEFAULT_TOOL_PREVIEW_CHARS = 12000
+# Recent tool results kept verbatim in the transcript. Older ones are replaced by
+# a retrievable stub before compaction, which frees context without summarising.
+DEFAULT_TOOL_RESULT_KEEP = 3
 DEFAULT_ENDPOINT_TIMEOUT_SECONDS = 7 * 60
 DEFAULT_EXTENSION_TIMEOUT_SECONDS = 7 * 60
 DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS = 2 * 60
@@ -166,6 +169,7 @@ class Config:
     endpoint_timeout_ms: int
     max_tool_rounds: int
     tool_preview_chars: int
+    tool_result_keep: int
     input_modalities: list[str]
     show_reasoning: bool
     compaction_reserve_tokens: int
@@ -245,6 +249,9 @@ def load_configuration(
         ),
         tool_preview_chars=parse_positive_integer(
             environment.get("TOOL_PREVIEW_CHARS"), "TOOL_PREVIEW_CHARS", DEFAULT_TOOL_PREVIEW_CHARS
+        ),
+        tool_result_keep=parse_positive_integer(
+            environment.get("TOOL_RESULT_KEEP"), "TOOL_RESULT_KEEP", DEFAULT_TOOL_RESULT_KEEP
         ),
         input_modalities=parse_input_modalities(environment.get("OPENAI_INPUT")),
         compaction_reserve_tokens=min(16384, context_window // 8),

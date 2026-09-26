@@ -24,7 +24,7 @@ from minagent.app import (
 )
 from minagent.attachments import prepare_user_message
 from minagent.config import Config, load_configuration, parse_directory_entry_limit
-from minagent.context import chunk_summary_transcript, compress_for_context
+from minagent.context import chunk_summary_transcript, compress_for_context, estimate_text_tokens
 from minagent.editor import (
     AUTOCOMPLETE_PANEL_ROWS,
     Key,
@@ -760,12 +760,17 @@ def test_the_system_prompt_prefix_survives_within_the_same_minute():
 
     app.refresh_system_prompt()
     primero = app.messages[0]["content"]
+    seccion = next(s for s in app._current_system_prompt_sections if s["name"] == "Current time")
+    minuto = re.search(r"T(\d{2}:\d{2}):00", seccion["content"])
+    assert minuto is not None, "the clock is not truncated to the minute"
+
+    # El segundo solo puede cambiar si cruzamos el minuto, en cuyo caso el
+    # prefijo debe cambiar; dentro del mismo minuto tiene que ser idéntico.
     time.sleep(1.1)
     app.refresh_system_prompt()
-    assert app.messages[0]["content"] == primero, "the system prompt changed within the same minute"
-
-    section = next(s for s in app._current_system_prompt_sections if s["name"] == "Current time")
-    assert re.search(r"T\d{2}:\d{2}:00", section["content"]), "the clock is not truncated to the minute"
+    siguiente = next(s for s in app._current_system_prompt_sections if s["name"] == "Current time")
+    if re.search(r"T(\d{2}:\d{2}):00", siguiente["content"]).group(1) == minuto.group(1):
+        assert app.messages[0]["content"] == primero, "the system prompt changed within the same minute"
 
 
 def test_stable_prompt_sections_come_before_the_volatile_ones():
@@ -875,6 +880,138 @@ def test_the_request_cache_is_bounded():
     # Lo más viejo se descartó, lo más reciente sigue ahí.
     assert cache.get(cache.key("m", [], [{"role": "user", "content": "0"}])) is None
     assert cache.get(cache.key("m", [], [{"role": "user", "content": "4"}])) is not None
+
+
+def test_clearing_old_tool_results_frees_context_without_losing_them(tmp_path):
+    """Tool result clearing: the transcript shrinks, the evidence stays retrievable."""
+    app = _archiving_app(tmp_path)
+    app.tool_result_keep = 1
+    app.messages = [{"role": "system", "content": "sistema"}]
+    for indice in range(4):
+        app.messages.append({"role": "user", "content": f"peticion {indice}"})
+        app.messages.append(
+            {"role": "assistant", "content": "", "tool_calls": [{"id": f"c{indice}", "type": "function"}]}
+        )
+        app.messages.append({"role": "tool", "tool_call_id": f"c{indice}", "content": "dato " * 900 + f"#{indice}"})
+
+    antes = sum(estimate_text_tokens(m.get("content") or "") for m in app.messages)
+    liberado = app.clear_old_tool_results()
+    despues = sum(estimate_text_tokens(m.get("content") or "") for m in app.messages)
+
+    assert liberado > 0, "nothing was freed"
+    assert despues < antes / 2, "the transcript barely shrank"
+    # The last result stays verbatim, the older ones become retrievable stubs.
+    assert "#3" in app.messages[-1]["content"]
+    resultados = [m["content"] for m in app.messages if m.get("role") == "tool"]
+    for contenido in resultados[:-1]:
+        assert contenido.startswith("[tool result cleared"), "an old result was not stubbed"
+        assert 'id="' in contenido, "the stub does not name a reference to recall from"
+
+    # Y lo importante: el dato sigue estando disponible.
+    referencia = resultados[0].split('id="')[1].split('"')[0]
+    assert "dato" in app.recall_tool_output({"id": referencia, "limit": 20000})
+
+
+def test_clearing_keeps_the_most_recent_tool_results_verbatim(tmp_path):
+    app = _archiving_app(tmp_path)
+    app.tool_result_keep = 2
+    app.messages = [{"role": "system", "content": "sistema"}]
+    for indice in range(5):
+        app.messages.append({"role": "tool", "tool_call_id": str(indice), "content": f"resultado {indice} " + "x" * 500})
+
+    app.clear_old_tool_results()
+    contenidos = [m["content"] for m in app.messages if m.get("role") == "tool"]
+    assert "resultado 4" in contenidos[-1]
+    assert "resultado 3" in contenidos[-2]
+    assert contenidos[0].startswith("[tool result cleared")
+    assert "resultado 2" not in contenidos[0]
+
+
+def test_clearing_is_idempotent_and_does_not_archive_twice(tmp_path):
+    app = _archiving_app(tmp_path)
+    app.tool_result_keep = 0
+    app.messages = [{"role": "system", "content": "sistema"}]
+    app.messages.append({"role": "tool", "tool_call_id": "c", "content": "contenido " * 500})
+
+    app.clear_old_tool_results()
+    primer_stub = app.messages[1]["content"]
+    liberado_segunda = app.clear_old_tool_results()
+
+    assert liberado_segunda == 0, "a cleared result was archived a second time"
+    assert app.messages[1]["content"] == primer_stub
+    referencia = primer_stub.split('id="')[1].split('"')[0]
+    assert "contenido" in app.recall_tool_output({"id": referencia, "limit": 20000})
+
+
+def test_a_truncated_result_keeps_its_existing_reference_when_cleared(tmp_path):
+    """A result that was already truncated must not be archived a second time."""
+    app = _archiving_app(tmp_path)
+    app.tool_result_keep = 0
+    app.messages = [{"role": "system", "content": "sistema"}]
+    acotado = app.bound_tool_result("z" * 60_000)
+    app.messages.append({"role": "tool", "tool_call_id": "c", "content": acotado})
+    original = acotado.split('id="')[1].split('"')[0]
+
+    app.clear_old_tool_results()
+    stub = app.messages[1]["content"]
+    assert f'id="{original}"' in stub, "the existing archive reference was replaced"
+    assert "z" * 100 in app.recall_tool_output({"id": original, "limit": 20000})
+
+
+def test_nothing_is_cleared_without_an_archive(tmp_path):
+    """Without somewhere to put the text, clearing it would lose it for good."""
+    app = _archiving_app(tmp_path)
+    app.tool_archive = ToolArchive("")
+    app.tool_result_keep = 0
+    app.messages = [{"role": "system", "content": "sistema"}]
+    app.messages.append({"role": "tool", "tool_call_id": "c", "content": "importante " * 500})
+
+    assert app.clear_old_tool_results() == 0
+    assert "importante" in app.messages[1]["content"]
+
+
+def test_markup_is_stripped_but_code_is_not(tmp_path):
+    """Angle brackets are everywhere in code; they are only markup in a document."""
+    html = "<html><head><style>body{color:red}</style></head><body><p>Hola</p><p>que tal</p></body></html>"
+    limpio = compress_for_context(html)
+    assert "<" not in limpio and "Hola" in limpio and "que tal" in limpio
+
+    codigo = 'if x < len(y) and z > 3:\n    return {"a": 1}\n'
+    # La indentacion ya se colapsa desde antes, pero los operadores de
+    # comparacion son lo que el detector de marcado no debe comerse.
+    compacto = compress_for_context(codigo)
+    assert "x < len(y) and z > 3" in compacto, "code was mistaken for markup"
+    assert 'return {"a": 1}' in compacto
+
+    diff = "--- a/file\n+++ b/file\n@@ -1 +1 @@\n-if a<b:\n+if a > b:\n"
+    assert compress_for_context(diff) == diff, "a diff was mistaken for markup"
+
+
+def test_repeated_lines_are_marked_instead_of_repeated():
+    linea = "PASSED tests/test_core.py::test_algo"
+    salida = "\n".join([linea] * 40)
+    compacto = compress_for_context(salida)
+    assert "repeated 40 times" in compacto
+    assert compacto.count(linea) == 1, "the line was still repeated 40 times"
+    # Una sola vez no se marca: no es una repetición.
+    assert compress_for_context(linea) == linea
+
+
+def test_base64_is_dropped_but_a_run_of_one_character_is_not():
+    import base64 as base64_module
+
+    carga = base64_module.b64encode(b"contenido binario " * 200).decode()
+    assert "base64 blob omitted" in compress_for_context(f"clave: {carga}")
+
+    # Un solo caracter repetido es relleno, no base64.
+    assert compress_for_context("x" * 50_000) == "x" * 50_000
+
+
+def test_tool_result_keep_is_configurable(tmp_path):
+    assert _configuration(tmp_path).tool_result_keep == 3
+    assert _configuration(tmp_path, TOOL_RESULT_KEEP="8").tool_result_keep == 8
+    with pytest.raises(AgentError, match="TOOL_RESULT_KEEP must be a positive integer"):
+        _configuration(tmp_path, TOOL_RESULT_KEEP="0")
 
 
 def test_the_capability_note_points_at_web_search_when_it_is_available():

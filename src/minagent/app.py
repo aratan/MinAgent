@@ -17,7 +17,13 @@ from datetime import datetime
 from typing import Any
 
 from .attachments import prepare_user_message as prepare_attachments
-from .config import DEFAULT_MAX_TOOL_ROUNDS, DEFAULT_TOOL_PREVIEW_CHARS, Config, load_configuration
+from .config import (
+    DEFAULT_MAX_TOOL_ROUNDS,
+    DEFAULT_TOOL_PREVIEW_CHARS,
+    DEFAULT_TOOL_RESULT_KEEP,
+    Config,
+    load_configuration,
+)
 from .context import (
     SUMMARY_INSTRUCTIONS,
     chunk_summary_transcript,
@@ -131,6 +137,10 @@ BRACKETED_PASTE_DISABLE = "\x1b[?2004l"
 PROMPT_VISIBLE_LENGTH = len("You › ")
 _COMPACT_COMMAND = re.compile(r"^\/compact(?:\s+([\s\S]*))?$", re.IGNORECASE)
 _USAGE_COMMAND = re.compile(r"^\/usage(?:\s+([\s\S]*))?$", re.IGNORECASE)
+# A tool result that tool result clearing already replaced with a stub.
+_CLEARED_TOOL_RESULT = re.compile(r"\A\[tool result cleared\b")
+# The archive reference a truncated result already carries.
+_ARCHIVED_REFERENCE_IN_TEXT = re.compile(r'id="([A-Za-z0-9_-]{1,64})"')
 _INIT_COMMAND = re.compile(r"^\/init(?:\s+([\s\S]*))?$", re.IGNORECASE)
 _SKILLS_COMMAND = re.compile(r"^\/skills(?:\s+([\s\S]*))?$", re.IGNORECASE)
 _SKILL_COMMAND = re.compile(r"^\/skill(?:\s+([\s\S]*))?$", re.IGNORECASE)
@@ -265,6 +275,7 @@ class MinAgent:
         self.endpoint_timeout_ms = 0
         self.max_tool_rounds = DEFAULT_MAX_TOOL_ROUNDS
         self.tool_preview_chars = DEFAULT_TOOL_PREVIEW_CHARS
+        self.tool_result_keep = DEFAULT_TOOL_RESULT_KEEP
         self.tool_archive = ToolArchive("")
         self.request_cache = RequestCache()
         self.input_modalities: list[str] = []
@@ -323,6 +334,7 @@ class MinAgent:
         self._session_tool_tokens: dict[str, int] = {}
         self._session_tool_calls: dict[str, int] = {}
         self._session_archived_tokens = 0
+        self._session_cleared_tool_result_tokens = 0
         self._tool_error_this_turn = False
         self._tool_errors_this_turn = 0
         self._web_search_prompted_this_turn = False
@@ -393,6 +405,7 @@ class MinAgent:
         self.endpoint_timeout_ms = config.endpoint_timeout_ms
         self.max_tool_rounds = config.max_tool_rounds
         self.tool_preview_chars = config.tool_preview_chars
+        self.tool_result_keep = config.tool_result_keep
         self.tool_archive = ToolArchive(config.application_root)
         self.input_modalities = config.input_modalities
         self.show_reasoning = config.show_reasoning
@@ -778,8 +791,63 @@ class MinAgent:
                         (f"{self._token_count(archived):>9}", "muted", False),
                     )
                 )
+        if self._session_cleared_tool_result_tokens:
+            self.ui_print_wrapped(
+                (
+                    (f"  {'limpiados del historial':<26}", "muted", False),
+                    (f"{self._token_count(self._session_cleared_tool_result_tokens):>9}", "muted", False),
+                )
+            )
         self.ui_print_wrapped((("╰─", "magenta", False),))
         self.print("")
+
+    def clear_old_tool_results(self, keep: int | None = None) -> int:
+        """Replace old tool results with a retrievable stub, keeping the tool call.
+
+        Anthropic calls this the safest, lightest touch of compaction: once a
+        tool result has been processed, the model rarely needs its text again,
+        and dropping it costs far less fidelity than summarising the whole
+        transcript. It runs before compaction for that reason.
+
+        Unlike Anthropic's server-side version, nothing is lost here: the result
+        is archived first and the stub names the reference, so the model can
+        bring any of it back with ``recall_tool_output``. A result that already
+        carries a reference keeps it instead of being archived twice.
+
+        Returns the number of tokens released.
+        """
+        keep = self.tool_result_keep if keep is None else keep
+        tool_indexes = [index for index, message in enumerate(self.messages) if message.get("role") == "tool"]
+        if len(tool_indexes) <= keep:
+            return 0
+
+        released = 0
+        cleared = 0
+        for index in tool_indexes[: len(tool_indexes) - max(0, keep)]:
+            message = self.messages[index]
+            content = message.get("content")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            if _CLEARED_TOOL_RESULT.match(content):
+                # Already a stub; clearing it again would only lose the reference.
+                continue
+
+            existing = _ARCHIVED_REFERENCE_IN_TEXT.search(content)
+            reference = existing.group(1) if existing else self.tool_archive.store(content)
+            if reference is None:
+                # Without an archive the text would be gone for good, so leave it.
+                continue
+
+            released += estimate_text_tokens(content)
+            cleared += 1
+            message["content"] = (
+                f"[tool result cleared to free the context window: {len(content)} characters, archived as "
+                f'{reference}. Call recall_tool_output with id="{reference}" to read any part of it back.]'
+            )
+
+        if cleared:
+            self._session_cleared_tool_result_tokens += released
+        return released
 
     def recall_tool_output(self, args: dict[str, Any]) -> str:
         """Return a slice of a tool result that was too large to keep inline."""
@@ -2160,6 +2228,26 @@ class MinAgent:
         estimated_tokens = self.estimate_current_context_tokens()
         if estimated_tokens <= threshold:
             return
+
+        # Cut old tool results before reaching for the expensive hammer. They are
+        # the bulk of a long transcript, they are recoverable, and clearing them
+        # keeps the model's own words instead of a lossy summary of everything.
+        released = self.clear_old_tool_results()
+        if released:
+            estimated_tokens = self.estimate_current_context_tokens()
+            self.print("")
+            self.ui_print_wrapped(
+                (
+                    (
+                        f"Cleared old tool results · freed ~{self._token_count(released)} tokens",
+                        "magenta",
+                        True,
+                    ),
+                )
+            )
+        if estimated_tokens <= threshold:
+            return
+
         conversation_messages = self.messages[1:]
         keep_recent = min(self.compaction_keep_recent_tokens, max(1, window // 8))
         cut_index = find_compaction_cut_point(conversation_messages, keep_recent)

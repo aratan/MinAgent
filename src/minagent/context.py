@@ -21,6 +21,29 @@ _ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 _TRAILING_SPACES = re.compile(r"[ \t]+\n")
 _MULTI_BLANK = re.compile(r"\n{3,}")
 _LONG_SPACES = re.compile(r"[ \t]{2,}")
+# Markup, comments and style blocks: the model wants the text, not the wrapper.
+_MARKUP_BLOCKS = re.compile(
+    r"<(script|style|head)\b[^>]*>.*?</\1\s*>|<!--.*?-->",
+    re.IGNORECASE | re.DOTALL,
+)
+_TAGS = re.compile(r"<[^>]+>")
+# A real tag: a name, optionally with attributes. `< len(y) and z >` is not one.
+_PLAUSIBLE_TAG = re.compile(r"</?[a-zA-Z][a-zA-Z0-9-]*(?:\s[^<>]*?)?/?>")
+# Below this share of removed text it is not a document, it is code or a diff.
+_MIN_MARKUP_SHARE = 0.15
+# A document has many tags even when its text is long, so this count catches the
+# markup that a share alone would miss. A stray tag in a diff never reaches it.
+_MIN_MARKUP_TAGS = 6
+_STYLE_LINE = re.compile(r"^\s*[\w-]+\s*\{[^}]*\}\s*$", re.MULTILINE)
+# Base64 blobs: attachments and inline images the model cannot read anyway.
+_DATA_URI = re.compile(r"data:[a-z0-9.+/-]+;base64,[A-Za-z0-9+/=]{200,}", re.IGNORECASE)
+# Long unbroken base64 runs outside a data: URI, such as a pasted key or hash.
+_BASE64_RUN = re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{400,}={0,2}(?![A-Za-z0-9+/=])")
+# A run of identical consecutive lines, which logs and test runners emit a lot.
+_REPEATED_LINE = re.compile(r"(?m)^(?P<line>[^\n]{1,200})\n(?=(?:[^\n]*\n)*?(?P=line)\n)")
+# Real base64 of any useful size spreads across many distinct characters; a run
+# of one repeated character is padding, a ruler, or a test fixture.
+_MIN_BASE64_DISTINCT = 12
 
 
 def _minify_json(text: str) -> str:
@@ -36,6 +59,74 @@ def _minify_json(text: str) -> str:
     return compact if len(compact) < len(text) else text
 
 
+def _strip_markup(text: str) -> str:
+    """Remove HTML and XML wrappers, but only when the text really is markup.
+
+    An agent sees web pages and email bodies far more often than it sees code,
+    so the tags go - but code and diffs are full of things that look like
+    markup, so two guards apply. There must be at least one tag with a plausible
+    name, which rules out comparisons like ``x < len(y) and z > 3``, and the
+    markup must account for a real share of the text, which rules out a stray
+    ``<b>`` inside a diff.
+    """
+    if "<" not in text or ">" not in text:
+        return text
+    tags = _PLAUSIBLE_TAG.findall(text)
+    if not tags:
+        return text
+    original = text.strip()
+    candidate = _MARKUP_BLOCKS.sub(" ", text)
+    candidate = _STYLE_LINE.sub("", candidate)
+    candidate = _TAGS.sub(" ", candidate)
+    if not candidate.strip():
+        return text
+    removed = len(original) - len(candidate.strip())
+    if removed < len(original) * _MIN_MARKUP_SHARE and len(tags) < _MIN_MARKUP_TAGS:
+        return text
+    return candidate
+
+
+def _drop_unreadable_blobs(text: str) -> str:
+    """Replace base64 payloads with a note, since the model cannot read them.
+
+    A long run of characters is only treated as base64 when it actually looks
+    like base64. Requiring a spread of distinct characters keeps a run of one
+    repeated character, which is padding or a ruler rather than an encoded blob.
+    """
+    if "base64," in text:
+        text = _DATA_URI.sub("[base64 payload omitted: the model cannot read image bytes]", text)
+    if not _BASE64_RUN.search(text):
+        return text
+
+    def replace(match: re.Match[str]) -> str:
+        run = match.group(0)
+        if len(set(run)) < _MIN_BASE64_DISTINCT:
+            return run
+        return "[base64 blob omitted: unreadable token noise]"
+
+    return _BASE64_RUN.sub(replace, text)
+
+
+def _collapse_repeats(text: str, minimum_run: int = 3) -> str:
+    """Mark runs of identical consecutive lines instead of repeating them."""
+    lines = text.split("\n")
+    if len(lines) < minimum_run * 2:
+        return text
+    out: list[str] = []
+    index = 0
+    while index < len(lines):
+        run = 1
+        while index + run < len(lines) and lines[index + run] == lines[index]:
+            run += 1
+        if run >= minimum_run and lines[index].strip():
+            out.append(f"{lines[index]} [... repeated {run} times]")
+            index += run
+        else:
+            out.append(lines[index])
+            index += 1
+    return "\n".join(out)
+
+
 def compress_for_context(text: str) -> str:
     """Shrink text without losing meaning so more of it fits the context window.
 
@@ -43,6 +134,13 @@ def compress_for_context(text: str) -> str:
     spaces, collapses runs of blank lines, and minifies pretty-printed JSON.
     These are lossless for meaning, unlike truncation, and cut common tool output
     (tables, diffs, JSON dumps) by a meaningful share.
+
+    On top of that, and only for text where it cannot cost information, it drops
+    markup wrappers, base64 blobs the model cannot read, and marks long runs of
+    repeated lines instead of repeating them. That is a deliberate trade: a
+    transcript that repeats a line forty times carries no more signal than one
+    that says it happened forty times. Anything that only looks like markup or
+    base64 in ordinary prose is left alone.
     """
     if not text:
         return text
@@ -51,7 +149,9 @@ def compress_for_context(text: str) -> str:
     text = _TRAILING_SPACES.sub("\n", text)
     text = _MULTI_BLANK.sub("\n\n", text)
     text = _LONG_SPACES.sub(" ", text)
-    return _minify_json(text)
+    text = _strip_markup(text)
+    text = _drop_unreadable_blobs(text)
+    return _minify_json(_collapse_repeats(text))
 
 SUMMARY_INSTRUCTIONS = """Create a concise checkpoint. Use these sections:
 

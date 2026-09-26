@@ -42,6 +42,7 @@ MCP_TIMEOUT_SECONDS=420
 TERMINAL_TIMEOUT_SECONDS=420
 MAX_TOOL_ROUNDS=64
 TOOL_PREVIEW_CHARS=12000
+TOOL_RESULT_KEEP=3
 OPENAI_SHOW_REASONING=off
 WORKSPACE_LIST_LIMIT=0
 TERMINAL_MODE=off
@@ -51,7 +52,7 @@ MEMORY_ENABLED=off
 WEB_SEARCH_ENABLED=off
 ```
 
-`OPENAI_MODEL` is required. `OPENAI_BASE_URL` defaults to `https://api.openai.com/v1` and is normalized to the `/chat/completions` endpoint. `OPENAI_API_KEY` is optional. `OPENAI_TIMEOUT_SECONDS`, `MCP_TIMEOUT_SECONDS`, and `TERMINAL_TIMEOUT_SECONDS` are positive integers in seconds and default to `420` (seven minutes); they bound one endpoint request, one MCP request, and one shell command respectively. `MAX_TOOL_ROUNDS` is a positive integer bounding how many tool-call rounds one turn may run before stopping, and defaults to `64`. `TOOL_PREVIEW_CHARS` is a positive integer bounding the inline preview of an oversized tool result, and defaults to `12000`.
+`OPENAI_MODEL` is required. `OPENAI_BASE_URL` defaults to `https://api.openai.com/v1` and is normalized to the `/chat/completions` endpoint. `OPENAI_API_KEY` is optional. `OPENAI_TIMEOUT_SECONDS`, `MCP_TIMEOUT_SECONDS`, and `TERMINAL_TIMEOUT_SECONDS` are positive integers in seconds and default to `420` (seven minutes); they bound one endpoint request, one MCP request, and one shell command respectively. `MAX_TOOL_ROUNDS` is a positive integer bounding how many tool-call rounds one turn may run before stopping, and defaults to `64`. `TOOL_PREVIEW_CHARS` is a positive integer bounding the inline preview of an oversized tool result, and defaults to `12000`. `TOOL_RESULT_KEEP` is a positive integer bounding how many recent tool results stay verbatim in the transcript, and defaults to `3`.
 
 Boolean settings use only `on` and `off`:
 
@@ -91,6 +92,16 @@ The model chooses when it needs workspace contents. With `WORKSPACE_LIST_LIMIT=0
 MinAgent verifies the persisted contents before a successful edit or write tool reports completion. A model response may request at most 16 tool calls; a turn may use at most `MAX_TOOL_ROUNDS` tool rounds (64 by default). Tool output stored in the conversation is compressed first (ANSI colour stripped, line endings normalised, blank-line and space runs collapsed, whole-JSON payloads minified) and, when it still exceeds `TOOL_PREVIEW_CHARS`, reduced to a head-and-tail preview. The omitted text is not discarded: it is stored zlib-compressed under `.minagent/tool-outputs/`, and the truncation note names an id the model passes to `recall_tool_output` to read any character range of the original back. Recall is exact, so a result is never permanently lost, and a single recall is capped so it cannot refill the window the archive just freed.
 
 Keeping the result recoverable is what lets the inline preview stay small. Before, one result was allowed to occupy up to a quarter of the window - roughly 65,000 tokens on the default window - and whatever did not fit was gone. Now a single result costs at most `TOOL_PREVIEW_CHARS` (about 2,800 tokens by default) and the rest is one `recall_tool_output` call away. Compression earns its place here by making the off-window copy cheap to keep: an archive is capped at 64 MB and its oldest entries are pruned past that, a single result over 8 MB is not archived at all, and a session with no archive root falls back to the old truncation.
+
+## Clearing old tool results
+
+Before MinAgent resorts to summarising a conversation, it clears the old tool results out of it. Anthropic calls this the safest, lightest touch of compaction: once a tool result has been processed the model rarely needs its text again, and dropping it costs far less fidelity than summarising everything. `TOOL_RESULT_KEEP` (3 by default) recent results are kept verbatim; older ones are replaced with a stub that names an archive reference, so unlike Anthropic's server-side clearing nothing is lost - the model can bring any part of it back with `recall_tool_output`. A result that was already truncated keeps its existing reference instead of being archived twice, and nothing is cleared at all when there is nowhere to archive it. On a forty-turn editing session this frees about 91% of the transcript, which means the lossy summary step runs far less often.
+
+Two notes on the trade-offs. Clearing invalidates the cached prefix where it happens, which is why it only runs when the conversation is already over the compaction threshold rather than after every turn. And editing earlier turns can invalidate reasoning blocks in later turns on reasoning models, so the cleared history is kept for recall rather than rewritten.
+
+## Filtering tool output without asking the model
+
+Alongside the lossless compression above, `compress_for_context` also drops things the model cannot use, and it does so without a second model call: HTML and XML wrappers, base64 blobs, and long runs of an identical line, which become a note saying how many times it repeated. That last one is a deliberate trade - a transcript repeating a line forty times carries no more signal than one saying it happened forty times. The guards matter, because an agent reads far more code than markup: tags are only stripped when at least one has a plausible tag name, so a comparison like `x < len(y) and z > 3` survives, and either a real share of the text is markup or the document has several tags, so a single `<b>` in a diff survives. Repeating a line, in test output, saves around 99%.
 
 ## Prompt caching and request replay
 
