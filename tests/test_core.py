@@ -1014,6 +1014,83 @@ def test_tool_result_keep_is_configurable(tmp_path):
         _configuration(tmp_path, TOOL_RESULT_KEEP="0")
 
 
+def test_the_lossy_filters_never_touch_source_code():
+    """An audit found the markup filter eating this very file's regexes.
+
+    Anything that reads as source, a diff, a stylesheet or structured config has
+    to come back with every token intact, because a stripped token in code is a
+    bug the model can neither see nor fix.
+    """
+    for nombre, texto in (
+        ("python", 'def _TAGS = re.compile(r"<[^>]+>")\n    return _TAGS.sub(" ", text)\n'),
+        ("xml", '<?xml version="1.0"?>\n<config><item id="1">clave</item></config>'),
+        ("diff", "--- a/f\n+++ b/f\n@@ -1 +1 @@\n-if a<b:\n+if a > b\n"),
+        ("css", ".a { color: red; }\n.b { color: blue; }\n"),
+        ("json", '{"claves": [1, 2, 3], "mapa": {"a": {"b": "c"}}}'),
+        ("sql", "SELECT * FROM t WHERE a < 5 AND b > 2;"),
+        ("compilacion", "#include <stdio.h>\nint main(void) { return 0; }\n"),
+    ):
+        salida = compress_for_context(texto)
+        assert [linea.strip() for linea in salida.split("\n") if linea.strip()] == [
+            linea.strip() for linea in texto.split("\n") if linea.strip()
+        ], f"the lossy filters altered {nombre}"
+
+
+def test_a_run_of_spaces_inside_a_string_literal_is_not_collapsed():
+    """A padding string is data: collapsing it silently changes the program."""
+    codigo = 'self.ui_print_wrapped((("     ", "pale", False), (line, "pale", False)))'
+    assert '"     "' in compress_for_context(codigo)
+
+    # La misma compressing en salida de terminal, que si se colapsa.
+    assert compress_for_context("columna1          columna2") == "columna1 columna2"
+
+
+def test_the_markup_filter_keeps_a_tag_mentioned_in_a_sentence():
+    """The attribute is the whole point of mentioning the tag."""
+    frase = "usa <div class='x'> con cuidado"
+    assert "<div class='x'>" in compress_for_context(frase)
+
+
+def test_the_markup_filter_still_strips_a_real_document():
+    documento = (
+        "<html><head><style>body{color:red}</style></head><body>"
+        + "<p>Hola</p><p>que tal</p><p>bien</p><p>gracias</p>"
+        + "</body></html>"
+    )
+    limpio = compress_for_context(documento)
+    assert "<" not in limpio
+    assert "Hola" in limpio and "que tal" in limpio
+
+
+def test_repeated_lines_are_never_collapsed_in_code():
+    """Two identical assertions in a test are the test, not noise."""
+    test = "def test_x():\n    assert calcula(1) == 1\n    assert calcula(1) == 1\n"
+    assert "repeated" not in compress_for_context(test)
+
+
+def test_repeated_lines_are_collapsed_in_command_output():
+    salida = "\n".join(["PASSED tests/test_core.py::test_algo"] * 12)
+    compacto = compress_for_context(salida)
+    assert "repeated 12 times" in compacto
+    assert compacto.count("PASSED") == 1
+
+
+def test_reading_a_source_file_of_this_project_keeps_every_line():
+    """The end-to-end version of the audit: this repo's own modules survive."""
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent / "src" / "minagent"
+    modulos = sorted(root.glob("*.py"))
+    assert modulos, "no source files found to check"
+    for modulo in modulos:
+        fuente = modulo.read_text(encoding="utf-8")
+        salida = compress_for_context(fuente)
+        original = [linea.strip() for linea in fuente.split("\n") if linea.strip()]
+        resultante = {linea.strip() for linea in salida.split("\n") if linea.strip()}
+        ausentes = [linea for linea in original if linea not in resultante]
+        assert not ausentes, f"{modulo.name} lost {len(ausentes)} lines, first: {ausentes[0]!r}"
+
+
 def test_the_capability_note_points_at_web_search_when_it_is_available():
     """Un modelo que dice 'no tengo noticias' necesita que le digan qué herramienta usar."""
     app, _output = _make_app(100)

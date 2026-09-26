@@ -31,8 +31,9 @@ _TAGS = re.compile(r"<[^>]+>")
 _PLAUSIBLE_TAG = re.compile(r"</?[a-zA-Z][a-zA-Z0-9-]*(?:\s[^<>]*?)?/?>")
 # Below this share of removed text it is not a document, it is code or a diff.
 _MIN_MARKUP_SHARE = 0.15
-# A document has many tags even when its text is long, so this count catches the
-# markup that a share alone would miss. A stray tag in a diff never reaches it.
+# A tag count is required as well as a share: an audit showed that a share alone
+# still ate a `<div class='x'>` mentioned inside a sentence, where the attribute
+# is the whole point. Documents have many tags, a stray mention has one.
 _MIN_MARKUP_TAGS = 6
 _STYLE_LINE = re.compile(r"^\s*[\w-]+\s*\{[^}]*\}\s*$", re.MULTILINE)
 # Base64 blobs: attachments and inline images the model cannot read anyway.
@@ -44,6 +45,21 @@ _REPEATED_LINE = re.compile(r"(?m)^(?P<line>[^\n]{1,200})\n(?=(?:[^\n]*\n)*?(?P=
 # Real base64 of any useful size spreads across many distinct characters; a run
 # of one repeated character is padding, a ruler, or a test fixture.
 _MIN_BASE64_DISTINCT = 12
+
+# The lossy filters below are for prose and command output. Source code and
+# structured config look enough like markup to trip them, and mangling either is
+# far worse than leaving a few tokens on the table, so they are skipped there.
+_CODE_SIGNAL = re.compile(
+    r"(?m)^\s*(?:def |class |import |from \S+ import|func |function |public |private |#include"
+    r"|package |use |module |interface |impl |struct |enum |fn |impl |SELECT |UPDATE |INSERT )"
+    r"|^\s*[-+]{3} [ab]/"
+    r"|^@@ -\d"
+    r"|=>|::\s*\w+\s*\{|<\?xml|<!DOCTYPE|<!doctype"
+)
+_CODE_OPENER = re.compile(r"\A\s*(?:#!|<\?xml|<!DOCTYPE|<\!doctype|diff --git|\{\s*$|\[\s*$)")
+_CODE_PUNCTUATION = re.compile(r"[{}();]|=>|::|->")
+# A CSS or config file: mostly selectors and declarations, little prose.
+_STYLESHEET = re.compile(r"(?m)^\s*[.#]?[\w-]+\s*\{[^}]*\}\s*$")
 
 
 def _minify_json(text: str) -> str:
@@ -72,7 +88,7 @@ def _strip_markup(text: str) -> str:
     if "<" not in text or ">" not in text:
         return text
     tags = _PLAUSIBLE_TAG.findall(text)
-    if not tags:
+    if len(tags) < _MIN_MARKUP_TAGS:
         return text
     original = text.strip()
     candidate = _MARKUP_BLOCKS.sub(" ", text)
@@ -81,7 +97,7 @@ def _strip_markup(text: str) -> str:
     if not candidate.strip():
         return text
     removed = len(original) - len(candidate.strip())
-    if removed < len(original) * _MIN_MARKUP_SHARE and len(tags) < _MIN_MARKUP_TAGS:
+    if removed < len(original) * _MIN_MARKUP_SHARE and len(tags) < _MIN_MARKUP_TAGS * 4:
         return text
     return candidate
 
@@ -127,13 +143,48 @@ def _collapse_repeats(text: str, minimum_run: int = 3) -> str:
     return "\n".join(out)
 
 
+def looks_like_code_or_config(text: str) -> bool:
+    """True when the lossy filters must not touch the text.
+
+    Source files, diffs, stylesheets and XML/JSON config are full of things that
+    look like markup and are not. An audit found the markup filter mangling an
+    XML config, a ``<div class='x'>`` inside a sentence, and - worst - this very
+    file, whose regex definitions were being stripped as if they were tags. The
+    cost of skipping a little whitespace on code is far below the cost of making
+    code unreadable.
+    """
+    stripped = text.lstrip()
+    if not stripped:
+        return False
+    if _CODE_OPENER.match(stripped):
+        return True
+    if len(_CODE_SIGNAL.findall(text)) >= 2:
+        return True
+    if _STYLESHEET.search(text) and len(_STYLESHEET.findall(text)) * 4 >= len(text.split("\n")):
+        return True
+
+    # A short excerpt still has to be protected: read_file with a limit returns
+    # a handful of lines, and those can carry the very string literals that must
+    # not be touched. Quotes alongside dense punctuation mean code; a terminal
+    # line can be dense without being quoted.
+    lines = [line for line in text.split("\n") if line.strip()]
+    quotes = text.count('"') + text.count("'")
+    if len(lines) < 3:
+        return quotes >= 2 and len(_CODE_PUNCTUATION.findall(text)) >= 3
+
+    densas = sum(1 for line in lines if len(_CODE_PUNCTUATION.findall(line)) >= 2)
+    return densas * 3 >= len(lines)
+
+
 def compress_for_context(text: str) -> str:
     """Shrink text without losing meaning so more of it fits the context window.
 
-    Strips ANSI colour, normalises line endings, removes trailing and repeated
-    spaces, collapses runs of blank lines, and minifies pretty-printed JSON.
-    These are lossless for meaning, unlike truncation, and cut common tool output
-    (tables, diffs, JSON dumps) by a meaningful share.
+    Strips ANSI colour, normalises line endings, removes trailing spaces,
+    collapses runs of blank lines, and minifies pretty-printed JSON. These are
+    lossless for meaning, unlike truncation, and cut common tool output (tables,
+    diffs, JSON dumps) by a meaningful share. Space runs and the lossy passes
+    below are skipped for source code, where a run of spaces inside a string
+    literal is data rather than formatting.
 
     On top of that, and only for text where it cannot cost information, it drops
     markup wrappers, base64 blobs the model cannot read, and marks long runs of
@@ -148,10 +199,16 @@ def compress_for_context(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = _TRAILING_SPACES.sub("\n", text)
     text = _MULTI_BLANK.sub("\n\n", text)
-    text = _LONG_SPACES.sub(" ", text)
-    text = _strip_markup(text)
+    # Base64 is unreadable wherever it appears, so it always goes. Everything
+    # that can change what the text *means* is limited to prose and command
+    # output. Collapsing runs of spaces belongs there too: inside a string
+    # literal a run of spaces is data, so a padding string would silently
+    # change meaning in any source file that passed through here.
     text = _drop_unreadable_blobs(text)
-    return _minify_json(_collapse_repeats(text))
+    if looks_like_code_or_config(text):
+        return _minify_json(text)
+    text = _LONG_SPACES.sub(" ", text)
+    return _minify_json(_collapse_repeats(_strip_markup(text)))
 
 SUMMARY_INSTRUCTIONS = """Create a concise checkpoint. Use these sections:
 
