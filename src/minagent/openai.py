@@ -149,8 +149,13 @@ def _consume_frame(
         reasoning_delta = reasoning_content
     else:
         reasoning_delta = ""
-    if reasoning_delta and on_reasoning_delta is not None:
-        on_reasoning_delta(reasoning_delta)
+    if reasoning_delta:
+        # Keep the reasoning even when nothing renders it: a reasoning model can
+        # finish a turn with only this channel filled, and dropping it would look
+        # exactly like an endpoint that returned nothing.
+        state["reasoning"] += reasoning_delta
+        if on_reasoning_delta is not None:
+            on_reasoning_delta(reasoning_delta)
 
     content = delta.get("content")
     if isinstance(content, str) and content:
@@ -199,6 +204,7 @@ async def read_streaming_response(
     tool_calls: dict[int, dict[str, Any]] = {}
     state: dict[str, Any] = {
         "content": "",
+        "reasoning": "",
         "usage": None,
         "finish_reason": None,
         "finished": False,
@@ -240,7 +246,7 @@ async def read_streaming_response(
             if buffer.strip():
                 _consume_frame(buffer, tool_calls, state, on_text_delta, on_reasoning_delta)
             if not state["finished"] and not state["finish_reason"]:
-                if state["content"] or tool_calls or state["usage"]:
+                if state["content"] or state["reasoning"] or tool_calls or state["usage"]:
                     # The server closed the stream without a finish reason. Keep
                     # what arrived and mark it incomplete, rather than discarding
                     # a partial answer the user already saw stream by.
@@ -261,6 +267,8 @@ async def read_streaming_response(
 
     content = state["content"]
     message: dict[str, Any] = {"role": "assistant", "content": content or None}
+    if state["reasoning"]:
+        message["reasoning_content"] = state["reasoning"]
     if tool_calls:
         message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
     finish_reason = state["finish_reason"]
@@ -276,6 +284,8 @@ async def read_streaming_response(
         except (json.JSONDecodeError, ValueError):
             raise AgentError(f"Endpoint returned invalid arguments for tool {call['function']['name']}.") from None
     payload: dict[str, Any] = {"usage": state["usage"], "finish_reason": finish_reason}
+    if state["reasoning"]:
+        payload["reasoning_tokens"] = len(state["reasoning"]) // 4
     if finish_reason == "length" or stream_incomplete:
         # Keep the partial text instead of discarding it; the caller continues it.
         payload["truncated"] = True

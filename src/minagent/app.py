@@ -129,6 +129,7 @@ BRACKETED_PASTE_DISABLE = "\x1b[?2004l"
 
 PROMPT_VISIBLE_LENGTH = len("You › ")
 _COMPACT_COMMAND = re.compile(r"^\/compact(?:\s+([\s\S]*))?$", re.IGNORECASE)
+_USAGE_COMMAND = re.compile(r"^\/usage(?:\s+([\s\S]*))?$", re.IGNORECASE)
 _INIT_COMMAND = re.compile(r"^\/init(?:\s+([\s\S]*))?$", re.IGNORECASE)
 _SKILLS_COMMAND = re.compile(r"^\/skills(?:\s+([\s\S]*))?$", re.IGNORECASE)
 _SKILL_COMMAND = re.compile(r"^\/skill(?:\s+([\s\S]*))?$", re.IGNORECASE)
@@ -203,6 +204,7 @@ UI_COLORS = {
 
 SLASH_COMMANDS = [
     {"name": "context", "description": "Show prompt token estimates by component"},
+    {"name": "usage", "description": "Show what each tool costs in context tokens"},
     {"name": "compact", "description": "Compact conversation history manually"},
     {"name": "init", "description": "Create or update AGENTS.md"},
     {"name": "skills", "description": "List, reload, or delete local skills"},
@@ -312,6 +314,13 @@ class MinAgent:
         self._current_user_request = ""
         self._steps_this_turn: list[str] = []
         self._tools_used_this_turn: list[str] = []
+        # Token telemetry: what each tool actually costs the context window.
+        self._turn_tool_tokens: dict[str, int] = {}
+        self._turn_tool_calls: dict[str, int] = {}
+        self._turn_archived_tokens = 0
+        self._session_tool_tokens: dict[str, int] = {}
+        self._session_tool_calls: dict[str, int] = {}
+        self._session_archived_tokens = 0
         self._tool_error_this_turn = False
         self._tool_errors_this_turn = 0
         self._web_search_prompted_this_turn = False
@@ -709,6 +718,67 @@ class MinAgent:
             raise AgentError("Memory is not enabled for this session.")
         return self.memory_store
 
+    def _record_tool_tokens(self, name: str, raw_text: str, bounded_text: str) -> None:
+        """Account for what one tool result cost the context window.
+
+        The archived size is the difference between what the result was and
+        what stayed inline, which is the part of the saving the archive is
+        responsible for.
+        """
+        spent = estimate_text_tokens(bounded_text)
+        archived = max(0, estimate_text_tokens(raw_text) - spent)
+        self._turn_tool_tokens[name] = self._turn_tool_tokens.get(name, 0) + spent
+        self._turn_tool_calls[name] = self._turn_tool_calls.get(name, 0) + 1
+        self._session_tool_tokens[name] = self._session_tool_tokens.get(name, 0) + spent
+        self._session_tool_calls[name] = self._session_tool_calls.get(name, 0) + 1
+        self._turn_archived_tokens += archived
+        self._session_archived_tokens += archived
+
+    def reset_turn_token_usage(self) -> None:
+        """Start a fresh per-turn tally without losing the session totals."""
+        self._turn_tool_tokens = {}
+        self._turn_tool_calls = {}
+        self._turn_archived_tokens = 0
+
+    def print_token_usage(self) -> None:
+        """Print where the context window actually goes, per turn and per tool."""
+        self.print("")
+        self.ui_print_wrapped((("╭─ USO DE TOKENS", "magenta", True),))
+
+        for label, tokens, calls, archived in (
+            ("este turno", self._turn_tool_tokens, self._turn_tool_calls, self._turn_archived_tokens),
+            ("sesión", self._session_tool_tokens, self._session_tool_calls, self._session_archived_tokens),
+        ):
+            total = sum(tokens.values())
+            if not total and not archived:
+                self.ui_print_wrapped(((f"{label}: sin llamadas a herramientas todavía", "muted", False),))
+                continue
+            self.ui_print_wrapped(
+                (
+                    (f"{label}", "pale", True),
+                    (f"  {self._token_count(total)} tokens de resultados", "muted", False),
+                )
+            )
+            for tool_name in sorted(tokens, key=lambda key: -tokens[key]):
+                share = tokens[tool_name] * 100 // total if total else 0
+                count = calls[tool_name]
+                self.ui_print_wrapped(
+                    (
+                        (f"  {tool_name:<26}", "cyan", False),
+                        (f"{self._token_count(tokens[tool_name]):>9}", "pale", False),
+                        (f"  {share:>3}%  {count} llamada{'s' if count != 1 else ''}", "muted", False),
+                    )
+                )
+            if archived:
+                self.ui_print_wrapped(
+                    (
+                        (f"  {'fuera de la ventana (archivo)':<26}", "muted", False),
+                        (f"{self._token_count(archived):>9}", "muted", False),
+                    )
+                )
+        self.ui_print_wrapped((("╰─", "magenta", False),))
+        self.print("")
+
     def recall_tool_output(self, args: dict[str, Any]) -> str:
         """Return a slice of a tool result that was too large to keep inline."""
         reference = args.get("id")
@@ -1062,6 +1132,12 @@ class MinAgent:
         if self.skills_enabled:
             lines.append(
                 "If a reusable capability is genuinely missing, save it with write_skill, then load_skill it and follow it."
+            )
+        if self.web_search_enabled:
+            lines.append(
+                "web_search searches the web and web_fetch reads a specific page: for anything current -news, "
+                "prices, weather, today's date in the news, releases- call web_search first instead of answering "
+                "from memory or telling the user to go elsewhere."
             )
         if self.mcp_enabled:
             lines.append(
@@ -2389,6 +2465,23 @@ class MinAgent:
                     return combined
                 final_text = f"{continued_text}{final_text}".strip()
                 if not final_text.strip():
+                    # Un modelo de razonamiento puede cerrar el turno pensando y
+                    # sin escribir nada en el canal de contenido. Eso no es una
+                    # respuesta vacía: el razonamiento es lo único que produjo,
+                    # asi que se devuelve en lugar de fallar la sesión.
+                    reasoning_only = str(message.get("reasoning_content") or "").strip()
+                    if reasoning_only and not payload.get("truncated"):
+                        final_text = reasoning_only
+                        self.ui_print_wrapped(
+                            (
+                                (
+                                    "The model answered only in its reasoning channel; showing that instead.",
+                                    "warning",
+                                    False,
+                                ),
+                            )
+                        )
+                if not final_text.strip():
                     empty_response_retries += 1
                     if empty_response_retries < 2:
                         self.ui_print_wrapped(
@@ -2506,8 +2599,14 @@ class MinAgent:
                 if isinstance(result, str) and _DENIED_RESULT.match(result):
                     denied_tool_calls += 1
                 if isinstance(result, dict) and "tool_text" in result:
+                    raw_tool_text = result["tool_text"]
+                else:
+                    raw_tool_text = str(result)
+                bounded_tool_text = self.bound_tool_result(raw_tool_text)
+                self._record_tool_tokens(name, raw_tool_text, bounded_tool_text)
+                if isinstance(result, dict) and "tool_text" in result:
                     self.messages.append(
-                        {"role": "tool", "tool_call_id": call_id, "content": self.bound_tool_result(result["tool_text"])}
+                        {"role": "tool", "tool_call_id": call_id, "content": bounded_tool_text}
                     )
                     if result.get("image"):
                         pending_images.append(result["image"])
@@ -2515,7 +2614,7 @@ class MinAgent:
                         pending_images.extend(result["images"])
                 else:
                     self.messages.append(
-                        {"role": "tool", "tool_call_id": call_id, "content": self.bound_tool_result(str(result))}
+                        {"role": "tool", "tool_call_id": call_id, "content": bounded_tool_text}
                     )
                 if (signal is not None and signal.cancelled) and call_index + 1 < len(calls):
                     self._append_canceled_tool_messages(calls[call_index + 1:])
@@ -2648,6 +2747,12 @@ class MinAgent:
                     doctor_match = _DOCTOR_COMMAND.match(text_input)
                     model_match = _MODEL_COMMAND.match(text_input)
                     try:
+                        if _USAGE_COMMAND.match(text_input):
+                            state["selected_files"].clear()
+                            self.clear_submitted_input(text_input, PROMPT_VISIBLE_LENGTH, input_rows_to_clear)
+                            self.print_user_bubble(text_input)
+                            self.print_token_usage()
+                            continue
                         if prompt.lower() == "/context":
                             state["selected_files"].clear()
                             self.clear_submitted_input(text_input, PROMPT_VISIBLE_LENGTH, input_rows_to_clear)
@@ -2748,6 +2853,7 @@ class MinAgent:
                         self._memory_remembered_this_turn = False
                         self._tools_used_this_turn = []
                         self._steps_this_turn = []
+                        self.reset_turn_token_usage()
                         self._tool_error_this_turn = False
                         self._tool_errors_this_turn = 0
                         self._web_search_prompted_this_turn = False

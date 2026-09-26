@@ -686,6 +686,109 @@ def test_an_oversized_result_is_not_worth_archiving(tmp_path):
     assert app.tool_archive.stored_bytes() == 0
 
 
+def test_token_usage_is_accounted_per_tool(tmp_path):
+    """Each tool result must be charged for what it really cost the window."""
+    app = _archiving_app(tmp_path)
+    app._record_tool_tokens("read_file", "a" * 4000, "a" * 1000)
+    app._record_tool_tokens("read_file", "b" * 4000, "b" * 1000)
+    app._record_tool_tokens("run_terminal", "c" * 400, "c" * 400)
+
+    assert app._turn_tool_calls == {"read_file": 2, "run_terminal": 1}
+    assert app._turn_tool_tokens["read_file"] > app._turn_tool_tokens["run_terminal"]
+    # The part moved out of the window by the archive is tracked separately.
+    assert app._turn_archived_tokens > 0
+
+
+def test_resetting_a_turn_keeps_the_session_totals(tmp_path):
+    app = _archiving_app(tmp_path)
+    app._record_tool_tokens("read_file", "a" * 4000, "a" * 1000)
+    session_total = app._session_tool_tokens["read_file"]
+    assert session_total > 0
+
+    app.reset_turn_token_usage()
+    assert app._turn_tool_tokens == {}
+    assert app._turn_tool_calls == {}
+    assert app._turn_archived_tokens == 0
+    assert app._session_tool_tokens["read_file"] == session_total, "the session tally was reset by mistake"
+
+
+def test_the_usage_command_lists_every_tool_it_charged(tmp_path):
+    app = _archiving_app(tmp_path)
+    app._record_tool_tokens("read_file", "a" * 4000, "a" * 1000)
+    app._record_tool_tokens("read_file", "a" * 2000, "a" * 500)
+    app._record_tool_tokens("run_terminal", "b" * 9000, "b" * 4000)
+    output = FakeOutput(100)
+    app._stdout = output
+
+    app.print_token_usage()
+    text = output.text
+    assert "USO DE TOKENS" in text
+    assert "read_file" in text and "run_terminal" in text
+    assert "2 llamadas" in text
+    assert "1 llamadas" not in text, "una sola llamada no se escribe en plural"
+    assert "  1 llamada" in text
+    assert "fuera de la ventana" in text, "the archived saving was not reported"
+
+
+def test_the_usage_command_survives_a_turn_with_no_tools(tmp_path):
+    app = _archiving_app(tmp_path)
+    output = FakeOutput(100)
+    app._stdout = output
+    app.print_token_usage()
+    assert "sin llamadas a herramientas" in output.text
+
+
+def test_an_archived_result_reports_what_it_saved(tmp_path):
+    """The telemetry has to see the archive doing its job, not just the preview."""
+    app = _archiving_app(tmp_path)
+    original = "z" * 200_000
+    bounded = app.bound_tool_result(original)
+    app._record_tool_tokens("run_terminal", original, bounded)
+
+    assert app._turn_tool_tokens["run_terminal"] < app._turn_tool_calls["run_terminal"] * 200_000 / 3
+    assert app._turn_archived_tokens > 0
+
+
+def test_the_capability_note_points_at_web_search_when_it_is_available():
+    """Un modelo que dice 'no tengo noticias' necesita que le digan qué herramienta usar."""
+    app, _output = _make_app(100)
+    app.web_search_enabled = False
+    assert "web_search searches the web" not in app.missing_capability_note()
+
+    app.web_search_enabled = True
+    note = app.missing_capability_note()
+    assert "web_search searches the web" in note
+    assert "call web_search first" in note
+
+
+def test_a_reasoning_only_response_is_answered_instead_of_failing(tmp_path):
+    """Un modelo que solo razona no puede parecer un endpoint que no responde."""
+    from minagent.openai import read_streaming_response
+
+    class FakeStream:
+        def __init__(self, frames):
+            self._frames = frames
+
+        async def aiter_bytes(self):
+            for frame in self._frames:
+                yield frame
+
+    def frame(payload):
+        return f"data: {json.dumps(payload)}\n\n".encode()
+
+    stream = FakeStream(
+        [
+            frame({"choices": [{"delta": {"reasoning_content": "estoy pensando "}}]}),
+            frame({"choices": [{"delta": {"reasoning_content": "en la respuesta"}}]}),
+            frame({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+            b"data: [DONE]\n\n",
+        ]
+    )
+    result = asyncio.run(read_streaming_response(stream))
+    assert result["message"]["content"] is None
+    assert result["message"]["reasoning_content"] == "estoy pensando en la respuesta"
+
+
 def test_the_recall_tool_is_exposed_to_the_model():
     app, _output = _make_app(80)
     names = {tool["function"]["name"] for tool in app.tools}
