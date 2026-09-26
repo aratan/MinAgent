@@ -37,20 +37,41 @@ RETRYABLE_NETWORK_ERRORS = {
     httpx.WriteTimeout,
 }
 
+# A busy server is worth retrying; a client error is not.
+RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+DEFAULT_RETRY_DELAY_SECONDS = 0.25
+MAX_RETRY_AFTER_SECONDS = 30.0
+MAX_REQUEST_ATTEMPTS = 3
+
 _FRAME_BOUNDARY = re.compile(r"\r?\n\r?\n")
 
 
-async def _wait_for_retry_delay(signal: CancellationToken | None) -> None:
-    """Pause briefly before retrying a connection, unless cancelled first."""
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    """The server's ``Retry-After`` in seconds, bounded, or ``None``."""
+    value = response.headers.get("retry-after")
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        return None
+    return min(max(seconds, 0.0), MAX_RETRY_AFTER_SECONDS)
+
+
+async def _wait_for_retry_delay(signal: CancellationToken | None, delay: float | None = None) -> None:
+    """Pause before a retry, honouring a ``Retry-After`` and any cancellation."""
     import asyncio
 
+    seconds = DEFAULT_RETRY_DELAY_SECONDS if delay is None else delay
+    if seconds <= 0:
+        return
     if signal is None:
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(seconds)
         return
     if signal.cancelled:
         raise OperationAborted("The operation was aborted.")
     try:
-        await asyncio.wait_for(signal.wait(), timeout=0.25)
+        await asyncio.wait_for(signal.wait(), timeout=seconds)
     except asyncio.TimeoutError:
         return
     raise OperationAborted("The operation was aborted.")
@@ -182,6 +203,7 @@ async def read_streaming_response(
     buffer = ""
     bytes_read = 0
     interrupted = False
+    stream_incomplete = False
     decoder = codecs.getincrementaldecoder("utf-8")()
 
     try:
@@ -215,7 +237,14 @@ async def read_streaming_response(
             if buffer.strip():
                 _consume_frame(buffer, tool_calls, state, on_text_delta, on_reasoning_delta)
             if not state["finished"] and not state["finish_reason"]:
-                raise AgentError("Endpoint stream ended before a complete response was received.")
+                if state["content"] or tool_calls or state["usage"]:
+                    # The server closed the stream without a finish reason. Keep
+                    # what arrived and mark it incomplete, rather than discarding
+                    # a partial answer the user already saw stream by.
+                    state["finish_reason"] = "incomplete"
+                    stream_incomplete = True
+                else:
+                    raise AgentError("Endpoint stream ended before a complete response was received.")
         except httpx.HTTPError:
             if signal is None or not signal.cancelled:
                 raise
@@ -244,7 +273,7 @@ async def read_streaming_response(
         except (json.JSONDecodeError, ValueError):
             raise AgentError(f"Endpoint returned invalid arguments for tool {call['function']['name']}.") from None
     payload: dict[str, Any] = {"usage": state["usage"], "finish_reason": finish_reason}
-    if finish_reason == "length":
+    if finish_reason == "length" or stream_incomplete:
         # Keep the partial text instead of discarding it; the caller continues it.
         payload["truncated"] = True
     return {"payload": payload, "message": message}
@@ -415,9 +444,13 @@ class OpenAiClient:
             request_body["max_tokens"] = options["max_tokens"]
 
         timeout = httpx.Timeout(self.timeout_ms / 1000) if self.timeout_ms > 0 else httpx.Timeout(None)
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+        async with httpx.AsyncClient(
+            timeout=timeout, follow_redirects=False, transport=self.transport
+        ) as client:
             response: httpx.Response | None = None
-            for attempt in range(2):
+            stream: Any = None
+            for attempt in range(MAX_REQUEST_ATTEMPTS):
+                last_attempt = attempt == MAX_REQUEST_ATTEMPTS - 1
                 try:
                     stream = client.stream(
                         "POST",
@@ -426,18 +459,27 @@ class OpenAiClient:
                         json=request_body,
                     )
                     response = await stream.__aenter__()
-                    break
                 except RETRYABLE_NETWORK_ERRORS as error:
                     if signal is not None and signal.cancelled:
                         raise OperationAborted("The operation was aborted.") from error
-                    if attempt == 0:
-                        await _wait_for_retry_delay(signal)
+                    if not last_attempt:
+                        await _wait_for_retry_delay(signal, DEFAULT_RETRY_DELAY_SECONDS * (attempt + 1))
                         continue
                     raise AgentError(
                         f"Could not connect to the OpenAI-compatible endpoint: {error}"
                     ) from error
+                if response.status_code in RETRYABLE_STATUSES and not last_attempt:
+                    retry_after = _retry_after_seconds(response)
+                    await stream.__aexit__(None, None, None)
+                    stream = None
+                    response = None
+                    await _wait_for_retry_delay(
+                        signal, retry_after if retry_after is not None else DEFAULT_RETRY_DELAY_SECONDS * (attempt + 1)
+                    )
+                    continue
+                break
 
-            assert response is not None
+            assert response is not None and stream is not None
             try:
                 if response.status_code >= 400:
                     body_text = await _read_response_prefix(response, 8 * 1024, signal)
