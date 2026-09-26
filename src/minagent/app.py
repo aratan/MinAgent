@@ -356,6 +356,7 @@ class MinAgent:
         self.api_key: str | None = None
         self.model = ""
         self.context_window = 0
+        self.model_context_length: int | None = None
         self.endpoint_timeout_ms = 0
         self.input_modalities: list[str] = []
         self.show_reasoning = False
@@ -1073,6 +1074,7 @@ class MinAgent:
     async def initialize_optional_features(self) -> list[str]:
         """Discover skills and MCP servers, reporting any setup warnings."""
         warnings: list[str] = []
+        self.model_context_length = await self.fetch_model_context_length()
         if self.skills_enabled:
             await self.refresh_skills(force=True)
         if self.mcp_enabled:
@@ -1745,9 +1747,20 @@ class MinAgent:
             options.append("increase OPENAI_CONTEXT_WINDOW")
         return options
 
+    def model_window_estimate(self) -> int | None:
+        """The model's real window when the endpoint publishes it, else the name hint.
+
+        ``/api/show`` on Ollama reports the ``num_ctx`` the server will use, which
+        beats guessing from a name like ``...-8k``. Other endpoints return nothing
+        and fall back to the name.
+        """
+        if self.model_context_length:
+            return self.model_context_length
+        return model_context_hint(self.model)
+
     def effective_context_window(self) -> int:
-        """The window MinAgent can rely on: the smaller of the configured and model-named sizes."""
-        hint = model_context_hint(self.model)
+        """The window MinAgent can rely on: the smaller of the configured and known sizes."""
+        hint = self.model_window_estimate()
         if hint is None:
             return self.context_window
         if self.context_window <= 0:
@@ -1762,12 +1775,13 @@ class MinAgent:
         return self.fixed_context_tokens() / window
 
     def context_window_mismatch_note(self) -> str:
-        """Warn when OPENAI_CONTEXT_WINDOW exceeds what the model name states, or return ""."""
-        hint = model_context_hint(self.model)
+        """Warn when OPENAI_CONTEXT_WINDOW exceeds the known model window, or return ""."""
+        hint = self.model_window_estimate()
         if hint is None or self.context_window <= hint:
             return ""
+        source = "the endpoint reports" if self.model_context_length else "the model name states"
         return (
-            f"the model name states a {self._token_count(hint)}-token window, but OPENAI_CONTEXT_WINDOW is "
+            f"{source} a {self._token_count(hint)}-token window, but OPENAI_CONTEXT_WINDOW is "
             f"{self._token_count(self.context_window)}. The server truncates the extra prompt, so the question "
             "can be lost before the model reads it. Set OPENAI_CONTEXT_WINDOW to match the model."
         )
@@ -1881,6 +1895,12 @@ class MinAgent:
         await self.refresh_workspace_snapshot()
         self.print_doctor_panel()
 
+    async def fetch_model_context_length(self) -> int | None:
+        """Ask the endpoint for the model's real window, best effort."""
+        if self.open_ai_client is None:
+            return None
+        return await self.open_ai_client.fetch_model_context()
+
     async def refresh_models(self, force: bool = False) -> list[str]:
         """Fetch the endpoint's model list once per session, or again when forced."""
         if self.open_ai_client is None:
@@ -1920,6 +1940,7 @@ class MinAgent:
             self.ui_print_wrapped((("Already using ", "muted", False), (name, "pale", True)))
             return
         self.model = name
+        self.model_context_length = None
         if self.open_ai_client is not None:
             self.open_ai_client.model = name
         # A different model has its own context window and usage accounting.
@@ -1969,6 +1990,16 @@ class MinAgent:
             await self.call_chat_completions([{"role": "user", "content": "ping"}], {"max_tokens": 1})
         except AgentError as error:
             self.ui_print_wrapped((("Model did not load: ", "warning", False), (str(error), "pale", False)))
+            return
+        self.model_context_length = await self.fetch_model_context_length()
+        if self.model_context_length:
+            self.ui_print_wrapped(
+                (
+                    ("Model ready", "cyan", False),
+                    (" · real window ", "muted", False),
+                    (f"{self._token_count(self.model_context_length)} tokens", "pale", False),
+                )
+            )
             return
         self.ui_print_wrapped((("Model ready.", "cyan", False),))
 

@@ -11,6 +11,7 @@ import codecs
 import json
 import re
 from typing import Any, AsyncIterator, Callable, Sequence
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -20,6 +21,10 @@ from .jsutil import is_int
 DEFAULT_TIMEOUT_MS = 7 * 60 * 1000
 DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_TOOL_ARGUMENT_CHARS = 1024 * 1024
+# A short budget for metadata calls (model list, context length) that should
+# never hold up a turn.
+DEFAULT_METADATA_TIMEOUT_MS = 10 * 1000
+_OLLAMA_CHAT_SUFFIX = "/v1/chat/completions"
 
 RETRYABLE_NETWORK_ERRORS = {
     httpx.ConnectError,
@@ -252,6 +257,46 @@ def _models_url(endpoint: str) -> str:
     return f"{endpoint.rstrip('/')}/models"
 
 
+def _looks_like_ollama(endpoint: str) -> bool:
+    """Heuristic: the endpoint is the local Ollama server.
+
+    Only Ollama serves ``/api/show``, so this avoids sending a metadata request
+    to a cloud endpoint or an unrelated OpenAI-compatible server.
+    """
+    try:
+        parts = urlsplit(endpoint)
+    except ValueError:
+        return False
+    host = (parts.hostname or "").lower()
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    return port == 11434 or "ollama" in host
+
+
+def _context_length_from_show(payload: Any) -> int | None:
+    """Read the real context length from an Ollama ``/api/show`` payload.
+
+    ``parameters`` carries the ``num_ctx`` the server will actually use, which
+    is the limit that matters: ``*.context_length`` states the model's maximum,
+    often far larger than the runtime window. ``num_ctx`` wins when present.
+    """
+    if not isinstance(payload, dict):
+        return None
+    parameters = payload.get("parameters")
+    if isinstance(parameters, str):
+        match = re.search(r"(?m)^\s*num_ctx\s+(\d+)\s*$", parameters)
+        if match and int(match.group(1)) > 0:
+            return int(match.group(1))
+    model_info = payload.get("model_info")
+    if isinstance(model_info, dict):
+        for key, value in model_info.items():
+            if isinstance(key, str) and key.endswith(".context_length") and is_int(value) and int(value) > 0:
+                return int(value)
+    return None
+
+
 async def _iter_chunks(response: Any) -> AsyncIterator[bytes]:
     """Iterate a response body as bytes, accepting httpx or a plain test double."""
     if hasattr(response, "aiter_bytes"):
@@ -284,6 +329,35 @@ class OpenAiClient:
         self.timeout_ms = timeout_ms
         self.max_response_bytes = max_response_bytes
         self.transport = transport
+
+    async def fetch_model_context(self, model: str | None = None) -> int | None:
+        """Return the model's real context length when the endpoint publishes it.
+
+        Ollama serves ``POST /api/show``; other OpenAI-compatible servers do not,
+        and simply return ``None`` so the caller falls back to its own estimate.
+        """
+        name = model or self.model
+        if not name or not self.endpoint.endswith(_OLLAMA_CHAT_SUFFIX) or not _looks_like_ollama(self.endpoint):
+            return None
+        base = self.endpoint[: -len(_OLLAMA_CHAT_SUFFIX)]
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        timeout = httpx.Timeout(DEFAULT_METADATA_TIMEOUT_MS / 1000)
+        try:
+            async with httpx.AsyncClient(
+                timeout=timeout, follow_redirects=False, transport=self.transport
+            ) as client:
+                response = await client.post(f"{base}/api/show", headers=headers, json={"model": name})
+        except httpx.HTTPError:
+            return None
+        if response.status_code >= 400:
+            return None
+        try:
+            payload = response.json()
+        except ValueError:
+            return None
+        return _context_length_from_show(payload)
 
     async def list_models(self) -> list[str]:
         """Return the model identifiers the endpoint advertises.

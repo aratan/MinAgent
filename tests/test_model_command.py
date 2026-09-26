@@ -174,9 +174,61 @@ async def test_switching_a_model_persists_and_warms_it(tmp_path: Path, monkeypat
         calls.append(options)
         return {"payload": {"usage": {}}, "message": {"content": "pong", "tool_calls": []}}
 
+    async def no_context() -> None:
+        return None
+
     monkeypatch.setattr(app, "call_chat_completions", fake_call)
+    monkeypatch.setattr(app, "fetch_model_context_length", no_context)
     await app.switch_model("qwen2.5:7b")
     assert app.model == "qwen2.5:7b"
     assert (tmp_path / ".env").read_text().strip().endswith("OPENAI_MODEL=qwen2.5:7b")
     assert calls == [{"max_tokens": 1}], "the model was not warmed before the first turn"
     assert "Model ready." in app._stdout.text
+
+
+async def test_fetch_model_context_prefers_num_ctx_over_the_model_maximum():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/show"
+        return httpx.Response(
+            200,
+            json={
+                "parameters": "stop '<|end|>'\nnum_ctx                        8192\ntemperature 0.7",
+                "model_info": {"qwen35.context_length": 262144},
+            },
+        )
+
+    client = OpenAiClient(ENDPOINT, None, "m", [], transport=httpx.MockTransport(handler))
+    assert await client.fetch_model_context() == 8192
+
+
+async def test_fetch_model_context_falls_back_to_model_info():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"model_info": {"llama.context_length": 32768}})
+
+    client = OpenAiClient(ENDPOINT, None, "m", [], transport=httpx.MockTransport(handler))
+    assert await client.fetch_model_context() == 32768
+
+
+async def test_fetch_model_context_skips_an_endpoint_that_is_not_ollama():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("a non-Ollama endpoint must not be called")
+
+    # A local OpenAI-compatible server on another port, e.g. llama.cpp on 8080.
+    client = OpenAiClient(
+        "http://127.0.0.1:8080/v1/chat/completions", None, "m", [], transport=httpx.MockTransport(handler)
+    )
+    assert await client.fetch_model_context() is None
+    cloud = OpenAiClient(
+        "https://api.openai.com/v1/chat/completions", "k", "m", [], transport=httpx.MockTransport(handler)
+    )
+    assert await cloud.fetch_model_context() is None
+
+
+def test_the_endpoint_window_beats_the_name_hint():
+    app = _app()
+    app.context_window = 32768
+    app.model = "bonsai27b-8k:latest"  # the name claims 8k
+    assert app.model_window_estimate() == 8192
+    app.model_context_length = 4096  # the endpoint says otherwise
+    assert app.model_window_estimate() == 4096
+    assert app.effective_context_window() == 4096
