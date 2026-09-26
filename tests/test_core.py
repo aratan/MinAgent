@@ -1676,6 +1676,19 @@ def test_endpoint_timeout_rejects_a_non_positive_value(tmp_path):
         _configuration(tmp_path, OPENAI_TIMEOUT_SECONDS="0")
 
 
+def test_tool_rounds_default_to_sixty_four(tmp_path):
+    assert _configuration(tmp_path).max_tool_rounds == 64
+
+
+def test_tool_rounds_are_configurable(tmp_path):
+    assert _configuration(tmp_path, MAX_TOOL_ROUNDS="8").max_tool_rounds == 8
+
+
+def test_tool_rounds_reject_a_non_positive_value(tmp_path):
+    with pytest.raises(AgentError, match="MAX_TOOL_ROUNDS must be a positive integer"):
+        _configuration(tmp_path, MAX_TOOL_ROUNDS="0")
+
+
 def test_extension_timeouts_default_to_seven_minutes(tmp_path):
     config = _configuration(tmp_path)
     assert config.mcp_timeout_ms == 7 * 60 * 1000

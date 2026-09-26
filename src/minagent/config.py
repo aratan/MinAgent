@@ -16,6 +16,7 @@ from urllib.parse import urlsplit, urlunsplit
 from .errors import AgentError, find_application_root
 
 DEFAULT_CONTEXT_WINDOW = 262144
+DEFAULT_MAX_TOOL_ROUNDS = 64
 DEFAULT_ENDPOINT_TIMEOUT_SECONDS = 7 * 60
 DEFAULT_EXTENSION_TIMEOUT_SECONDS = 7 * 60
 DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS = 2 * 60
@@ -160,6 +161,7 @@ class Config:
     model: str
     context_window: int
     endpoint_timeout_ms: int
+    max_tool_rounds: int
     input_modalities: list[str]
     show_reasoning: bool
     compaction_reserve_tokens: int
@@ -234,6 +236,9 @@ def load_configuration(
         model=model,
         context_window=context_window,
         endpoint_timeout_ms=endpoint_timeout_seconds * 1000,
+        max_tool_rounds=parse_positive_integer(
+            environment.get("MAX_TOOL_ROUNDS"), "MAX_TOOL_ROUNDS", DEFAULT_MAX_TOOL_ROUNDS
+        ),
         input_modalities=parse_input_modalities(environment.get("OPENAI_INPUT")),
         compaction_reserve_tokens=min(16384, context_window // 8),
         compaction_keep_recent_tokens=min(20000, context_window // 8),

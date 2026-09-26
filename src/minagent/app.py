@@ -17,7 +17,7 @@ from datetime import datetime
 from typing import Any
 
 from .attachments import prepare_user_message as prepare_attachments
-from .config import Config, load_configuration
+from .config import DEFAULT_MAX_TOOL_ROUNDS, Config, load_configuration
 from .context import (
     SUMMARY_INSTRUCTIONS,
     chunk_summary_transcript,
@@ -106,7 +106,6 @@ from .web_search import (
 )
 from .workspace import WorkspaceAccess
 
-MAX_TOOL_ROUNDS = 32
 MAX_TOOL_CALLS_PER_RESPONSE = 16
 # A response cut off by the output token limit is continued this many times before stopping.
 MAX_RESPONSE_CONTINUATIONS = 3
@@ -256,6 +255,7 @@ class MinAgent:
         self.context_window = 0
         self.model_context_length: int | None = None
         self.endpoint_timeout_ms = 0
+        self.max_tool_rounds = DEFAULT_MAX_TOOL_ROUNDS
         self.input_modalities: list[str] = []
         self.show_reasoning = False
         self.compaction_reserve_tokens = 0
@@ -373,6 +373,7 @@ class MinAgent:
         self.model = config.model
         self.context_window = config.context_window
         self.endpoint_timeout_ms = config.endpoint_timeout_ms
+        self.max_tool_rounds = config.max_tool_rounds
         self.input_modalities = config.input_modalities
         self.show_reasoning = config.show_reasoning
         self.compaction_reserve_tokens = config.compaction_reserve_tokens
@@ -2216,7 +2217,7 @@ class MinAgent:
         continued_text = ""
         continuations = 0
         light_context_retries = 0
-        for round_index in range(MAX_TOOL_ROUNDS):
+        for round_index in range(self.max_tool_rounds):
             if signal is not None and signal.cancelled:
                 return ""
             await self.refresh_workspace_snapshot()
@@ -2510,7 +2511,7 @@ class MinAgent:
                         ],
                     }
                 )
-        raise AgentError(f"Stopped after {MAX_TOOL_ROUNDS} consecutive tool rounds.")
+        raise AgentError(f"Stopped after {self.max_tool_rounds} consecutive tool rounds.")
 
     def _append_canceled_tool_messages(self, calls: Sequence[dict[str, Any]]) -> None:
         """Answer every skipped tool call so the transcript stays well formed."""
