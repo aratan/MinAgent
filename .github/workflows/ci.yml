@@ -22,7 +22,9 @@ jobs:
       - name: Install dependencies
         run: uv sync
       - name: Lint
-        run: uv run ruff check src/minagent tests
+        # Todo el repositorio, no solo el paquete: los scripts de scripts/ y de
+        # las skills tambien tienen que pasar el lint o se pudren en silencio.
+        run: uv run ruff check .
       - name: Type check
         run: uv run mypy
       - name: Test with coverage

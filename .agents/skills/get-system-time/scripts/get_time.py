@@ -4,12 +4,13 @@ Script de apoyo para la skill get-system-time.
 Retorna un payload JSON estructurado con la información temporal del sistema.
 """
 
-import json
 import datetime
+import json
 import time
 
+
 def main():
-    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    now_utc = datetime.datetime.now(datetime.UTC)
     now_local = datetime.datetime.now().astimezone()
 
     payload = {
@@ -21,6 +22,7 @@ def main():
     }
 
     print(json.dumps(payload, ensure_ascii=False, indent=2))
+
 
 if __name__ == "__main__":
     main()

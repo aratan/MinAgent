@@ -1,5 +1,5 @@
-import sqlite3
 import os
+import sqlite3
 
 db_path = os.path.join(os.path.dirname(__file__), '../../.agents/memory/memoria.db')
 conn = sqlite3.connect(os.path.abspath(db_path))
@@ -16,10 +16,11 @@ for table in tables:
     columns = cursor.fetchall()
     columns = [col[2] for col in columns]
     print(f"Columnas: {columns}")
-    
+
+
     cursor.execute(f"SELECT * FROM {table} LIMIT 20;")
     rows = cursor.fetchall()
-    print(f"Filas (máx 20):\n")
+    print("Filas (máx 20):\n")
     for row in rows:
         print(row)
 
