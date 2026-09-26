@@ -98,12 +98,19 @@ function clip(text) {
 }
 
 /** Envoltura común: ejecuta, registra y convierte cualquier fallo en isError. */
+/**
+ * Ejecuta una herramienta y devuelve su texto.
+ *
+ * `options.clip === false` devuelve la salida sin recortar, para que quien la
+ * reciba pueda parsearla antes de decidir cuanto se queda: recortar aqui dejaria
+ * un JSON partido por la mitad.
+ */
 async function himalayaTool(label, args, options) {
   console.error(`[MCP-HIMALAYA] ${label}: ${COMMAND} ${args.join(" ")}`);
   try {
     const { stdout, stderr } = await runHimalaya(args, options);
     const body = stdout.trim() || stderr.trim() || "(sin salida)";
-    return { content: [{ type: "text", text: clip(body) }] };
+    return { content: [{ type: "text", text: options && options.clip === false ? body : clip(body) }] };
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     return {
@@ -111,6 +118,79 @@ async function himalayaTool(label, args, options) {
       content: [{ type: "text", text: `No se pudo ejecutar ${label}: ${detail}` }],
     };
   }
+}
+
+/**
+ * Recorta el cuerpo de un mensaje y devuelve el objeto ya parseado.
+ *
+ * El JSON de himalaya es válido, pero un correo largo lo convierte en un
+ * documento que el host recorta a la mitad antes de entregarlo, y un fragmento
+ * recortado no se puede parsear. Acotando aqui el cuerpo, el documento que sale
+ * entero y sigue siendo JSON valido.
+ */
+function trimMessageBody(message, offset, maxChars) {
+  let omitted = 0;
+  for (const part of Array.isArray(message.parts) ? message.parts : []) {
+    const body = part && typeof part.body === "object" ? part.body : null;
+    if (!body) continue;
+    for (const key of ["Text", "Html"]) {
+      const value = body[key];
+      if (typeof value !== "string" || value.length === 0) continue;
+      const slice = value.slice(offset, offset + maxChars);
+      if (slice.length >= value.length) continue;
+      omitted += value.length - slice.length;
+      const next = offset + slice.length;
+      body[key] =
+        `${slice}\n\n[...${value.length - slice.length} caracteres omitidos de ${value.length}; ` +
+        `llama a leer_mensaje con cuerpo_offset=${next} para continuar]`;
+    }
+  }
+  if (omitted > 0) {
+    message.cuerpo_omitido_caracteres = omitted;
+  }
+  return message;
+}
+
+/** Caracteres de cuerpo por defecto: deja el documento entero y parseable. */
+const DEFAULT_BODY_CHARS = 4000;
+/** Piso del recorte: por debajo, el cuerpo ya no aporta nada util. */
+const MIN_BODY_CHARS = 200;
+
+/**
+ * Devuelve el texto como un documento JSON válido, sin importar cuanto mida.
+ *
+ * Recortar el texto a pelo lo dejaria en JSON invalido, porque el corte cae en
+ * mitad de una cadena. En vez de eso se reencoge el cuerpo del mensaje hasta
+ * que el documento entra, y si ni asi cabe -unas cabeceras enormes lo
+ * consiguen- se entrega un envoltorio valido que explica el recorte en vez de
+ * un fragmento imposible de parsear.
+ */
+function jsonResult(text, transform) {
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    console.error(`[MCP-HIMALAYA] la respuesta no es JSON válido, se devuelve sin transformar: ${detail}`);
+    return { content: [{ type: "text", text: clip(text) }] };
+  }
+
+  for (let budget = transform.budget; budget >= MIN_BODY_CHARS; budget = Math.floor(budget / 2)) {
+    const serialized = JSON.stringify(transform.apply(parsed, budget));
+    if (serialized.length <= MAX_RESULT_CHARS) {
+      return { content: [{ type: "text", text: serialized }] };
+    }
+  }
+
+  // Ni con el cuerpo minimo entra: mejor un JSON valido y explicito que un
+  // fragmento que ningun cliente puede parsear.
+  const preview = JSON.stringify(parsed).slice(0, MAX_RESULT_CHARS / 2);
+  const envelope = {
+    error: `el mensaje no cabe en ${MAX_RESULT_CHARS} caracteres ni con el cuerpo recortado`,
+    PREVIEW_length: JSON.stringify(parsed).length,
+    PREVIEW: preview,
+  };
+  return { content: [{ type: "text", text: JSON.stringify(envelope) }] };
 }
 
 const mailbox = z.string().min(1).optional().describe("Nombre o id de la bandeja; por defecto, la bandeja inbox de la cuenta activa");
@@ -185,25 +265,46 @@ server.registerTool(
 );
 
 server.registerTool(
-  "leer_mensaje",
-  {
+  "leer_mensaje",  {
     title: "Leer mensaje",
-    description:      "Devuelve el mensaje completo parseado como JSON: cabeceras Date/From/To/Cc/Subject, flags y las partes MIME con su contenido.",
+    description:
+      "Devuelve el mensaje como JSON: cabeceras Date/From/To/Cc/Subject, flags y las partes MIME. El cuerpo llega acotado para que quepa en el contexto; si viene recortado, vuelve a llamar con cuerpo_offset para seguir leyendo.",
     inputSchema: {
       id: z.string().min(1).describe("Id del mensaje, tal cual aparece en listar_mensajes o buscar_mensajes"),
       mailbox,
       marcar_visto: z.boolean().optional().describe("Marcar el mensaje como leído (himalaya message read --seen)"),
+      cuerpo_offset: z.number().int().min(0).optional().describe("Primer carácter del cuerpo a devolver; 0 por defecto"),
+      cuerpo_max_chars: z
+        .number()
+        .int()
+        .min(200)
+        .max(20000)
+        .optional()
+        .describe("Caracteres de cuerpo por parte; 4000 por defecto"),
     },
   },
-  async ({ id, mailbox: name, marcar_visto }) =>
-    himalayaTool("leer_mensaje", [
-      "message",
-      "read",
-      "--json",
-      ...(marcar_visto ? ["--seen"] : []),
-      ...(name ? ["-m", name] : []),
-      id,
-    ])
+  async ({ id, mailbox: name, marcar_visto, cuerpo_offset, cuerpo_max_chars }) => {
+    const result = await himalayaTool(
+      "leer_mensaje",
+      [
+        "message",
+        "read",
+        "--json",
+        ...(marcar_visto ? ["--seen"] : []),
+        ...(name ? ["-m", name] : []),
+        id,
+      ],
+      { clip: false }
+    );
+    if (result.isError) return result;
+    const offset = cuerpo_offset ?? 0;
+    return jsonResult(result.content[0].text, {
+      budget: cuerpo_max_chars ?? DEFAULT_BODY_CHARS,
+      apply(message, budget) {
+        return trimMessageBody(structuredClone(message), offset, budget);
+      },
+    });
+  }
 );
 
 server.registerTool(
