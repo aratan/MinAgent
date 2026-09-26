@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Callable, Sequence
+from typing import Any
 
 from .terminal_text import safe_terminal_text, terminal_text_width, truncate_terminal_text
 
@@ -347,9 +348,7 @@ def rank_workspace_files(query: str, workspace_files: Sequence[str]) -> dict[str
     for path in workspace_files:
         lower_path = path.lower()
         file_name = lower_path[lower_path.rfind("/") + 1:]
-        if not normalized:
-            score = 0.0
-        elif file_name.startswith(normalized):
+        if not normalized or file_name.startswith(normalized):
             score = 0.0
         elif lower_path.startswith(normalized):
             score = 1.0

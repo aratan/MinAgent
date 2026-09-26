@@ -9,8 +9,8 @@ from __future__ import annotations
 import os
 import re
 import sys
+from collections.abc import MutableMapping
 from dataclasses import dataclass
-from typing import MutableMapping
 from urllib.parse import urlsplit, urlunsplit
 
 from .errors import AgentError, find_application_root
@@ -108,7 +108,7 @@ def parse_boolean_setting(value: str | None, name: str, fallback: bool) -> bool:
 
 def parse_input_modalities(value: str | None) -> list[str]:
     """Parse ``OPENAI_INPUT``; it must include ``text`` and may include ``image``."""
-    source = value if (_cleaned(value) or "") else "text,image"
+    source = _cleaned(value) or "text,image"
     items = [item.lower() for item in re.split(r"[\s,]+", source) if item]
     unique = list(dict.fromkeys(items))
     if "text" not in unique or any(item not in ("text", "image") for item in unique):
@@ -221,10 +221,9 @@ def load_configuration(
         DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS,
     )
     workspace_name = os.path.basename(root_directory) or "workspace"
-    if os.name == "nt":
-        terminal_shell = (environment.get("ComSpec") or "").strip() or "cmd.exe"
-    else:
-        terminal_shell = "/bin/sh"
+    terminal_shell = (
+        (environment.get("ComSpec") or "").strip() or "cmd.exe" if os.name == "nt" else "/bin/sh"
+    )
 
     return Config(
         application_root=root,

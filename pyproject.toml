@@ -17,6 +17,9 @@ minagent = "minagent.__main__:main"
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
+    "mypy>=1.11",
 ]
 
 [build-system]
@@ -31,3 +34,33 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4"]
+# E501: prompt text and tool descriptions are intentionally long single lines.
+# B023: lambdas that close over loop variables are awaited within the same iteration.
+# SIM105: the explicit try/except forms read more clearly than contextlib.suppress here.
+ignore = ["E501", "B023", "SIM105"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B017", "E731", "SIM905"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src/minagent"]
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+check_untyped_defs = true
+
+[tool.coverage.run]
+source = ["src/minagent"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true

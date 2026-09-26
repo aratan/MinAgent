@@ -16,9 +16,10 @@ import asyncio
 import os
 import re
 import sqlite3
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from datetime import datetime, timezone
-from typing import Any, Iterator, Sequence
+from datetime import UTC, datetime
+from typing import Any
 
 from .errors import AgentError
 
@@ -105,7 +106,7 @@ def _compact_whitespace(value: str) -> str:
 
 def _now() -> str:
     """The current UTC time as a stable ISO 8601 string."""
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def _title_key(title: str) -> str:

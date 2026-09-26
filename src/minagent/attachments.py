@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import base64
 import re
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 from .errors import AgentError
 from .image import detect_image_mime_type, image_content_part
@@ -156,6 +157,7 @@ async def prepare_user_message(
 
     text = remover.apply(text_input)
     prompt = "\n\n".join([text.strip(), *text_attachments]) or "Analyze the attached image."
+    message: dict[str, Any]
     if not images and not text_attachments:
         message = {"role": "user", "content": text_input}
     else:

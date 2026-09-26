@@ -7,7 +7,8 @@ conversation inside the configured context window.
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 from .errors import AgentError
 from .jsutil import byte_length, json_stringify

@@ -9,7 +9,8 @@ line to the assistant bubble's width.
 from __future__ import annotations
 
 import re
-from typing import Any, Callable, Sequence
+from collections.abc import Callable, Sequence
+from typing import Any
 
 from .terminal_text import (
     graphemes,
@@ -722,10 +723,10 @@ class TerminalRendering:
     def _renderer(self, write_display: Callable[[str], None]) -> MarkdownTerminalRenderer:
         return MarkdownTerminalRenderer(write_display, self._get_use_color, self._ui_colors, self._stdout)
 
-    def create_streaming_output(self, label: str) -> "_StreamingOutput":
+    def create_streaming_output(self, label: str) -> _StreamingOutput:
         return _StreamingOutput(label, self)
 
-    def create_reasoning_streaming_output(self) -> "_ReasoningStreamingOutput":
+    def create_reasoning_streaming_output(self) -> _ReasoningStreamingOutput:
         return _ReasoningStreamingOutput(
             self._stdout, self._ui_text, self._print, terminal_columns(self._stdout)
         )

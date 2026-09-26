@@ -12,8 +12,9 @@ import json
 import os
 import re
 import sys
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime
-from typing import Any, Awaitable, Callable, Sequence
+from typing import Any
 
 from .attachments import prepare_user_message as prepare_attachments
 from .config import Config, load_configuration
@@ -37,9 +38,9 @@ from .editor import (
     reset_prompt_rows,
 )
 from .errors import AgentError, CancellationToken, OperationAborted, find_application_root
-from .jsutil import json_stringify
 from .image import image_content_part
 from .init_project import collect_project_essentials
+from .jsutil import json_stringify
 from .line_editor import EditorClosed, LineEditor
 from .markdown_terminal import create_terminal_rendering
 from .mcp import (
@@ -48,6 +49,8 @@ from .mcp import (
     execute_mcp_tool,
     format_mcp_context,
     mcp_config_fingerprint,
+)
+from .mcp import (
     write_mcp_server as author_mcp_server,
 )
 from .memory import (
@@ -71,6 +74,8 @@ from .skills import (
     format_skill_context,
     parse_skill_draft,
     skill_tree_fingerprint,
+)
+from .skills import (
     write_skill as author_skill,
 )
 from .terminal_command import run_terminal_command as execute_terminal_command
@@ -87,7 +92,11 @@ from .terminal_text import (
 )
 from .web_search import (
     DEFAULT_MAX_RESULTS as DEFAULT_WEB_SEARCH_RESULTS,
+)
+from .web_search import (
     MAX_RESULTS as MAX_WEB_SEARCH_RESULTS,
+)
+from .web_search import (
     WebSearchClient,
     create_web_search_tools,
     format_fetch_result,
@@ -1014,6 +1023,7 @@ class MinAgent:
         """Author a skill on the model's request and register it in this session."""
         created = await author_skill(self.skill_write_directory, args)
         await self.refresh_skills(force=True)
+        assert self.workspace_access is not None
         location = self.workspace_access.relative_name(created["path"])
         self.ui_print_wrapped((("Skill registered ", "cyan", True), (created["name"], "pale", False)))
         return (
@@ -2458,7 +2468,7 @@ class MinAgent:
             denied_tool_calls = 0
             for call_index, call in enumerate(calls):
                 function = call.get("function") or {}
-                name = function.get("name")
+                name = str(function.get("name") or "")
                 call_id = call.get("id") or f"call-{round_index}-{len(self.messages)}"
                 if signal is not None and signal.cancelled:
                     self._append_canceled_tool_messages(calls[call_index:])
@@ -2702,6 +2712,7 @@ class MinAgent:
                             )
                             if not created:
                                 continue
+                            assert self.workspace_access is not None
                             self.ui_print_wrapped(
                                 (
                                     ("Skill registered ", "cyan", True),

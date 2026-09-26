@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import signal as signal_module
-from typing import Any, Callable, Sequence
+from collections.abc import Callable, Sequence
+from typing import Any
 
 from .errors import AgentError
 from .jsutil import json_stringify
@@ -129,7 +130,7 @@ async def run_terminal_command(
                 asyncio.gather(drain(process.stdout), drain(process.stderr)),
                 timeout=timeout_seconds,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             timed_out = True
             stop()
         returncode = await process.wait()

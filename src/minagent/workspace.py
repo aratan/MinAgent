@@ -439,7 +439,7 @@ class WorkspaceAccess:
         self, args: dict[str, Any], image_enabled: bool = False
     ) -> str | dict[str, Any]:
         """Read a text file, continuing within a long line via offset/column."""
-        target = self.resolve_path(args.get("path"), allow_outside=True)
+        target = self.resolve_path(str(args.get("path") or ""), allow_outside=True)
         _, buffer = await self._read_regular_buffer(target, "read_file", allow_outside=True)
 
         image_mime_type = detect_image_mime_type(buffer)

@@ -7,7 +7,8 @@ sequences, and combining marks lay out correctly.
 from __future__ import annotations
 
 import os
-from typing import Any, Callable, Sequence
+from collections.abc import Callable, Sequence
+from typing import Any
 
 import regex
 

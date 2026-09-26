@@ -17,8 +17,9 @@ import os
 import sys
 import termios
 import tty
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 from .terminal_text import terminal_columns, terminal_rows_for_input, terminal_text_width
 

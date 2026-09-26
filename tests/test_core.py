@@ -14,10 +14,9 @@ from typing import Any
 
 import pytest
 
-from minagent.app import UI_COLORS, MinAgent, _MISSING_CAPABILITY_REQUEST, build_terminal_tool
+from minagent.app import _MISSING_CAPABILITY_REQUEST, UI_COLORS, MinAgent, build_terminal_tool
 from minagent.attachments import prepare_user_message
 from minagent.config import Config, load_configuration, parse_directory_entry_limit
-from minagent.errors import AgentError
 from minagent.context import chunk_summary_transcript
 from minagent.editor import (
     AUTOCOMPLETE_PANEL_ROWS,
@@ -29,6 +28,7 @@ from minagent.editor import (
     handle_control_j_input,
     handle_pasted_input,
 )
+from minagent.errors import AgentError
 from minagent.init_project import collect_project_essentials
 from minagent.line_editor import LineEditor
 from minagent.markdown_terminal import create_terminal_rendering
@@ -43,6 +43,7 @@ from minagent.terminal_text import (
     wrap_styled_segments,
 )
 from minagent.workspace import WorkspaceAccess
+
 
 class _TurnStopped(Exception):
     """Raised by a fake endpoint to end a turn as soon as its options are captured."""

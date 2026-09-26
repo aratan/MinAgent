@@ -13,7 +13,8 @@ import json
 import os
 import re
 import stat as stat_module
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
@@ -246,7 +247,7 @@ class McpStdioClient:
             raise AgentError(f"Could not write to the MCP server: {error}") from error
         try:
             return await asyncio.wait_for(future, timeout=timeout_ms / 1000)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self.pending.pop(str(identifier), None)
             raise AgentError(f"MCP request timed out: {method}") from None
 
@@ -288,7 +289,7 @@ class McpStdioClient:
         if self.process.returncode is None:
             try:
                 await asyncio.wait_for(self.process.wait(), timeout=1.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 terminate_process_tree(self.process)
                 await self.process.wait()
 
@@ -785,7 +786,7 @@ def write_mcp_server(application_root: str, config_path: str, args: dict[str, An
 
     script = args.get("script")
     filename = ""
-    content = ""
+    content: Any = ""
     if script is not None:
         if not isinstance(script, dict):
             raise AgentError("script must be an object with filename and content.")
@@ -938,7 +939,8 @@ async def execute_mcp_tool(
         elif item_type == "resource_link":
             text_parts.append(f"Resource link: {item.get('name') or item.get('uri')}\n{item.get('uri')}")
         elif item_type == "image":
-            encoded = item.get("data") if isinstance(item.get("data"), str) else ""
+            raw_data = item.get("data")
+            encoded = raw_data if isinstance(raw_data, str) else ""
             encoded_limit = -(-MAX_MCP_IMAGE_BYTES // 3) * 4
             valid_base64 = (
                 0 < len(encoded) <= encoded_limit and len(encoded) % 4 == 0 and bool(_BASE64.match(encoded))

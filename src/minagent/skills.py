@@ -12,7 +12,8 @@ import os
 import re
 import stat as stat_module
 import unicodedata
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 from .errors import AgentError, is_missing
 from .jsutil import decode_utf8, json_stringify, locale_key

@@ -10,7 +10,8 @@ from __future__ import annotations
 import os
 import re
 import stat as stat_module
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from .errors import AgentError
 from .jsutil import decode_utf8, locale_key
@@ -115,7 +116,7 @@ async def collect_project_essentials(
         score = init_candidate_score(name, depth, project_name)
         if score is None:
             return
-        candidates[relative_path] = min(candidates.get(relative_path, float("inf")), score)
+        candidates[relative_path] = min(candidates.get(relative_path, score), score)
 
     def mode_of(entry: os.DirEntry) -> int:
         try:
