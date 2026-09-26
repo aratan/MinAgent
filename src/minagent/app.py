@@ -1482,9 +1482,28 @@ class MinAgent:
         return {"auto": "Auto", "ask": "Ask"}.get(self.terminal_mode, "Off")
 
     def _context_usage(self) -> dict[str, float]:
+        """Split what fills the window into the fixed prompt and the conversation.
+
+        The two are not the same thing and reporting only the total makes an
+        empty conversation look full: the system sections and the tool schemas
+        are resent with every request, so they are a floor under the meter that
+        no amount of clearing can move.
+        """
         used = self.estimate_current_context_tokens()
+        breakdown = self.prompt_token_breakdown()
+        fixed = float(breakdown["system_tokens"] + breakdown["tool_tokens"])
+        # The usage correction can move the total a little away from the sum of
+        # the parts, so the conversation is whatever the total leaves over.
+        conversation = max(0.0, used - fixed)
         percent = (used / self.context_window * 100) if self.context_window > 0 else 0
-        return {"used": used, "percent": percent}
+        return {
+            "used": used,
+            "percent": percent,
+            "fixed": fixed,
+            "conversation": conversation,
+            "system": float(breakdown["system_tokens"]),
+            "tools": float(breakdown["tool_tokens"]),
+        }
 
     def print_startup_panel(self) -> None:
         """Print the session header before the first prompt."""
@@ -1502,6 +1521,13 @@ class MinAgent:
         rows: list[tuple[str, str]] = [
             ("Model", self.model),
             ("Context", context),
+            # Named apart from the total, so the floor under the meter is never
+            # mistaken for a conversation that failed to clear.
+            (
+                "Fixed",
+                f"~{self._token_count(usage['fixed'])}  "
+                f"(system ~{self._token_count(usage['system'])} · tools ~{self._token_count(usage['tools'])})",
+            ),
             ("Input", " · ".join(self.input_modalities)),
             ("Terminal", self._terminal_mode_label()),
             ("Workspace", self.workspace_name),
@@ -1813,17 +1839,59 @@ class MinAgent:
         self.last_usage_system_tokens = 0
         self.refresh_system_prompt()
 
-    async def start_new_conversation(self) -> None:
-        """Clear the conversation and redraw the startup panel."""
+    def _reset_conversation_state(self) -> None:
+        """Drop everything the finished conversation owned.
+
+        Clearing the messages and the compacted summary is not enough, because
+        the surrounding bookkeeping still describes the run that just ended: the
+        token tallies make ``/usage`` report the previous conversation, the step
+        trail would seed the next turn's memory capture, and the replay cache
+        would answer an identical opening question with the old completion. A
+        fresh conversation must start from nothing but the fixed prompt.
+        """
         del self.messages[1:]
         self.compacted_summary = ""
         self.last_prompt_tokens = None
         self.last_usage_message_count = 0
         self.last_usage_system_tokens = 0
+        self._current_user_request = ""
+        self._steps_this_turn = []
+        self._tools_used_this_turn = []
+        self.reset_turn_token_usage()
+        self._session_tool_tokens = {}
+        self._session_tool_calls = {}
+        self._session_archived_tokens = 0
+        self._session_cleared_tool_result_tokens = 0
+        self._memory_remembered_this_turn = False
+        self._tool_error_this_turn = False
+        self._tool_errors_this_turn = 0
+        self._web_search_prompted_this_turn = False
+        # The provider's own prompt cache is untouched, so the fixed prefix is
+        # still reused; only our own replay entries are conversation-scoped.
+        self.request_cache.clear()
+
+    async def start_new_conversation(self) -> None:
+        """Clear the conversation and redraw the startup panel."""
+        self._reset_conversation_state()
         await self.refresh_workspace_snapshot()
         self._stdout.write("\x1b[2J\x1b[H")
         self.print_startup_panel()
-        self.ui_print_wrapped((("◆ New conversation ready.", "cyan", True),))
+        usage = self._context_usage()
+        # The meter cannot read as empty because the fixed prompt - the system
+        # sections plus the tool schemas - is sent with every single request.
+        # Say so, or a full-looking bar right after /new reads as a failure.
+        self.ui_print_wrapped(
+            (
+                ("◆ New conversation ready. ", "cyan", True),
+                (
+                    "The conversation is empty; the whole bar is the fixed prompt sent with every request.",
+                    "muted",
+                    False,
+                )
+                if usage["conversation"] <= 0
+                else (f"~{self._token_count(usage['conversation'])} tokens of conversation remain.", "muted", False),
+            )
+        )
 
     def bound_tool_result(self, text: str) -> str:
         """Keep one tool result from filling the whole context window.

@@ -2563,3 +2563,46 @@ def test_markdown_table_keeps_escaped_pipes_in_a_single_cell():
     bubble.write("| A\\|B | C |\n| --- | --- |\n| x | y |")
     bubble.close()
     assert "A|B" in output.text + "".join(buffer)
+
+
+async def test_a_new_conversation_starts_empty_with_no_state_from_the_last_one(tmp_path):
+    """``/new`` must leave nothing of the finished run behind, and say why the bar is not empty."""
+    app = _make_app(80)[0]
+    app.workspace_access = WorkspaceAccess(str(tmp_path), "Test", 0)
+    app._base_system_prompt_sections = app.build_base_system_prompt()
+    app.messages.append({"role": "user", "content": "hola"})
+    app.messages.append({"role": "assistant", "content": "respuesta larga " * 200})
+    app.compacted_summary = "resumen " * 200
+    app._tools_used_this_turn = ["read_file"]
+    app._steps_this_turn = ["read_file(path=README.md)"]
+    app._current_user_request = "hola"
+    app._record_tool_tokens("read_file", "salida " * 4000, "salida " * 100)
+    app._session_cleared_tool_result_tokens = 4242
+    app._tool_error_this_turn = True
+    app._web_search_prompted_this_turn = True
+    app.refresh_system_prompt()
+    app.request_cache.put(
+        app.request_cache.key(app.model, app.tools, app.messages),
+        {"payload": {"finish_reason": "stop"}, "message": {"content": "respuesta"}},
+    )
+
+    await app.start_new_conversation()
+
+    assert app.messages == [app.messages[0]], "only the system prompt should survive"
+    assert app.compacted_summary == ""
+    assert app._tools_used_this_turn == [] and app._steps_this_turn == []
+    assert app._current_user_request == ""
+    assert app._turn_tool_tokens == {} and app._session_tool_tokens == {}
+    assert app._session_archived_tokens == 0 and app._session_cleared_tool_result_tokens == 0
+    assert app._tool_error_this_turn is False and app._web_search_prompted_this_turn is False
+    assert app.last_prompt_tokens is None and app.last_usage_message_count == 0
+    # A replay entry from the previous conversation would answer the next
+    # identical question without ever reaching the endpoint.
+    assert len(app.request_cache) == 0
+
+    usage = app._context_usage()
+    assert usage["conversation"] == 0
+    assert usage["fixed"] > 0, "the system sections and tool schemas are resent every request"
+    assert usage["used"] == pytest.approx(usage["fixed"])
+    assert "The conversation is empty" in app._stdout.text
+    assert "Fixed" in app._stdout.text
