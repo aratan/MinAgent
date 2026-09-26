@@ -124,6 +124,9 @@ _SKILL_COMMAND = re.compile(r"^\/skill(?:\s+([\s\S]*))?$", re.IGNORECASE)
 _MEMORY_COMMAND = re.compile(r"^\/memory(?:\s+([\s\S]*))?$", re.IGNORECASE)
 _DOCTOR_COMMAND = re.compile(r"^\/doctor(?:\s+([\s\S]*))?$", re.IGNORECASE)
 _MODEL_COMMAND = re.compile(r"^\/model(?:\s+([\s\S]*))?$", re.IGNORECASE)
+# A line that is selecting a model (``/model `` with a space), for autocomplete.
+_MODEL_SELECTION_LINE = re.compile(r"^\s*/model\s")
+_MODEL_ENV_LINE = re.compile(r"^\s*OPENAI_MODEL\s*=")
 _FENCE_STRIP = re.compile(r"^```(?:markdown|md)?\s*\n", re.IGNORECASE)
 _FENCE_STRIP_END = re.compile(r"\n```\s*$")
 _DENIED_RESULT = re.compile(r"^(?:Permission denied by the user|MCP call denied by the user)", re.IGNORECASE)
@@ -365,6 +368,10 @@ class MinAgent:
         self.web_search_base_url = ""
         self.web_search_timeout_seconds = 0
         self.web_search_client: WebSearchClient | None = None
+        self.available_models: list[str] = []
+        self._models_fetched = False
+        self._models_error = ""
+        self._models_fetch_task: asyncio.Task[Any] | None = None
         self._minimal_context = False
         self.skill_directories: list[str] = []
         self.mcp_config_path = ""
@@ -1843,6 +1850,36 @@ class MinAgent:
         await self.refresh_workspace_snapshot()
         self.print_doctor_panel()
 
+    async def refresh_models(self, force: bool = False) -> list[str]:
+        """Fetch the endpoint's model list once per session, or again when forced."""
+        if self.open_ai_client is None:
+            return self.available_models
+        if self._models_fetched and not force:
+            return self.available_models
+        try:
+            self.available_models = await self.open_ai_client.list_models()
+            self._models_error = ""
+        except AgentError as error:
+            self.available_models = []
+            self._models_error = str(error)
+        self._models_fetched = True
+        return self.available_models
+
+    def schedule_models_refresh(self, state: dict[str, Any]) -> None:
+        """Load the model list in the background, then repaint the picker."""
+        if self._models_fetch_task is not None and not self._models_fetch_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._models_fetch_task = loop.create_task(self._load_models_then_refresh(state))
+
+    async def _load_models_then_refresh(self, state: dict[str, Any]) -> None:
+        await self.refresh_models()
+        if self.editor is not None:
+            self._update_autocomplete(state)
+
     def select_model(self, name: str) -> None:
         """Switch the active model for later requests and report the change."""
         name = name.strip()
@@ -1864,16 +1901,71 @@ class MinAgent:
             note = f" · effective window {self._token_count(self.effective_context_window())} tokens"
         self.ui_print_wrapped((("Model switched to ", "muted", False), (name, "pale", True), (note, "muted", False)))
 
+    def persist_model(self, name: str) -> str:
+        """Write ``OPENAI_MODEL`` into the project ``.env`` so the choice survives a restart.
+
+        Returns the file written, or `""` when there is no project root to write to.
+        """
+        if not self.application_root or not os.path.isdir(self.application_root):
+            return ""
+        path = os.path.join(self.application_root, ".env")
+        try:
+            with open(path, encoding="utf-8") as handle:
+                lines = handle.read().splitlines()
+        except FileNotFoundError:
+            lines = []
+        replaced = False
+        for index, line in enumerate(lines):
+            if _MODEL_ENV_LINE.match(line):
+                lines[index] = f"OPENAI_MODEL={name}"
+                replaced = True
+                break
+        if not replaced:
+            lines.append(f"OPENAI_MODEL={name}")
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("\n".join(lines) + "\n")
+        except OSError:
+            return ""
+        return path
+
+    async def load_model(self, name: str) -> None:
+        """Warm the model with a one-token request so the first turn is not the load."""
+        if self.open_ai_client is None:
+            return
+        self.ui_print_wrapped((("Loading ", "muted", False), (name, "pale", True), ("…", "muted", False)))
+        try:
+            await self.call_chat_completions([{"role": "user", "content": "ping"}], {"max_tokens": 1})
+        except AgentError as error:
+            self.ui_print_wrapped((("Model did not load: ", "warning", False), (str(error), "pale", False)))
+            return
+        self.ui_print_wrapped((("Model ready.", "cyan", False),))
+
+    async def switch_model(self, name: str) -> None:
+        """Switch, persist, and warm the model chosen from ``/model <name>``."""
+        name = name.strip()
+        if not name:
+            raise AgentError("Usage: /model <name>")
+        if name == self.model:
+            self.ui_print_wrapped((("Already using ", "muted", False), (name, "pale", True)))
+            return
+        self.select_model(name)
+        saved = self.persist_model(name)
+        if saved:
+            self.ui_print_wrapped((("Saved to ", "muted", False), (saved, "pale", False)))
+        await self.load_model(name)
+
     async def handle_model_command(self, argument: str) -> None:
         """Run ``/model``: list the endpoint's models, or switch to the one given."""
         argument = argument.strip()
         if argument:
-            self.select_model(argument)
+            await self.switch_model(argument)
             return
-        try:
-            models = await self.open_ai_client.list_models()
-        except AgentError as error:
-            self.ui_print_wrapped((("Could not list models: ", "warning", False), (str(error), "pale", False)))
+        await self.refresh_models(force=True)
+        models = self.available_models
+        if not models:
+            detail = self._models_error or "the endpoint reported no models"
+            self.ui_print_wrapped((("Could not list models: ", "warning", False), (detail, "pale", False)))
             self.ui_print_wrapped(
                 (
                     ("Current model ", "muted", False),
@@ -1885,8 +1977,6 @@ class MinAgent:
             return
         self.print("")
         self.ui_print_wrapped((("╭─ MODELS", "magenta", True),))
-        if not models:
-            self.ui_print_wrapped((("│ ", "magenta", False), ("The endpoint reported no models.", "muted", False)))
         for name in models:
             if name == self.model:
                 self.ui_print_wrapped(
@@ -1894,7 +1984,9 @@ class MinAgent:
                 )
             else:
                 self.ui_print_wrapped((("│ ", "magenta", False), ("○ ", "muted", False), (name, "pale", False)))
-        self.ui_print_wrapped((("╰─ ", "magenta", False), ("/model <name>", "muted", False)))
+        self.ui_print_wrapped(
+            (("╰─ ", "magenta", False), ("/model <name> · ↑/↓ to choose while typing", "muted", False))
+        )
 
     def prompt_overhead_warning(self) -> str:
         """Describe a fixed prompt that crowds the configured window, or return ""."""
@@ -2703,7 +2795,12 @@ class MinAgent:
             state["autocomplete"] = None
             state["visible"] = self.hide_autocomplete_panel(state["visible"])
             return
-        next_state = build_autocomplete_state(line, cursor, self.workspace_files, SLASH_COMMANDS)
+        next_state = build_autocomplete_state(
+            line, cursor, self.workspace_files, SLASH_COMMANDS, self.available_models, self.model
+        )
+        if next_state is None and _MODEL_SELECTION_LINE.match(line) and not self.available_models:
+            # The picker needs the endpoint's list; fetch it, then repaint.
+            self.schedule_models_refresh(state)
         if (
             not next_state
             or "\n" in line

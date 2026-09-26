@@ -114,7 +114,7 @@ Type `/` to open command autocomplete. Use ↑/↓ to choose a command and Enter
 - `/skills [reload | show <name> | delete <name>]`: list the registered skills, force a rescan, print one skill's instructions, or delete a skill that lives inside the workspace.
 - `/memory [forget <id>]`: show how many memories exist, their success and reuse counts, and the strongest entries; `forget` deletes one entry.
 - `/skill <what it should do>`: ask the model to draft a `SKILL.md` for that capability, register it immediately, and report the resulting name and path. An unfinished draft is reported; nothing is registered unless it validates.
-- `/model [name]`: list the models the endpoint advertises through its OpenAI-compatible `/models` endpoint (Ollama and llama.cpp both expose it), marking the current one, or switch to `name` when given. Switching is in-session only; it does not edit `.env`.
+- `/model [name]`: list the models the endpoint advertises through its OpenAI-compatible `/models` endpoint (Ollama and llama.cpp both expose it), marking the current one, or switch to `name` when given. While you type `/model `, ↑/↓ choose from a live picker and Enter completes the name. Switching persists `OPENAI_MODEL` in the project `.env` and warms the model with a one-token request so the first turn is not the load.
 - `/doctor`: check the model, the context window, and the fixed prompt overhead.
 - `/new`: clear the screen and start a new conversation.
 - `/exit`: close MinAgent.

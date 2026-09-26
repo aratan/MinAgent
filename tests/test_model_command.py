@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 
 from minagent.app import MinAgent
+from minagent.editor import Key, build_autocomplete_state, handle_autocomplete_keypress
 from minagent.errors import AgentError
 from minagent.openai import OpenAiClient
 
@@ -108,3 +110,73 @@ def test_selecting_the_same_model_is_a_no_op():
     app.open_ai_client = OpenAiClient(ENDPOINT, None, "llama3:latest", [])
     app.select_model("llama3:latest")
     assert "Already using" in app._stdout.text
+
+
+def test_model_picker_lists_matching_models_while_typing():
+    state = build_autocomplete_state(
+        "/model qw",
+        len("/model qw"),
+        [],
+        [],
+        ["llama3:latest", "qwen2.5:7b"],
+        "llama3:latest",
+    )
+    assert state is not None and state["kind"] == "model"
+    assert [candidate["value"] for candidate in state["candidates"]] == ["qwen2.5:7b"]
+
+
+def test_model_picker_completes_the_chosen_name_in_place():
+    state = build_autocomplete_state(
+        "/model qw",
+        len("/model qw"),
+        [],
+        [],
+        ["qwen2.5:7b"],
+        "llama3:latest",
+    )
+    app_line = "/model qw"
+
+    class _Editor:
+        line = app_line
+        cursor = len(app_line)
+
+    editor = _Editor()
+    action = handle_autocomplete_keypress(state, Key(name="enter"), editor)
+    assert action == {"kind": "complete", "selected_file": None}
+    assert editor.line == "/model qwen2.5:7b"
+
+
+def test_persist_model_replaces_the_env_entry(tmp_path: Path):
+    env = tmp_path / ".env"
+    env.write_text("OPENAI_BASE_URL=http://x/v1\nOPENAI_MODEL=old\n")
+    app = _app()
+    app.application_root = str(tmp_path)
+    assert app.persist_model("new-model") == str(env)
+    assert env.read_text() == "OPENAI_BASE_URL=http://x/v1\nOPENAI_MODEL=new-model\n"
+
+
+def test_persist_model_appends_when_missing(tmp_path: Path):
+    env = tmp_path / ".env"
+    env.write_text("OPENAI_BASE_URL=http://x/v1\n")
+    app = _app()
+    app.application_root = str(tmp_path)
+    app.persist_model("fresh-model")
+    assert env.read_text().endswith("OPENAI_MODEL=fresh-model\n")
+
+
+async def test_switching_a_model_persists_and_warms_it(tmp_path: Path, monkeypatch):
+    app = _app()
+    app.application_root = str(tmp_path)
+    app.open_ai_client = OpenAiClient(ENDPOINT, None, "llama3:latest", [])
+    calls: list[Any] = []
+
+    async def fake_call(messages, options=None):
+        calls.append(options)
+        return {"payload": {"usage": {}}, "message": {"content": "pong", "tool_calls": []}}
+
+    monkeypatch.setattr(app, "call_chat_completions", fake_call)
+    await app.switch_model("qwen2.5:7b")
+    assert app.model == "qwen2.5:7b"
+    assert (tmp_path / ".env").read_text().strip().endswith("OPENAI_MODEL=qwen2.5:7b")
+    assert calls == [{"max_tokens": 1}], "the model was not warmed before the first turn"
+    assert "Model ready." in app._stdout.text

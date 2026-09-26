@@ -23,6 +23,7 @@ _RESET = "\x1b[0m"
 _WHITESPACE = re.compile(r"\s")
 _NON_SPACE_TOKEN = re.compile(r"^[^\s]*")
 _COMMAND_PREFIX = re.compile(r"^(\s*)\/([^\s]*)$")
+_MODEL_PREFIX = re.compile(r"^\s*/model\s+")
 _WHITESPACE_RUN = re.compile(r"\s+")
 
 NAVIGATION_KEYS = {
@@ -191,11 +192,39 @@ def build_autocomplete_state(
     cursor: int,
     workspace_files: Sequence[str],
     slash_commands: Sequence[dict[str, str]],
+    models: Sequence[str] = (),
+    current_model: str = "",
 ) -> dict[str, Any] | None:
     """Build the autocomplete panel state for the token under the cursor."""
     prefix = line[:cursor]
     token_match = _NON_SPACE_TOKEN.match(line[cursor:])
     token_end = cursor + (len(token_match.group(0)) if token_match else 0)
+
+    model_match = _MODEL_PREFIX.match(prefix)
+    if model_match and models:
+        query = prefix[model_match.end():]
+        lowered = query.lower()
+        candidates = [
+            {
+                "value": name,
+                "label": f"{name}  current" if name == current_model else name,
+            }
+            for name in models
+            if name.lower().startswith(lowered)
+        ]
+        if not candidates:
+            return None
+        return {
+            "kind": "model",
+            "line": line,
+            "cursor": cursor,
+            "start": model_match.end(),
+            "end": token_end,
+            "query": query,
+            "candidates": candidates,
+            "total_matches": len(candidates),
+            "selected_index": 0,
+        }
 
     command_match = _COMMAND_PREFIX.match(prefix)
     if command_match:
@@ -270,7 +299,7 @@ def format_autocomplete_panel(
     ui_text: Callable[..., str] = lambda value, *args: value,
 ) -> list[str]:
     """Render the autocomplete panel as fixed-height lines."""
-    title = "Files" if state["kind"] == "file" else "Commands"
+    title = {"file": "Files", "model": "Models"}.get(state["kind"], "Commands")
     matches = state["total_matches"]
     # The panel keeps a fixed height, so its own chrome is truncated rather than wrapped.
     lines = [
@@ -278,7 +307,7 @@ def format_autocomplete_panel(
             truncate_terminal_text(
                 f"  ┌─ {title.upper()} · {matches} match{'es' if matches != 1 else ''}", columns
             ),
-            "cyan" if state["kind"] == "file" else "magenta",
+            "magenta" if state["kind"] in ("command", "model") else "cyan",
             True,
         )
     ]
