@@ -8,6 +8,7 @@ import os
 import pty
 import re
 import sys
+import time
 import tty
 from datetime import datetime
 from typing import Any
@@ -39,6 +40,7 @@ from minagent.init_project import collect_project_essentials
 from minagent.line_editor import LineEditor
 from minagent.markdown_terminal import create_terminal_rendering
 from minagent.openai import read_streaming_response
+from minagent.request_cache import RequestCache
 from minagent.secrets import approval_preview
 from minagent.skills import create_skill_tools, execute_skill_tool, slugify_skill_name
 from minagent.terminal_command import run_terminal_command
@@ -747,6 +749,132 @@ def test_an_archived_result_reports_what_it_saved(tmp_path):
 
     assert app._turn_tool_tokens["run_terminal"] < app._turn_tool_calls["run_terminal"] * 200_000 / 3
     assert app._turn_archived_tokens > 0
+
+
+def test_the_system_prompt_prefix_survives_within_the_same_minute():
+    """Providers only reuse a byte-identical prefix, so the clock must not tick in it."""
+    app, _output = _make_app(100)
+    app.terminal_mode = "auto"
+    app._base_system_prompt_sections = app.build_base_system_prompt()
+    app.messages = [{"role": "system", "content": ""}]
+
+    app.refresh_system_prompt()
+    primero = app.messages[0]["content"]
+    time.sleep(1.1)
+    app.refresh_system_prompt()
+    assert app.messages[0]["content"] == primero, "the system prompt changed within the same minute"
+
+    section = next(s for s in app._current_system_prompt_sections if s["name"] == "Current time")
+    assert re.search(r"T\d{2}:\d{2}:00", section["content"]), "the clock is not truncated to the minute"
+
+
+def test_stable_prompt_sections_come_before_the_volatile_ones():
+    """Putting the changing parts last keeps the reusable prefix as long as possible."""
+    app, _output = _make_app(100)
+    app.terminal_mode = "auto"
+    app.agents_context = "Reglas."
+    app.compacted_summary = "Resumen."
+    app.workspace_snapshot = "src/minagent/app.py"
+    app.memory_hint_context = "Memoria."
+    app._base_system_prompt_sections = app.build_base_system_prompt()
+    app.messages = [{"role": "system", "content": ""}]
+
+    app.refresh_system_prompt()
+    nombres = [section["name"] for section in app._current_system_prompt_sections]
+    base = [section["name"] for section in app._base_system_prompt_sections]
+    assert nombres[: len(base)] == base, "the stable sections are not first"
+    assert nombres.index("Current time") == len(base), "the clock should open the volatile block"
+    for nombre in ("AGENTS.md", "Conversation summary", "Workspace inventory", "Memory hints"):
+        assert nombre in nombres
+
+
+async def test_the_request_cache_replays_an_identical_request_without_calling_the_endpoint(tmp_path, monkeypatch):
+    """The retry after a bad turn resends the same request; it must not be paid for twice."""
+    app = _skill_app(tmp_path)
+    llamadas = []
+
+    async def counting(messages, options=None):
+        llamadas.append(messages)
+        return {
+            "payload": {"usage": {}, "finish_reason": "stop"},
+            "message": {"role": "assistant", "content": "respuesta"},
+        }
+
+    monkeypatch.setattr(app, "call_chat_completions", counting)
+    app.messages = [{"role": "system", "content": "sistema"}]
+    primera = await app.request_assistant_turn(None)
+    assert primera == "respuesta"
+    assert len(llamadas) == 1
+
+    # Mismo prompt byte a byte: se reproduce sin volver a llamar al endpoint.
+    app.request_cache.put(app.request_cache.key(app.model, app.tools, app.messages), {
+        "payload": {"usage": {}, "finish_reason": "stop"},
+        "message": {"role": "assistant", "content": "respuesta"},
+    })
+    assert await app.request_assistant_turn(None) == "respuesta"
+    assert len(llamadas) == 1, "an identical request reached the endpoint again"
+    assert app.request_cache.stats()["hits"] == 1
+
+
+def test_the_request_cache_keeps_the_flags_the_caller_branches_on():
+    """A replay that dropped 'truncated' would take a different path than the original."""
+    cache = RequestCache()
+    tools = [{"type": "function", "function": {"name": "read_file"}}]
+    mensajes = [{"role": "user", "content": "hola"}]
+    clave = cache.key("m", tools, mensajes)
+    cache.put(
+        clave,
+        {
+            "payload": {"usage": {"prompt_tokens": 7}, "finish_reason": "length", "truncated": True},
+            "message": {"role": "assistant", "content": None, "tool_calls": [{"id": "a", "type": "function"}]},
+        },
+    )
+    golpe = cache.get(clave)
+    assert golpe is not None
+    assert golpe["payload"]["truncated"] is True
+    assert golpe["payload"]["finish_reason"] == "length"
+    assert golpe["payload"]["usage"] == {"prompt_tokens": 7}
+    assert golpe["message"]["tool_calls"] == [{"id": "a", "type": "function"}]
+
+
+def test_the_request_cache_separates_different_requests():
+    cache = RequestCache()
+    tools = [{"type": "function", "function": {"name": "read_file"}}]
+    base = [{"role": "user", "content": "hola"}]
+    clave = cache.key("m", tools, base)
+    cache.put(clave, {"payload": {"finish_reason": "stop"}, "message": {"content": "a"}})
+
+    # Cambiar el modelo, las herramientas o el mensaje debe invalidar la entrada.
+    assert cache.get(cache.key("otro", tools, base)) is None
+    assert cache.get(cache.key("m", tools + [{"type": "function"}], base)) is None
+    assert cache.get(cache.key("m", tools, [{"role": "user", "content": "adios"}])) is None
+    # El orden de las claves no debe producir un falso fallo.
+    assert cache.get(cache.key("m", [{"function": {"name": "read_file"}, "type": "function"}], base)) is not None
+
+
+def test_the_request_cache_never_replays_a_stopped_response():
+    cache = RequestCache()
+    clave = cache.key("m", [], [{"role": "user", "content": "hola"}])
+    cache.put(clave, {"payload": {"finish_reason": "aborted"}, "message": {"content": "a medias"}})
+    assert cache.get(clave) is None
+    assert len(cache) == 0
+
+    cache.put(
+        clave,
+        {"payload": {"finish_reason": "stop"}, "message": {"content": "x", "interrupted": True}},
+    )
+    assert cache.get(clave) is None, "an interrupted response must be retried, not replayed"
+
+
+def test_the_request_cache_is_bounded():
+    cache = RequestCache(max_entries=2)
+    for indice in range(5):
+        clave = cache.key("m", [], [{"role": "user", "content": str(indice)}])
+        cache.put(clave, {"payload": {"finish_reason": "stop"}, "message": {"content": str(indice)}})
+    assert len(cache) == 2
+    # Lo más viejo se descartó, lo más reciente sigue ahí.
+    assert cache.get(cache.key("m", [], [{"role": "user", "content": "0"}])) is None
+    assert cache.get(cache.key("m", [], [{"role": "user", "content": "4"}])) is not None
 
 
 def test_the_capability_note_points_at_web_search_when_it_is_available():

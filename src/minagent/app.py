@@ -67,6 +67,7 @@ from .memory import (
     format_remember_result,
 )
 from .openai import OpenAiClient
+from .request_cache import RequestCache
 from .secrets import approval_preview, redact_likely_secrets
 from .skills import (
     create_skill_tools,
@@ -265,6 +266,7 @@ class MinAgent:
         self.max_tool_rounds = DEFAULT_MAX_TOOL_ROUNDS
         self.tool_preview_chars = DEFAULT_TOOL_PREVIEW_CHARS
         self.tool_archive = ToolArchive("")
+        self.request_cache = RequestCache()
         self.input_modalities: list[str] = []
         self.show_reasoning = False
         self.compaction_reserve_tokens = 0
@@ -1081,10 +1083,18 @@ class MinAgent:
         return warnings
 
     def refresh_system_prompt(self) -> None:
-        """Recompose the system message from the current sections."""
+        """Recompose the system message from the current sections.
+
+        Order matters for prompt caching: providers only reuse a byte-identical
+        prefix, and the system message is the first thing in the request. So the
+        stable sections come first and everything that can change per request -
+        the clock, AGENTS.md, the compacted summary, the inventory, the memory
+        hints - follows them, which keeps the reusable prefix as long as
+        possible instead of invalidating it from the first block.
+        """
         sections = list(self._base_system_prompt_sections)
         # The clock is real host state, so it is refreshed with every request.
-        sections.insert(1 if sections else 0, self.current_time_section())
+        sections.append(self.current_time_section())
         if self.agents_context:
             sections.append({"name": "AGENTS.md", "content": self.agents_context})
         if self.compacted_summary:
@@ -1099,8 +1109,14 @@ class MinAgent:
         self.messages[0]["content"] = "\n\n".join(section["content"] for section in sections)
 
     def current_time_section(self) -> dict[str, str]:
-        """Report the host clock, so time questions need no shell round trip."""
-        now = datetime.now().astimezone()
+        """Report the host clock, so time questions need no shell round trip.
+
+        The reading is truncated to the minute on purpose. A second-resolution
+        clock would change the system message on every single request, and a
+        changed system message is a cache miss on the whole prompt. A minute of
+        drift is irrelevant because the model can always run ``date``.
+        """
+        now = datetime.now().astimezone().replace(second=0, microsecond=0)
         content = (
             f"Host local time: {now.isoformat(timespec='seconds')} ({now.strftime('%A')}). "
             "This is the clock of the machine MinAgent runs on; answer time questions from it."
@@ -2363,26 +2379,36 @@ class MinAgent:
                     reasoning_output.close()
                 streamed_output.write(chunk)
 
-            try:
-                completion = await self.call_chat_completions(
-                    self.messages,
-                    {
-                        "with_tools": True,
-                        # The list grows after startup (skills, MCP), so send it per request.
-                        "available_tools": self.tools,
-                        "signal": signal,
-                        "on_text_delta": write_answer,
-                        "on_reasoning_delta": reasoning_output.write if reasoning_output else None,
-                    },
-                )
-                stream_status = "complete"
-            finally:
-                streamed_output.close("interrupted" if (signal is not None and signal.cancelled) else stream_status)
-                if reasoning_output is not None:
-                    reasoning_output.close()
+            # An identical request may already have an answer: the retry after an
+            # empty response, a resubmitted prompt, a corrective nudge. Replaying
+            # it skips the endpoint without changing what the model was asked.
+            cache_key = self.request_cache.key(self.model, self.tools, self.messages)
+            completion: Any = self.request_cache.get(cache_key)
+            if completion is None:
+                try:
+                    completion = await self.call_chat_completions(
+                        self.messages,
+                        {
+                            "with_tools": True,
+                            # The list grows after startup (skills, MCP), so send it per request.
+                            "available_tools": self.tools,
+                            "signal": signal,
+                            "on_text_delta": write_answer,
+                            "on_reasoning_delta": reasoning_output.write if reasoning_output else None,
+                        },
+                    )
+                    stream_status = "complete"
+                finally:
+                    streamed_output.close(
+                        "interrupted" if (signal is not None and signal.cancelled) else stream_status
+                    )
+                    if reasoning_output is not None:
+                        reasoning_output.close()
 
             payload = completion["payload"]
             message = completion["message"]
+            if not payload.get("replayed"):
+                self.request_cache.put(cache_key, completion)
             if (signal is not None and signal.cancelled) or message.get("interrupted"):
                 partial_text = assistant_text(message.get("content") or "").strip()
                 if partial_text:
