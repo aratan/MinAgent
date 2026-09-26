@@ -10,7 +10,8 @@ from __future__ import annotations
 import codecs
 import json
 import re
-from typing import Any, AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
+from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
@@ -26,7 +27,9 @@ MAX_TOOL_ARGUMENT_CHARS = 1024 * 1024
 DEFAULT_METADATA_TIMEOUT_MS = 10 * 1000
 _OLLAMA_CHAT_SUFFIX = "/v1/chat/completions"
 
-RETRYABLE_NETWORK_ERRORS = {
+# A tuple: ``except`` rejects a set with a TypeError, which silently disabled
+# these retries.
+RETRYABLE_NETWORK_ERRORS = (
     httpx.ConnectError,
     httpx.ConnectTimeout,
     httpx.ReadError,
@@ -35,7 +38,7 @@ RETRYABLE_NETWORK_ERRORS = {
     httpx.PoolTimeout,
     httpx.ReadTimeout,
     httpx.WriteTimeout,
-}
+)
 
 # A busy server is worth retrying; a client error is not.
 RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
@@ -72,7 +75,7 @@ async def _wait_for_retry_delay(signal: CancellationToken | None, delay: float |
         raise OperationAborted("The operation was aborted.")
     try:
         await asyncio.wait_for(signal.wait(), timeout=seconds)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return
     raise OperationAborted("The operation was aborted.")
 

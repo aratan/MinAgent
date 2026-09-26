@@ -53,6 +53,34 @@ async def test_a_429_is_retried_then_succeeds():
     assert result["message"]["content"] == "hi"
 
 
+async def test_a_connection_error_is_retried_before_failing():
+    calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise httpx.ConnectError("refused", request=request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_TEXT_FRAME + b"data: [DONE]\n\n",
+        )
+
+    client = OpenAiClient(ENDPOINT, None, "m", [], timeout_ms=5000, transport=httpx.MockTransport(handler))
+    result = await client.complete([{"role": "user", "content": "hi"}])
+    assert calls["count"] == 2, "a connection error must be retried"
+    assert result["message"]["content"] == "hi"
+
+
+async def test_a_persistent_connection_error_becomes_an_agent_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused", request=request)
+
+    client = OpenAiClient(ENDPOINT, None, "m", [], timeout_ms=5000, transport=httpx.MockTransport(handler))
+    with pytest.raises(AgentError, match="Could not connect"):
+        await client.complete([{"role": "user", "content": "hi"}])
+
+
 async def test_a_client_error_is_not_retried():
     calls = {"count": 0}
 
