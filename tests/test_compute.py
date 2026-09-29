@@ -22,6 +22,8 @@ from minagent.app import MinAgent
 from minagent.capabilities import build_builtin_capabilities
 from minagent.compute import (
     MUSIC_TOOL_NAME,
+    QUEUE_TOOL_NAME,
+    RESULT_TOOL_NAME,
     SPEAK_TOOL_NAME,
     STATUS_TOOL_NAME,
     TRANSCRIBE_TOOL_NAME,
@@ -100,9 +102,9 @@ def test_a_music_refusal_does_not_suggest_changing_video_settings(tmp_path: Path
     orchestrator = _orchestrator(tmp_path)
     orchestrator._vram_probe = lambda: VramReading(total_mib=FULL_CARD, free_mib=300)
     with pytest.raises(AgentError) as failure:
-        orchestrator.require_headroom("Music generation", 2800)
+        orchestrator.require_headroom("Music generation", 3200)
     message = str(failure.value)
-    assert "small model" in message
+    assert "'music' model" in message
     assert "frames" not in message
 
 
@@ -230,11 +232,12 @@ def test_frames_drive_video_memory_and_offload_chooses_the_mode() -> None:
     assert estimate_video_vram(49, "sequential") < estimate_video_vram(49, "group")
 
 
-def test_only_musicgen_small_fits_alongside_voice(tmp_path: Path) -> None:
-    orchestrator = _orchestrator(tmp_path)
-    # 2800 MiB fits in what a clean card leaves after the voice reserve.
-    orchestrator.generate_music  # noqa: B018 - attribute access documents the surface
-    assert estimate_video_vram(49, "group") == 5200
+def test_only_the_lightest_music_model_fits_alongside_voice(tmp_path: Path) -> None:
+    """The default has to be the one that runs, not the one that sounds best."""
+    from minagent.compute import MUSIC_VRAM_ESTIMATE_MIB
+
+    assert min(MUSIC_VRAM_ESTIMATE_MIB, key=lambda name: MUSIC_VRAM_ESTIMATE_MIB[name]) == "music"
+    assert estimate_video_vram(49, "sequential") < estimate_video_vram(49, "group")
 
 
 async def test_an_unknown_offload_mode_is_refused(tmp_path: Path) -> None:
@@ -365,6 +368,8 @@ def test_every_tool_has_a_schema_and_a_label(tmp_path: Path) -> None:
         TRANSCRIBE_TOOL_NAME,
         VIDEO_TOOL_NAME,
         MUSIC_TOOL_NAME,
+        QUEUE_TOOL_NAME,
+        RESULT_TOOL_NAME,
         STATUS_TOOL_NAME,
     }
     from minagent.app import FILE_TOOL_LABELS
@@ -470,6 +475,302 @@ def test_a_generated_path_is_reported_relative_to_the_workspace(tmp_path: Path) 
     assert agent.orchestrator is not None
     absolute = str(tmp_path / "salida" / "a.mp4")
     assert agent.relative_to_workspace(absolute) == os.path.join("salida", "a.mp4")
+
+
+# ---------------------------------------------------------------- the queue
+async def test_a_queued_job_returns_an_id_without_waiting(tmp_path: Path) -> None:
+    """A render is minutes; asking for one must not spend minutes of turn time."""
+    orchestrator = _orchestrator(tmp_path)
+    job_id = orchestrator.submit_video("un gato", frames=17)
+    assert job_id.startswith("job-")
+    assert "waiting" in orchestrator.result_text(job_id).lower()
+    await asyncio.sleep(0.05)
+
+
+async def test_several_jobs_queue_in_order_and_run_one_at_a_time(tmp_path: Path) -> None:
+    orchestrator = _orchestrator(tmp_path)
+    active = 0
+    peak = 0
+    order: list[str] = []
+
+    async def runner(script: Path, argv: list[str], timeout: int) -> str:
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        order.append(argv[1])
+        await asyncio.sleep(0.02)
+        active -= 1
+        return 'RESULT {"ok": true, "path": "salida/x.mp4"}'
+
+    orchestrator._spawn = runner  # type: ignore[method-assign]
+    ids = [orchestrator.submit_video(f"clip {index}", frames=17) for index in range(3)]
+    for job_id in ids:
+        for _ in range(100):
+            if "finished" in orchestrator.result_text(job_id):
+                break
+            await asyncio.sleep(0.01)
+    assert peak == 1
+    assert order == ["clip 0", "clip 1", "clip 2"]
+
+
+async def test_a_queued_job_reports_waiting_then_done(tmp_path: Path) -> None:
+    orchestrator = _orchestrator(tmp_path)
+    release = asyncio.Event()
+    order: list[str] = []
+
+    async def runner(script: Path, argv: list[str], timeout: int) -> str:
+        order.append(argv[1])
+        if argv[1] == "blocker":
+            await release.wait()
+        return 'RESULT {"ok": true, "path": "salida/queued.mp4"}'
+
+    orchestrator._spawn = runner  # type: ignore[method-assign]
+    # The blocker goes first and holds the card, so the second is observably
+    # waiting rather than running.
+    orchestrator.submit_video("blocker", frames=17)
+    job_id = orchestrator.submit_video("x", frames=17)
+    await asyncio.sleep(0.03)
+    assert "position 1" in orchestrator.result_text(job_id)
+    release.set()
+    for _ in range(100):
+        if "finished" in orchestrator.result_text(job_id):
+            break
+        await asyncio.sleep(0.01)
+    assert order == ["blocker", "x"]
+    assert "salida/queued.mp4" in orchestrator.result_text(job_id)
+
+
+async def test_a_late_poll_still_gets_the_result(tmp_path: Path) -> None:
+    """Finishing must not make the id stop answering, or a slow poll loses the work."""
+    orchestrator = _orchestrator(tmp_path)
+
+    async def runner(script: Path, argv: list[str], timeout: int) -> str:
+        return 'RESULT {"ok": true, "path": "salida/late.mp4"}'
+
+    orchestrator._spawn = runner  # type: ignore[method-assign]
+    job_id = orchestrator.submit_video("x", frames=17)
+    await asyncio.sleep(0.05)
+    assert "salida/late.mp4" in orchestrator.result_text(job_id)
+    assert orchestrator.queued == 0
+
+
+def test_an_unknown_job_id_is_a_clear_error(tmp_path: Path) -> None:
+    orchestrator = _orchestrator(tmp_path)
+    with pytest.raises(AgentError) as failure:
+        orchestrator.result_text("job-999")
+    assert "compute_status" in str(failure.value)
+
+
+async def test_the_queue_is_bounded(tmp_path: Path) -> None:
+    """Minutes of GPU time per entry means the backlog needs a ceiling."""
+    orchestrator = _orchestrator(tmp_path, queue_limit=2)
+
+    async def runner(script: Path, argv: list[str], timeout: int) -> str:
+        await asyncio.sleep(0.05)
+        return 'RESULT {"ok": true}'
+
+    orchestrator._spawn = runner  # type: ignore[method-assign]
+    orchestrator.submit_video("a", frames=17)
+    orchestrator.submit_video("b", frames=17)
+    with pytest.raises(AgentError) as failure:
+        orchestrator.submit_video("c", frames=17)
+    assert "COMPUTE_QUEUE_LIMIT" in str(failure.value)
+
+
+async def test_status_lists_the_queue_with_positions(tmp_path: Path) -> None:
+    orchestrator = _orchestrator(tmp_path)
+
+    async def runner(script: Path, argv: list[str], timeout: int) -> str:
+        await asyncio.sleep(0.05)
+        return 'RESULT {"ok": true}'
+
+    orchestrator._spawn = runner  # type: ignore[method-assign]
+    orchestrator.submit_video("a", frames=17)
+    orchestrator.submit_video("b", frames=17)
+    report = orchestrator.status_text()
+    assert "1. Video generation" in report
+    assert "2. Video generation" in report
+
+
+async def test_a_queued_job_and_a_blocking_one_share_the_card(tmp_path: Path) -> None:
+    """The single slot is the policy; two entry points must not each take one."""
+    orchestrator = _orchestrator(tmp_path)
+    active = 0
+    peak = 0
+
+    async def runner(script: Path, argv: list[str], timeout: int) -> str:
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.02)
+        active -= 1
+        return 'RESULT {"ok": true, "path": "salida/x.mp4"}'
+
+    orchestrator._spawn = runner  # type: ignore[method-assign]
+    orchestrator.submit_video("queued", frames=17)
+    await orchestrator.generate_video("blocking", frames=17, runner=runner)
+    assert peak == 1
+
+
+# ------------------------------------------------------------- the VRAM hold
+async def test_ollama_is_never_unloaded_unless_asked(tmp_path: Path) -> None:
+    """Evicting someone's warm model is their decision, not the agent's."""
+    orchestrator = _orchestrator(tmp_path, ollama_mode="off")
+    assert await orchestrator._release_vram() == ""
+
+
+async def test_a_job_that_cannot_fit_still_names_the_holder(tmp_path: Path) -> None:
+    """Off means "do not touch it", not "fail vaguely"."""
+    orchestrator = _orchestrator(tmp_path, ollama_mode="off")
+    orchestrator._vram_probe = lambda: VramReading(
+        total_mib=FULL_CARD, free_mib=200, used_by_others_mib=7000, processes=("llama-server (7000 MiB)",)
+    )
+    with pytest.raises(AgentError) as failure:
+        await orchestrator.generate_video("x", frames=49)
+    assert "llama-server" in str(failure.value)
+    assert "COMPUTE_UNLOAD_OLLAMA" not in str(failure.value)
+
+
+def test_the_unload_mode_parsing_is_explicit() -> None:
+    from minagent.compute import parse_ollama_mode
+
+    assert parse_ollama_mode(None) == "off"
+    assert parse_ollama_mode("") == "off"
+    assert parse_ollama_mode("off") == "off"
+    assert parse_ollama_mode("on") == "auto"
+    assert parse_ollama_mode("auto") == "auto"
+    # "ask" is a real mode the orchestrator honours as "do not", so the decision
+    # stays with the person watching.
+    assert parse_ollama_mode("ask") == "ask"
+    with pytest.raises(AgentError):
+        parse_ollama_mode("maybe")
+
+
+def test_asking_does_not_unload_either(tmp_path: Path) -> None:
+    orchestrator = _orchestrator(tmp_path, ollama_mode="ask")
+    assert orchestrator.ollama_mode != "auto"
+
+
+async def test_unload_reports_when_ollama_has_nothing_loaded(tmp_path: Path) -> None:
+    """The common case must be a one-line answer, not an error."""
+    from minagent.compute import unload_ollama
+
+    fake = tmp_path / "ollama"
+    fake.write_text('#!/bin/sh\necho "NAME    ID    SIZE"\n')
+    fake.chmod(0o755)
+    original = os.environ.get("PATH", "")
+    os.environ["PATH"] = f"{tmp_path}:{original}"
+    try:
+        message = await unload_ollama(str(tmp_path))
+    finally:
+        os.environ["PATH"] = original
+    assert "no model loaded" in message
+
+
+async def test_unload_names_the_model_it_stopped(tmp_path: Path) -> None:
+    from minagent.compute import unload_ollama
+
+    fake = tmp_path / "ollama"
+    # `ps` reports a loaded model; `stop` succeeds; there is no nvidia-smi here
+    # so the free-memory wait ends on its own timeout.
+    fake.write_text(
+        "#!/bin/sh\n"
+        'case "$1" in\n'
+        '  ps) printf "NAME\\tID\\tSIZE\\tPROCESSOR\\tCONTEXT\\tUNTIL\\nllama3:8b\\tabc\\t6.2GB\\t100%GPU\\t"\n'
+        '     printf "4 minutes from now\\n" ;;\n'
+        '  stop) exit 0 ;;\n'
+        'esac\n'
+    )
+    fake.chmod(0o755)
+    original = os.environ.get("PATH", "")
+    os.environ["PATH"] = f"{tmp_path}:{original}"
+    try:
+        message = await unload_ollama(str(tmp_path), seconds=1.0)
+    finally:
+        os.environ["PATH"] = original
+    assert "llama3:8b" in message
+    assert "reloads" in message
+
+
+def test_the_config_exposes_the_new_settings(tmp_path: Path) -> None:
+    config = load_configuration(
+        str(tmp_path),
+        str(tmp_path),
+        {
+            "OPENAI_API_KEY": "test",
+            "OPENAI_MODEL": "m",
+            "COMPUTE_ENABLED": "on",
+            "COMPUTE_UNLOAD_OLLAMA": "on",
+            "COMPUTE_QUEUE_LIMIT": "3",
+        },
+    )
+    assert config.compute_unload_ollama == "auto"
+    assert config.compute_queue_limit == 3
+
+
+def test_the_two_new_tools_are_in_the_capability(tmp_path: Path) -> None:
+    entries = build_builtin_capabilities(terminal_mode="off", compute_enabled=True)
+    compute = next(entry for entry in entries if entry.name == "compute")
+    assert QUEUE_TOOL_NAME in compute.tool_names
+    assert RESULT_TOOL_NAME in compute.tool_names
+    # The guidance has to tell the model to queue rather than block, or the
+    # queue exists and nothing ever uses it.
+    assert "queue_job" in compute.guidance
+    assert "compute_result" in compute.guidance
+
+
+async def test_every_advertised_tool_is_implemented_by_the_mcp_server() -> None:
+    """A tool in ``tools/list`` that raises "Unknown tool" is worse than absent.
+
+    The server builds its list from ``create_compute_tools`` while dispatching
+    through its own ``if`` chain, so adding a tool to one and forgetting the
+    other advertises something that cannot be called. That is exactly what
+    happened: ``queue_job`` and ``compute_result`` were listed and refused.
+    """
+    import importlib.util
+
+    root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location("compute_mcp", root / ".agents" / "mcp" / "compute" / "index.py")
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    server = module.ComputeServer(str(root))
+    advertised = {schema["function"]["name"] for schema in server.tools()}
+
+    # Every advertised tool must be dispatchable. A bad argument is fine and
+    # expected; "Unknown tool" is not.
+    for name in advertised:
+        try:
+            await server.call(name, {})
+        except ValueError as error:
+            assert "Unknown tool" not in str(error), f"{name} is advertised but not implemented"
+        except Exception:
+            pass  # Rejected on its arguments, which is the dispatch working.
+
+
+async def test_the_mcp_server_queues_and_collects() -> None:
+    import importlib.util
+
+    root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location("compute_mcp_q", root / ".agents" / "mcp" / "compute" / "index.py")
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    server = module.ComputeServer(str(root))
+
+    async def runner(script: Path, argv: list[str], timeout: int) -> str:
+        return 'RESULT {"ok": true, "path": "salida/q.wav"}'
+
+    server.orchestrator._spawn = runner  # type: ignore[method-assign]
+    answer = await server.call(QUEUE_TOOL_NAME, {"kind": "music", "prompt": "jazz", "seconds": 5})
+    assert "job-1" in answer
+    for _ in range(100):
+        if "finished" in await server.call(RESULT_TOOL_NAME, {"job_id": "job-1"}):
+            break
+        await asyncio.sleep(0.01)
+    assert "salida/q.wav" in await server.call(RESULT_TOOL_NAME, {"job_id": "job-1"})
 
 
 async def test_the_backend_runs_under_this_interpreter_not_bare_python3(tmp_path: Path) -> None:

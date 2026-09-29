@@ -319,7 +319,7 @@ that card, it is impossible, so `COMPUTE_ENABLED=on` turns the constraint into a
 - **The voice engines stay resident.** `speak_text` (Kokoro) and `transcribe_audio` (whisper.cpp)
   hold under 2.5 GB together and answer immediately — including *while a video is rendering*,
   because they never queue behind the heavy lock.
-- **Heavy jobs are serialized.** `generate_video` (LTX-Video) and `generate_music` (MusicGen) take
+- **Heavy jobs are serialized.** `generate_video` (LTX-Video) and `generate_music` (AudioLDM2) take
   the card one at a time, each in its own process with system RAM backing the layer offload.
 - **Free VRAM is measured, not assumed.** A job that will not fit is refused before it starts,
   naming the process holding the memory. On this machine an Ollama server was once sitting on
@@ -335,6 +335,44 @@ in a request that does not generate anything. The backends live in `scripts/comp
 optional dependencies: a missing `diffusers` fails that one call with the install command, and
 never stops the agent from starting. `.agents/skills/compute-gpu/SKILL.md` covers the install
 steps and the frame-count rules.
+
+**A separate environment for the backends.** The generation stack does not run on the agent's
+interpreter. Kokoro's `misaki` requires Python below 3.13, and LTX-Video's SentencePiece tokenizer
+needs `transformers` 4.x, so both break on the 3.14 the agent itself uses. `COMPUTE_PYTHON` points
+the subprocess at a 3.12 environment; `.env.example` has the exact commands. This is the one piece
+of setup that is not optional here, and it is the piece that most looks like it should not be
+necessary.
+
+**What runs where, measured on this machine** rather than assumed:
+
+| job | backend | notes |
+|-----|---------|-------|
+| `speak_text` | Kokoro 82M | falls back to CPU when the card is full, so it never fails |
+| `transcribe_audio` | whisper.cpp, `base` | CPU build here; the GPU flag is chosen from the binary, not the machine |
+| `generate_video` | LTX-Video 2B | `sequential` offload; 17 frames in ~1 min, peaked at 696 MiB |
+| `generate_music` | AudioLDM2 `music` | 8 s of audio in 25 s; 30 s is the ceiling per job |
+
+`sequential` offload is the default because it is the one that fits while another model holds the
+card. `group` is faster on an empty GPU and OOMs here. MusicGen, the obvious choice for music, is
+no longer in diffusers at all, which is why the music backend is AudioLDM2.
+
+**Queueing.** A render is minutes of GPU time, so asking for three videos one after another would
+spend an hour of turn time with no feedback. `queue_job` accepts a job and returns an id
+immediately, `compute_status` shows every waiting job's position, and `compute_result` reads one
+back when it finishes. Heavy jobs go through one queue whichever way they were asked for, so a
+queued job and a directly requested one still take the card one at a time. The queue is bounded
+by `COMPUTE_QUEUE_LIMIT`, because an unbounded backlog of minutes-long jobs is not a feature.
+
+A job that does not fit right now is **queued, not refused** — the thing usually holding the card
+is another of these jobs, and refusing the second video of a two-video request would be a bug
+wearing a policy's clothes. The VRAM decision is made at the front of the queue, where the
+reading is the freshest there is.
+
+**Freeing VRAM held by something else.** With `COMPUTE_UNLOAD_OLLAMA=on`, a job that still will
+not fit runs `ollama stop` first, which expires the keep-alive on a resident model. It is off by
+default on purpose: the model reloads on its next request, so that trade belongs to whoever is at
+the keyboard. With it off, a refused job names the process holding the memory and leaves the
+decision alone.
 
 The same orchestrator is also exposed as an MCP stdio server in `.agents/mcp/compute/index.py`, so
 any MCP client generates under the same VRAM budget rather than a second, divergent one.

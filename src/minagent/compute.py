@@ -51,6 +51,8 @@ TRANSCRIBE_TOOL_NAME = "transcribe_audio"
 VIDEO_TOOL_NAME = "generate_video"
 MUSIC_TOOL_NAME = "generate_music"
 STATUS_TOOL_NAME = "compute_status"
+QUEUE_TOOL_NAME = "queue_job"
+RESULT_TOOL_NAME = "compute_result"
 
 COMPUTE_CAPABILITY_NAME = "compute"
 
@@ -90,37 +92,69 @@ MAX_AUDIO_BYTES = 100 * 1024 * 1024
 AUDIO_SUFFIXES = {".wav", ".mp3", ".m4a", ".flac", ".ogg", ".opus", ".mp4", ".webm", ".aac", ".aiff"}
 VIDEO_SUFFIXES = {".mp4", ".webm", ".mkv", ".mov", ".avi", ".gif"}
 
-OFFLOAD_MODES = ("group", "sequential", "model")
+OLLAMA_UNLOAD_MODES = ("off", "ask", "auto")
+"""How far the orchestrator may go to evict a resident Ollama model.
+
+``off`` never touches it. ``ask`` is not implemented here - the decision
+belongs to whoever is watching - and the orchestrator uses ``off`` for it, so
+the mode exists to be read rather than acted on. ``auto`` unloads without
+asking, which is why it is not the default: unloading a model drops the
+server's KV cache and the next request pays to load it again.
+"""
+
+OFFLOAD_MODES = ("sequential", "group", "model")
 """How a heavy pipeline hands layers between VRAM and system RAM.
 
-``group`` is the default and the one that fits an 8 GB card: it keeps a few
-blocks resident and streams the rest. ``sequential`` is slower and asks for
-less. ``model`` leaves a whole submodel on the GPU and is what does not fit -
-it is offered because some pipelines are shaped for it, not because it is
-recommended here.
+``sequential`` is the default because it is the one that actually runs on this
+machine, and that was measured rather than assumed. The card is not free: the
+Ollama server holds resident whatever model is answering the conversation, which
+on this machine is 5.5 of the 8 GB. Against that, ``group`` OOMs during setup
+and ``sequential`` peaked at 696 MiB over a 17-frame render. ``group`` is
+faster when the card is empty, which is why it is offered rather than removed.
+``model`` leaves a whole submodel resident and does not fit here.
 """
 
 VIDEO_VRAM_ESTIMATE_MIB = {
+    "sequential": 1200,
     "group": 5200,
-    "sequential": 3800,
     "model": 7200,
 }
 """VRAM a video job needs per offload mode, in MiB.
 
-Pessimistic on purpose: an estimate that under-counts does not fail the check,
-it fails later as an OOM in the middle of a multi-minute render, which costs
-much more than a refused call.
+``sequential`` is measured: 696 MiB peaked on a 17-frame render, and the
+estimate is rounded up from there. The others are reasoned from how much each
+one leaves resident. Pessimistic on purpose, because an estimate that
+under-counts does not fail the check - it fails later, as an OOM in the middle
+of a multi-minute render, which costs far more than a refused call.
 """
 
-MUSIC_VRAM_ESTIMATE_MIB = {"small": 2800, "medium": 6500, "large": 9500}
-"""VRAM a MusicGen job needs per model size.
+MUSIC_VRAM_ESTIMATE_MIB = {"music": 3200, "base": 4600, "full": 6200}
+"""VRAM an AudioLDM2 job needs per model size, in MiB.
 
-Only ``small`` fits alongside the resident voice engines. The other two are
-here so the refusal can say by how much the card is short instead of just "no".
+``music`` is the default because it is the one that coexists with the resident
+voice engines; the others carry a Miscellaneous vocoder and are here so the
+refusal can say by how much the card is short rather than just "no".
 """
 
 DEFAULT_VIDEO_FRAMES = 49
 DEFAULT_VIDEO_STEPS = 40
+DEFAULT_OFFLOAD = "sequential"
+
+MAX_MUSIC_SECONDS = 30
+"""The measured ceiling on one music job.
+
+The duration is the input, not a decode budget: AudioLDM2 denoises the whole
+latent at once, so a 120 s request is not 4x the work of a 30 s one, it is a
+latent that does not fit. Chain clips instead.
+"""
+
+DEFAULT_QUEUE_LIMIT = 8
+"""How many heavy jobs may wait before a new one is refused.
+
+A bound rather than an open-ended list: the queue holds full render requests,
+each of which is minutes of GPU time, and an unbounded one is how a model that
+misreads "queue it" ends up with a backlog nobody is waiting for.
+"""
 
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -132,7 +166,7 @@ def estimate_video_vram(frames: int, offload: str) -> int:
     just recompute over the same sequence. The scale factor is measured against
     49 frames, which is what the numbers above describe.
     """
-    base = VIDEO_VRAM_ESTIMATE_MIB.get(offload, VIDEO_VRAM_ESTIMATE_MIB["group"])
+    base = VIDEO_VRAM_ESTIMATE_MIB.get(offload, VIDEO_VRAM_ESTIMATE_MIB[DEFAULT_OFFLOAD])
     scale = 0.55 + 0.45 * (max(frames, 9) / DEFAULT_VIDEO_FRAMES)
     return int(base * min(scale, 1.9))
 
@@ -225,12 +259,43 @@ class JobRecord:
     finished_at: float = 0.0
     outcome: str = "queued"
     output: str = ""
+    sequence: int = 0
+    """Submission order, so the queue can say who is ahead of whom."""
 
     @property
     def seconds(self) -> float:
         if not self.started_at:
             return 0.0
         return (self.finished_at or 0.0) - self.started_at
+
+    @property
+    def waiting(self) -> bool:
+        """Queued but not started: what a caller is actually waiting on."""
+        return self.outcome == "queued"
+
+
+@dataclass
+class QueueEntry:
+    """A job waiting for the card, with the position the user would be told."""
+
+    record: JobRecord
+    event: asyncio.Event
+    job: asyncio.Task[Any] | None = None
+    needed_mib: int = 0
+    kind: str = ""
+    released: str = ""
+    """What the VRAM release step did, or an empty string when it did nothing."""
+
+
+def parse_ollama_mode(value: str | None) -> str:
+    normalized = (value or "").strip().lower()
+    if not normalized:
+        return "off"
+    if normalized in ("on", "auto"):
+        return "auto"
+    if normalized in ("off", "ask"):
+        return normalized
+    raise AgentError("COMPUTE_UNLOAD_OLLAMA must be on, off, or ask.")
 
 
 @dataclass
@@ -247,8 +312,16 @@ class ComputeOrchestrator:
     job_timeout_seconds: int = DEFAULT_JOB_TIMEOUT_SECONDS
     voice_timeout_seconds: int = VOICE_TIMEOUT_SECONDS
     output_dirname: str = "salida"
+    ollama_mode: str = "off"
+    """Whether a heavy job may unload a resident Ollama model to free VRAM."""
+    queue_limit: int = DEFAULT_QUEUE_LIMIT
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    _queue: list[QueueEntry] = field(default_factory=list, repr=False)
+    """Jobs waiting for the card, in submission order."""
+    _sequence: int = 0
     _history: list[JobRecord] = field(default_factory=list, repr=False)
+    _retired: dict[str, QueueEntry] = field(default_factory=dict, repr=False)
+    """Finished jobs kept by id, so a late poll still gets its result."""
     _vram_probe: Any = None
     """``Callable[[], VramReading]``; replaced in tests. ``None`` means nvidia-smi."""
     _own_pids: set[int] = field(default_factory=set, repr=False)
@@ -300,7 +373,7 @@ class ComputeOrchestrator:
         *,
         frames: int = 49,
         steps: int = 40,
-        offload: str = "group",
+        offload: str = DEFAULT_OFFLOAD,
         name: str = "",
         runner: Any = None,
     ) -> JobRecord:
@@ -337,22 +410,22 @@ class ComputeOrchestrator:
         self,
         prompt: str,
         *,
-        seconds: int = 15,
-        model: str = "small",
+        seconds: int = 10,
+        model: str = "music",
         name: str = "",
         runner: Any = None,
     ) -> JobRecord:
-        """Generate music with MusicGen, alone, after checking it fits.
+        """Generate music with AudioLDM2, alone, after checking it fits.
 
-        ``small`` is the only size that coexists with the resident voice
+        ``music`` is the only size that coexists with the resident voice
         engines on an 8 GB card, so it is both the default and the reason the
         larger models are refused with a number rather than attempted.
         """
         text = _require_text(prompt, MUSIC_TOOL_NAME, MAX_PROMPT_CHARS)
         if model not in MUSIC_VRAM_ESTIMATE_MIB:
             raise AgentError(f"model must be one of: {', '.join(sorted(MUSIC_VRAM_ESTIMATE_MIB))}.")
-        if seconds < 1 or seconds > 120:
-            raise AgentError("Music must be between 1 and 120 seconds.")
+        if seconds < 1 or seconds > MAX_MUSIC_SECONDS:
+            raise AgentError(f"Music must be between 1 and {MAX_MUSIC_SECONDS} seconds.")
         output = self._output_path(name, "wav", "musica")
         argv = [
             "--prompt", text,
@@ -413,8 +486,8 @@ class ComputeOrchestrator:
         # to reduce the frame count sends them off to fix the wrong thing.
         if kind.lower().startswith("music"):
             detail += (
-                " Free it before retrying, or use the small model and a shorter duration; the larger "
-                "MusicGen models need more VRAM than this card has free with voice resident."
+                " Free it before retrying, or use the 'music' model and a shorter duration; the other "
+                "sizes need more VRAM than this card has free with voice resident."
             )
         else:
             detail += (
@@ -444,37 +517,266 @@ class ComputeOrchestrator:
         timeout_seconds: int | None = None,
         runner: Any = None,
     ) -> JobRecord:
-        """Run one heavy job alone, checking free VRAM before starting it.
+        """Run one heavy job alone, waiting its turn behind any other.
 
-        The lock is the whole scheduling policy: voice stays responsive during
-        a twenty-minute video because voice never asks for it, and two heavy
-        jobs never overlap because this is the only path that takes it.
+        A job that does not fit right now is queued rather than refused, because
+        the thing usually holding the card is another of these jobs: refusing
+        the second video of a two-video request would be a bug dressed as a
+        policy. Only a job that still will not fit once it reaches the front of
+        the queue is refused, and by then the queue is empty and the reading is
+        the freshest one there is.
         """
-        self.require_headroom(kind, needed_mib)
         script = self.resolve_script(script_name)
-        async with self._lock:
-            record = self._record(JobRecord(kind=kind, detail=" ".join(argv[:1])))
-            loop = asyncio.get_running_loop()
-            record.started_at = loop.time()
-            record.outcome = "running"
-            try:
-                result = await (runner or self._spawn)(
-                    script,
-                    argv,
-                    timeout_seconds if timeout_seconds is not None else self.job_timeout_seconds,
-                )
-            except asyncio.CancelledError:
-                record.outcome = "cancelled"
+        entry = self._register(kind, script_name, argv, needed_mib)
+        try:
+            return await self._run_queued(
+                entry,
+                script_name,
+                argv,
+                script=script,
+                timeout_seconds=timeout_seconds,
+                runner=runner,
+            )
+        finally:
+            self._retire(entry)
+
+    def submit_video(
+        self,
+        prompt: str,
+        *,
+        frames: int = DEFAULT_VIDEO_FRAMES,
+        steps: int = DEFAULT_VIDEO_STEPS,
+        offload: str = DEFAULT_OFFLOAD,
+        name: str = "",
+    ) -> str:
+        """Queue a video render and return its job id without waiting."""
+        text = _require_text(prompt, VIDEO_TOOL_NAME, MAX_PROMPT_CHARS)
+        if offload not in OFFLOAD_MODES:
+            raise AgentError(f"offload must be one of: {', '.join(OFFLOAD_MODES)}.")
+        if frames < 9:
+            raise AgentError("A clip needs at least 9 frames.")
+        output = self._output_path(name, "mp4", "ltx")
+        argv = [
+            "--prompt", text,
+            "--frames", str(frames),
+            "--steps", str(steps),
+            "--offload", offload,
+            "--salida", str(output),
+        ]
+        return self.submit(
+            "Video generation", "video_ltx.py", argv, needed_mib=estimate_video_vram(frames, offload)
+        )
+
+    def submit_music(
+        self,
+        prompt: str,
+        *,
+        seconds: int = 10,
+        model: str = "music",
+        name: str = "",
+    ) -> str:
+        """Queue a music generation and return its job id without waiting."""
+        text = _require_text(prompt, MUSIC_TOOL_NAME, MAX_PROMPT_CHARS)
+        if model not in MUSIC_VRAM_ESTIMATE_MIB:
+            raise AgentError(f"model must be one of: {', '.join(sorted(MUSIC_VRAM_ESTIMATE_MIB))}.")
+        if seconds < 1 or seconds > MAX_MUSIC_SECONDS:
+            raise AgentError(f"Music must be between 1 and {MAX_MUSIC_SECONDS} seconds.")
+        output = self._output_path(name, "wav", "musica")
+        argv = [
+            "--prompt", text,
+            "--segundos", str(seconds),
+            "--modelo", model,
+            "--salida", str(output),
+        ]
+        return self.submit(
+            "Music generation", "musica.py", argv, needed_mib=MUSIC_VRAM_ESTIMATE_MIB[model]
+        )
+
+    async def _run_queued(
+        self,
+        entry: QueueEntry,
+        script_name: str,
+        argv: list[str],
+        *,
+        script: Path | None = None,
+        timeout_seconds: int | None = None,
+        runner: Any = None,
+    ) -> JobRecord:
+        """Wait for the card, then run the job, recording how it went.
+
+        Both entry points go through here so a queued job and a blocking one
+        cannot differ in what they check: the VRAM decision is made at the front
+        of the queue, where the card is actually free, rather than at the moment
+        the request happened to arrive.
+        """
+        script = script or self.resolve_script(script_name)
+        record = entry.record
+        loop = asyncio.get_running_loop()
+        try:
+            async with self._lock:
+                if not self._can_fit(entry.needed_mib):
+                    entry.released = await self._release_vram()
+                if not self._can_fit(entry.needed_mib):
+                    self.require_headroom(entry.kind, entry.needed_mib)
+                record.started_at = loop.time()
+                record.outcome = "running"
+                try:
+                    result = await (runner or self._spawn)(
+                        script,
+                        argv,
+                        timeout_seconds if timeout_seconds is not None else self.job_timeout_seconds,
+                    )
+                except asyncio.CancelledError:
+                    record.outcome = "cancelled"
+                    record.finished_at = loop.time()
+                    raise
+                except AgentError:
+                    record.outcome = "failed"
+                    record.finished_at = loop.time()
+                    raise
                 record.finished_at = loop.time()
-                raise
-            except AgentError:
-                record.outcome = "failed"
-                record.finished_at = loop.time()
-                raise
-            record.finished_at = loop.time()
-            record.outcome = "done"
-            record.output = parse_result_line(result)
-            return record
+                record.outcome = "done"
+                record.output = parse_result_line(result)
+                return record
+        finally:
+            if entry in self._queue:
+                self._queue.remove(entry)
+            entry.event.set()
+
+    def _retire(self, entry: QueueEntry) -> None:
+        """Move a finished job out of the queue, keeping it answerable by id."""
+        if entry in self._queue:
+            self._queue.remove(entry)
+        if entry.record.outcome in {"done", "failed", "cancelled"}:
+            self._retired[f"job-{entry.record.sequence}"] = entry
+            # Bounded, like the history: a poll cannot resurrect every job ever
+            # run, only the recent ones.
+            for stale in list(self._retired)[:-self.queue_limit]:
+                del self._retired[stale]
+
+    def _can_fit(self, needed_mib: int) -> bool:
+        return self.read_vram().available_for_heavy_mib >= needed_mib
+
+    async def _release_vram(self) -> str:
+        """Unload a resident Ollama model, if that is what is in the way.
+
+        Opt-in via ``COMPUTE_UNLOAD_OLLAMA=on``, because it is the user's
+        server and the model reloads on the next request. Off by default for
+        that reason: silently evicting someone's warm model to start a video is
+        not a decision the agent should make on its own.
+        """
+        if self.ollama_mode != "auto":
+            return ""
+        reading = self.read_vram()
+        if reading.used_by_others_mib <= 0:
+            return ""
+        return await unload_ollama(self.root_directory)
+
+    # ------------------------------------------------------- the async queue
+    def submit(
+        self,
+        kind: str,
+        script_name: str,
+        argv: list[str],
+        *,
+        needed_mib: int,
+    ) -> str:
+        """Start a heavy job in the background and return its id straight away.
+
+        The point is that a turn can queue several requests without spending
+        the whole turn waiting: a 20-minute render blocks the loop's caller, so
+        three videos asked for at once would take an hour of turn time and no
+        feedback in between. Here they take a second to accept, and the caller
+        polls ``compute_result``.
+        """
+        entry = self._register(kind, script_name, argv, needed_mib)
+        job_id = f"job-{entry.record.sequence}"
+        loop = asyncio.get_running_loop()
+        entry.job = loop.create_task(self._execute(entry, script_name, argv))
+        return job_id
+
+
+    def _register(self, kind: str, script_name: str, argv: list[str], needed_mib: int) -> QueueEntry:
+        """Enqueue a job without starting it, used by both the blocking and async paths."""
+        if len(self._queue) >= self.queue_limit:
+            raise AgentError(
+                f"{self.queue_limit} heavy jobs are already waiting and one is running. A render is "
+                "minutes of GPU time, so queueing more just builds a backlog nobody is waiting for. "
+                "Wait for compute_status to report fewer waiting jobs, or raise COMPUTE_QUEUE_LIMIT."
+            )
+        self._sequence += 1
+        record = JobRecord(kind=kind, detail=script_name, sequence=self._sequence)
+        entry = QueueEntry(record=record, event=asyncio.Event(), needed_mib=needed_mib, kind=kind)
+        self._queue.append(entry)
+        self._record(record)
+        return entry
+
+    async def _execute(self, entry: QueueEntry, script_name: str, argv: list[str]) -> JobRecord:
+        """The background body of a queued job.
+
+        It takes the same lock as a blocking call, so a queued job and a
+        directly requested one share the single slot on the card rather than
+        each assuming it has the GPU to itself.
+        """
+        try:
+            return await self._run_queued(entry, script_name, argv)
+        except Exception:  # noqa: BLE001 - the outcome is read back, not raised
+            return entry.record
+        finally:
+            self._retire(entry)
+
+    def result_text(self, job_id: str) -> str:
+        """What a queued job has to say right now, or that the id is unknown."""
+        entry = self._job(job_id)
+        record = entry.record
+        if record.waiting:
+            position = self._position(entry)
+            return f"Job {job_id} is waiting: position {position} of {self.queued} in the queue."
+        if record.outcome == "running":
+            return f"Job {job_id} is rendering now, on its own. It takes minutes; call again later."
+        if record.outcome == "done":
+            note = f"\n{entry.released}" if entry.released else ""
+            return f"Job {job_id} finished in {record.seconds:.0f}s.{note}\n{record.output}"
+        return f"Job {job_id} {record.outcome}."
+
+    def _job(self, job_id: str) -> QueueEntry:
+        wanted = (job_id or "").strip()
+        for entry in self._queue:
+            if f"job-{entry.record.sequence}" == wanted:
+                return entry
+        # A finished job leaves the queue, but its id must keep answering: a
+        # caller that polls a moment late should be told the result, not that
+        # the job never existed.
+        retired = self._retired.get(wanted)
+        if retired is not None:
+            return retired
+        raise AgentError(
+            f"No job with id '{wanted}'. Call compute_status for the queue and recent jobs."
+        )
+
+    def _position(self, entry: QueueEntry) -> int:
+        waiting = [item for item in self._queue if item.record.waiting]
+        return waiting.index(entry) + 1 if entry in waiting else len(waiting)
+
+    @property
+    def queued(self) -> int:
+        """How many jobs are waiting for the card, not counting the running one."""
+        return sum(1 for entry in self._queue if entry.record.waiting)
+
+    def queue_text(self) -> str:
+        """The queue as the model and the user read it.
+
+        Positions are included because "you are third" is the difference between
+        waiting and wondering whether a request was received at all.
+        """
+        waiting = [entry for entry in self._queue if entry.record.waiting]
+        if not waiting:
+            return "Queue: empty."
+        lines = [f"Queue: {len(waiting)} waiting, one job at a time."]
+        for position, entry in enumerate(waiting, start=1):
+            note = f" ({entry.released})" if entry.released else ""
+            lines.append(f"  {position}. {entry.kind}{note}")
+        return "\n".join(lines)
 
     async def _spawn(self, script: Path, argv: list[str], timeout_seconds: int) -> str:
         """Start a backend script and collect its output.
@@ -614,6 +916,9 @@ class ComputeOrchestrator:
         else:
             lines.append("Nothing outside this agent is holding VRAM.")
         lines.append(f"Queue: {'busy' if self.busy else 'idle'}; heavy jobs run one at a time.")
+        waiting = self.queue_text()
+        if waiting != "Queue: empty.":
+            lines.append(waiting)
         if self._history:
             lines.append("Recent heavy jobs:")
             for record in self._history[-5:]:
@@ -634,6 +939,95 @@ def _terminate(process: Any) -> None:
         process.kill()
     except (ProcessLookupError, OSError):
         return
+
+
+async def unload_ollama(root_directory: str, seconds: float = 20.0) -> str:
+    """Unload whatever Ollama has resident, so the card is actually free.
+
+    On this machine an Ollama model was sitting on 6390 of 8188 MiB, which is
+    most of the reason a video job gets refused. Ollama keeps a model resident
+    for a keep-alive window after the last request, and that is deliberate -
+    it is a cache, not a leak - so the way to get the memory back is to ask it
+    to unload, not to kill the process. Killing ``ollama serve`` would also
+    take down anything else pointed at it, which for a server the user may be
+    using for their own requests is a much bigger thing to do than evicting a
+    cache entry.
+
+    Returns a line saying what happened, for the caller to fold into its own
+    report. Failure is not an error: the caller is about to re-measure the
+    card anyway, and the answer is in that measurement.
+    """
+    binary = shutil.which("ollama")
+    if binary is None:
+        return "Ollama is not installed; nothing to unload."
+
+    async def ollama(*arguments: str) -> subprocess.CompletedProcess[str]:
+        process = await asyncio.create_subprocess_exec(
+            binary,
+            *arguments,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await process.communicate()
+        return subprocess.CompletedProcess(arguments, process.returncode or 0, stdout.decode("utf-8", "replace"), "")
+
+    # `ollama ps` is the loaded models and their VRAM. It is the right source
+    # because it is Ollama's own view of its cache, not a guess from nvidia-smi
+    # about which of its processes is which.
+    try:
+        listing = await asyncio.wait_for(ollama("ps"), timeout=15)
+    except (TimeoutError, OSError) as error:
+        return f"Could not ask Ollama what it has loaded: {error}"
+
+    if listing.returncode != 0:
+        return "Ollama did not answer, so nothing was unloaded."
+    rows = [line for line in listing.stdout.splitlines()[1:] if line.strip()]
+    if not rows:
+        return "Ollama has no model loaded; the memory is not its."
+
+    unloaded: list[str] = []
+    for row in rows:
+        name = row.split()[0] if row.split() else ""
+        if not name:
+            continue
+        # `ollama stop` expires the keep-alive, which is the supported way to
+        # drop a resident model. The alternative, killing the process, would
+        # take the whole server with it.
+        stopped = await ollama("stop", name)
+        if stopped.returncode == 0:
+            unloaded.append(name)
+        else:
+            return (
+                f"Tried to unload {name} and Ollama refused. Free it yourself with "
+                f"`ollama stop {name}`, then retry."
+            )
+
+    if not unloaded:
+        return "Ollama had a model loaded but none could be named; free it and retry."
+
+    # The stop is asynchronous: the process has to exit and the driver has to
+    # release the memory. Reporting success before that would hand the next
+    # check a reading that has not caught up yet, which is the same stale
+    # measurement the whole feature exists to avoid.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + seconds
+    before = free_vram_mib()
+    while loop.time() < deadline:
+        await asyncio.sleep(0.5)
+        if free_vram_mib() - before > 512:
+            break
+    reclaimed = max(0, free_vram_mib() - before)
+    return (
+        f"Unloaded {', '.join(unloaded)} from Ollama, which had been holding VRAM; "
+        f"{reclaimed} MiB came back. The next request for that model reloads it, "
+        "which takes a few seconds."
+    )
+
+
+def free_vram_mib() -> int:
+    """Free VRAM right now, or 0 when nvidia-smi cannot answer."""
+    return probe_vram(DEFAULT_VRAM_TOTAL_MIB).free_mib
 
 
 def probe_vram(default_total_mib: int, ignore_pids: set[int] | None = None) -> VramReading:
@@ -775,8 +1169,9 @@ def create_compute_tools() -> list[dict[str, Any]]:
                             "type": "string",
                             "enum": list(OFFLOAD_MODES),
                             "description": (
-                                "How layers move between VRAM and RAM. 'group' fits an 8 GB card and is "
-                                "the default; 'sequential' needs the least VRAM and is slowest."
+                                "How layers move between VRAM and RAM. 'sequential' is the default: it "
+                                "is the one that fits while another model holds the card, and it is "
+                                "the slowest. 'group' is faster but needs a nearly empty GPU."
                             ),
                         },
                         "name": {"type": "string", "description": "Optional output file name."},
@@ -790,7 +1185,7 @@ def create_compute_tools() -> list[dict[str, Any]]:
             "function": {
                 "name": MUSIC_TOOL_NAME,
                 "description": (
-                    "Generate music or ambience from a text prompt with MusicGen and save a wav in "
+                    "Generate music or ambience from a text prompt with AudioLDM2 and save a wav in "
                     "salida/. Heavy, like video: it runs alone, the voice engines stay resident, and it "
                     "is refused up front when free VRAM is too low."
                 ),
@@ -803,26 +1198,78 @@ def create_compute_tools() -> list[dict[str, Any]]:
                         },
                         "seconds": {
                             "type": "integer",
-                            "description": "Duration; 10 is quick, 30 default. Longer needs more time, not much more VRAM.",
+                            "description": f"Duration, 1 to {MAX_MUSIC_SECONDS}. 10 is quick. Longer costs VRAM, not just time.",
                         },
                         "name": {"type": "string", "description": "Optional output file name."},
                     },
                     "required": ["prompt"],
                 },
             },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": STATUS_TOOL_NAME,
-                "description": (
-                    "Report free VRAM, what is holding it, the voice reserve, and recent heavy jobs. Call "
-                    "this before a heavy job if a previous one was refused for lack of memory - it names "
-                    "the process to free."
-                ),
-                "parameters": {"type": "object", "properties": {}},
+        },            {
+                "type": "function",
+                "function": {
+                    "name": STATUS_TOOL_NAME,
+                    "description": (
+                        "Report free VRAM, what is holding it, the voice reserve, the heavy job queue with "
+                        "each waiting job's position, and recent jobs. Call this when a heavy job was "
+                        "refused for lack of memory - it names the process to free - and to see how far "
+                        "back a queue is."
+                    ),
+                    "parameters": {"type": "object", "properties": {}},
+                },
             },
-        },
+            {
+                "type": "function",
+                "function": {
+                    "name": QUEUE_TOOL_NAME,
+                    "description": (
+                        "Submit a heavy video or music job without waiting for it and return a job id "
+                        "immediately, so several can be queued in one turn instead of blocking on the "
+                        "first. Jobs run one at a time in the order they were queued. Then call "
+                        "compute_status to see positions, and read each finished result back with "
+                        "compute_result once it reports done."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {
+                                "type": "string",
+                                "enum": ["video", "music"],
+                                "description": "Which heavy job to queue.",
+                            },
+                            "prompt": {"type": "string", "description": "For video: what it shows. For music: what it sounds like."},
+                            "frames": {"type": "integer", "description": "Video only. 17 is quick, 49 default."},
+                            "steps": {"type": "integer", "description": "Video only. More steps is slower, not bigger in VRAM."},
+                            "offload": {
+                                "type": "string",
+                                "enum": list(OFFLOAD_MODES),
+                                "description": "Video only. 'sequential' is the default and fits alongside another model on the card.",
+                            },
+                            "seconds": {"type": "integer", "description": f"Music only. Duration, 1 to {MAX_MUSIC_SECONDS}."},
+                            "name": {"type": "string", "description": "Optional output file name."},
+                        },
+                        "required": ["kind", "prompt"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": RESULT_TOOL_NAME,
+                    "description": (
+                        "Read the result of a job submitted with queue_job: 'done' with the output path, "
+                        "'waiting' with its position in the queue, or 'failed' with the reason. This is "
+                        "how a queued job is collected without having blocked on it."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "job_id": {"type": "string", "description": "The id queue_job returned."}
+                        },
+                        "required": ["job_id"],
+                    },
+                },
+            },
     ]
 
 

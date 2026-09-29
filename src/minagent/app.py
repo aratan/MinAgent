@@ -28,6 +28,8 @@ from .capabilities import (
 )
 from .compute import (
     MUSIC_TOOL_NAME,
+    QUEUE_TOOL_NAME,
+    RESULT_TOOL_NAME,
     SPEAK_TOOL_NAME,
     STATUS_TOOL_NAME,
     TRANSCRIBE_TOOL_NAME,
@@ -345,6 +347,8 @@ FILE_TOOL_LABELS = {
     VIDEO_TOOL_NAME: "Generate video",
     MUSIC_TOOL_NAME: "Generate music",
     STATUS_TOOL_NAME: "Compute status",
+    QUEUE_TOOL_NAME: "Queue job",
+    RESULT_TOOL_NAME: "Compute result",
 }
 
 UI_COLORS = {
@@ -668,6 +672,8 @@ class MinAgent:
                 vram_total_mib=config.compute_vram_total_mib,
                 job_timeout_seconds=config.compute_job_timeout_seconds,
                 voice_timeout_seconds=config.compute_voice_timeout_seconds,
+                ollama_mode=config.compute_unload_ollama,
+                queue_limit=config.compute_queue_limit,
             )
         self.ensure_image_tools()
         self.ensure_download_tools()
@@ -839,6 +845,38 @@ class MinAgent:
     def run_compute_status(self, args: dict[str, Any]) -> str:
         """Report free VRAM, what holds it, and the heavy job queue."""
         return self._require_orchestrator().status_text()
+
+    def run_queue_job(self, args: dict[str, Any]) -> str:
+        """Accept a heavy job and return its id, without waiting for the render."""
+        orchestrator = self._require_orchestrator()
+        kind = str(args.get("kind", "")).strip().lower()
+        prompt = str(args.get("prompt", ""))
+        if kind == "video":
+            job_id = orchestrator.submit_video(
+                prompt,
+                frames=_as_int(args.get("frames"), 49, "frames"),
+                steps=_as_int(args.get("steps"), 40, "steps"),
+                offload=str(args.get("offload", "group") or "group"),
+                name=str(args.get("name", "")),
+            )
+        elif kind == "music":
+            job_id = orchestrator.submit_music(
+                prompt,
+                seconds=_as_int(args.get("seconds"), 15, "seconds"),
+                name=str(args.get("name", "")),
+            )
+        else:
+            raise AgentError("kind must be 'video' or 'music'.")
+        return (
+            f"Queued {job_id} for {kind}. It renders in the background; the queue is "
+            f"{orchestrator.queued} deep behind it. Poll compute_result with this id, and use "
+            "compute_status to see where everything stands."
+        )
+
+    def run_compute_result(self, args: dict[str, Any]) -> str:
+        """Read what a queued job has to say: waiting, running, done, or failed."""
+        orchestrator = self._require_orchestrator()
+        return orchestrator.result_text(str(args.get("job_id", "")))
 
     def relative_to_workspace(self, path: str) -> str:
         """A workspace-relative path, so the model can hand it back to a tool."""
@@ -2133,6 +2171,10 @@ class MinAgent:
             return await self.run_generate_music(args)
         if name == STATUS_TOOL_NAME:
             return self.run_compute_status(args)
+        if name == QUEUE_TOOL_NAME:
+            return self.run_queue_job(args)
+        if name == RESULT_TOOL_NAME:
+            return self.run_compute_result(args)
         if name == VIEW_IMAGE_TOOL_NAME:
             return await self.run_view_image(args)
         if name == DOWNLOAD_TOOL_NAME:

@@ -16,6 +16,9 @@
 
 # Python / uv
 .venv/
+# The generation backends run on their own Python 3.12: Kokoro's misaki
+# needs <3.13 and LTX-Video's tokenizer needs transformers 4.x.
+.venv-compute/
 __pycache__/
 *.py[cod]
 *.egg-info/

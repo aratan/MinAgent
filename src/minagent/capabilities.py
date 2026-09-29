@@ -20,6 +20,8 @@ from typing import Any
 
 from .compute import (
     MUSIC_TOOL_NAME,
+    QUEUE_TOOL_NAME,
+    RESULT_TOOL_NAME,
     SPEAK_TOOL_NAME,
     STATUS_TOOL_NAME,
     TRANSCRIBE_TOOL_NAME,
@@ -363,12 +365,14 @@ def build_builtin_capabilities(
         entries.append(
             Capability(
                 name="compute",
-                summary="Speak, transcribe, and generate video or music on the local GPU",
+                            summary="Speak, transcribe, and generate video or music on the local GPU",
                 tool_names=(
                     SPEAK_TOOL_NAME,
                     TRANSCRIBE_TOOL_NAME,
                     VIDEO_TOOL_NAME,
                     MUSIC_TOOL_NAME,
+                    QUEUE_TOOL_NAME,
+                    RESULT_TOOL_NAME,
                     STATUS_TOOL_NAME,
                 ),
                 guidance=(
@@ -377,11 +381,15 @@ def build_builtin_capabilities(
                     "engines that stay loaded and answer immediately, and they keep working while a video "
                     "or music job runs - do not wait for a render to finish to speak. Video and music are "
                     "serialized: each takes the card alone, runs for minutes, and streams layers into "
-                    "system RAM. A heavy job that will not fit is refused before it starts, naming the "
-                    "process holding the memory; when that happens call compute_status, then either free "
-                    "it or shrink the request - fewer frames for video, --offload sequential, or a shorter "
-                    "duration for music. Do not retry the same oversized job: an unchanged retry fails the "
-                    "same way, and each attempt costs minutes. Frames drive video memory and steps do "
+                    "system RAM. A render is minutes, so when the user asks for several, queue_job them "
+                    "all in one turn and collect each with compute_result instead of calling "
+                    "generate_video repeatedly and blocking on the first; call compute_status for "
+                    "positions. A job that will not fit is queued rather than refused, and is only "
+                    "refused at the front of the queue, so do not treat a wait as a failure. When it is "
+                    "refused the error names the process holding the memory: call compute_status, then "
+                    "either free it or shrink the request - fewer frames for video, offload sequential, or "
+                    "a shorter duration for music. Do not retry the same oversized job: an unchanged "
+                    "retry fails the same way and costs minutes. Frames drive video memory and steps do "
                     "not, so lower frames to save VRAM and steps only to save time. Video output must be "
                     "8k+1 frames (9, 17, 25, 49, 97); anything else is adjusted for you. Generation saves "
                     "into salida/ and returns a path, not the media itself."

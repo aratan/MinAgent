@@ -51,6 +51,8 @@ if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from minagent.compute import (  # noqa: E402
+    QUEUE_TOOL_NAME,
+    RESULT_TOOL_NAME,
     ComputeOrchestrator,
     create_compute_tools,
     format_heavy_result,
@@ -112,10 +114,35 @@ class ComputeServer:
         if name == "generate_music":
             record = await orchestrator.generate_music(
                 str(arguments.get("prompt", "")),
-                seconds=int(arguments.get("seconds", 15) or 15),
+                seconds=int(arguments.get("seconds", 10) or 10),
                 name=str(arguments.get("name", "")),
             )
             return format_heavy_result(record, record.output)
+        if name == QUEUE_TOOL_NAME:
+            kind = str(arguments.get("kind", "")).strip().lower()
+            prompt = str(arguments.get("prompt", ""))
+            if kind == "video":
+                job_id = orchestrator.submit_video(
+                    prompt,
+                    frames=int(arguments.get("frames", 49) or 49),
+                    steps=int(arguments.get("steps", 40) or 40),
+                    offload=str(arguments.get("offload", "sequential") or "sequential"),
+                    name=str(arguments.get("name", "")),
+                )
+            elif kind == "music":
+                job_id = orchestrator.submit_music(
+                    prompt,
+                    seconds=int(arguments.get("seconds", 10) or 10),
+                    name=str(arguments.get("name", "")),
+                )
+            else:
+                raise ValueError("kind must be 'video' or 'music'.")
+            return (
+                f"Queued {job_id} for {kind}. It renders in the background; the queue is "
+                f"{orchestrator.queued} deep behind it. Poll compute_result with this id."
+            )
+        if name == RESULT_TOOL_NAME:
+            return orchestrator.result_text(str(arguments.get("job_id", "")))
         raise ValueError(f"Unknown tool: {name}")
 
 

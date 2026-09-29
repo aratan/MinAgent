@@ -87,6 +87,20 @@ OFFLOAD_BLOCKS = {
     "model": 0,
 }
 
+# Lo que el equipo tiene mientras este agente corre, medido y no supuesto.
+#
+# La tarjeta no está libre: el servidor de Ollama tiene resident el modelo que
+# está respondiendo esta conversación, y se lleva 5.5 GB de los 8. Contra eso
+# solo quedan ~2.5 GB, y un render de vídeo esminutes. Con
+# `enable_group_offload` el render pide algo más de lo que queda y revienta; con
+# `enable_sequential_cpu_offload` baja un submódulo entero a RAM cada vez, y el
+# pico medido en 17 fotogramas fue de 696 MiB - con sitio de sobra.
+#
+# Por eso el defecto es `sequential` y no `group`, aunque `group` sea más rápido
+# en una tarjeta con la VRAM libre. Es la diferencia entre un trabajo que sale y
+# uno que no, y el modo por defecto tiene que ser el que sale.
+DEFAULT_OFFLOAD = "sequential"
+
 
 def estimate_vram_mib(frames: int, offload: str) -> int:
     """A rough VRAM figure for a job, used to refuse it before it starts.
@@ -112,7 +126,12 @@ def fail(message: str, code: int = 1) -> int:
 
 
 def _output_path(requested: str, stem: str, suffix: str) -> Path:
-    """Resolve an output path inside salida/, which is the only place video lands."""
+    """Resolve an output path inside salida/, which is the only place video lands.
+
+    A name that already starts with `salida/` is not prefixed again: the
+    orchestrator resolves the absolute path before calling here, and doing it
+    twice produced `salida/salida/clip.mp4`.
+    """
     name = (requested or "").strip()
     if not name:
         name = f"{stem}-{int(time.time())}.{suffix}"
@@ -120,9 +139,53 @@ def _output_path(requested: str, stem: str, suffix: str) -> Path:
         name = f"{name}.{suffix}"
     path = Path(name)
     if not path.is_absolute():
-        path = DEFAULT_OUTPUT_DIR / path
+        if path.parts and path.parts[0] == DEFAULT_OUTPUT_DIR.name:
+            path = REPO_ROOT / path
+        else:
+            path = DEFAULT_OUTPUT_DIR / path
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _check_transformers_compatibility() -> None:
+    """Fail early, with the fix, if the tokenizer cannot be read.
+
+    transformers 5 routes the SentencePiece tokenizer of LTX-Video through the
+    fast converter, which cannot parse the binary protobuf form; it then falls
+    back to a TikToken extractor rather than to sentencepiece, and the error
+    surfaces as a protobuf parse failure 80 seconds into loading the weights.
+    Checking first turns that into a one-line instruction.
+    """
+    try:
+        import transformers
+    except ImportError:
+        return
+    major = int(str(getattr(transformers, "__version__", "0")).split(".")[0] or 0)
+    if major < 5:
+        return
+    return fail(
+        "LTX-Video necesita transformers 4.x: en la 5.x el tokenizer SentencePiece se intenta leer "
+        "con el conversor rápido y falla con 'Error parsing line'. Instala:\n"
+        "    uv pip install 'transformers<5' protobuf sentencepiece"
+    )
+
+
+def save_video(frames: list, output: Path, fps: int) -> None:
+    """Write the frames to an mp4.
+
+    imageio does it rather than `diffusers.utils.export_to_video`, which is not
+    importable from the top-level `diffusers` namespace on the versions this
+    pins, and rather than imageio's ffmpeg plugin defaults, which refuse a
+    frame size that is not a multiple of 16 - and LTX renders at sizes that
+    are, so the default is exactly what breaks.
+    """
+    import imageio
+    import numpy as np
+
+    array = [np.asarray(frame) for frame in frames]
+    imageio.mimsave(
+        str(output), array, fps=fps, quality=8, macro_block_size=1, ffmpeg_log_level="error"
+    )
 
 
 def apply_offload(pipeline: object, offload: str) -> None:
@@ -144,6 +207,9 @@ def apply_offload(pipeline: object, offload: str) -> None:
             use_stream=True,
         )
     elif offload == "sequential":
+        # El submódulo entero (codificador, transformer, VAE) va y viene de la
+        # tarjeta por turnos. Es más lento que `group` porque cambia de sitio
+        # un bloque grande cada vez, y es el único que cabe aquí.
         pipeline.enable_sequential_cpu_offload()  # type: ignore[attr-defined]
     elif offload == "model":
         pipeline.enable_model_cpu_offload()  # type: ignore[attr-defined]
@@ -163,11 +229,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--semilla", type=int, default=42, help="Semilla para reproducir el resultado.")
     parser.add_argument(
         "--offload",
-        default="group",
+        default=DEFAULT_OFFLOAD,
         choices=sorted(VRAM_ESTIMATE_MIB),
         help=(
-            "'group' cabe en 8 GB y es el más rápido; 'sequential' es el que menos VRAM pide; "
-            "'model' deja submodelos enteros en la GPU y normalmente no cabe en esta tarjeta."
+            "'sequential' es el defecto: baja un submódulo a RAM cada vez y es el único que cabe "
+            "con el modelo de Ollama resident en la tarjeta (pico medido: 696 MiB). 'group' es más "
+            "rápido pero necesita más VRAM de la que queda libre aquí. 'model' no cabe en 8 GB."
         ),
     )
     parser.add_argument("--salida", default="", help="Ruta del mp4 de salida.")
@@ -192,12 +259,18 @@ def main(argv: list[str] | None = None) -> int:
     try:
         import torch
         from diffusers import LTXPipeline
-        from diffusers.utils import export_to_video
     except ImportError as error:
         return fail(
             f"Falta {error.name}. Instala el extra de vídeo con: "
             "uv pip install torch diffusers transformers accelerate imageio imageio-ffmpeg"
         )
+
+    # El tokenizer de LTX-Video es un SentencePiece en formato protobuf binario.
+    # transformers 5 intenta leerlo con el conversor rápido de `tokenizers`, que
+    # falla con "Error parsing line b'\\x0e'", y cae a un extractor equivocado
+    # en lugar de a sentencepiece. Se comprueba aquí para que el fallo sea una
+    # instrucción, no un volcado de una traza a mitad de la carga de pesos.
+    _check_transformers_compatibility()
 
     if not torch.cuda.is_available():
         return fail("No hay CUDA disponible. LTX-Video en CPU es impracticable.")
@@ -211,14 +284,18 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as error:  # noqa: BLE001
         return fail(f"No se pudieron cargar los pesos de {MODEL_ID}: {error}")
 
-    # VAE en fp32 no aporta nada visible en un clip corto y se come ~400 MiB.
-    # Es una de las palancas que hacen que 49 fotogramas quepan en 8 GB.
-    if hasattr(pipeline, "vae"):
-        pipeline.vae.to(dtype=torch.float32)  # type: ignore[attr-defined]
-    pipeline.to("cuda")  # type: ignore[attr-defined]
+    # No se llama a `pipeline.to("cuda")` antes del offload, y esto no es una
+    # omisión: los tres modos de offload gestionan la residencia de las capas y
+    # necesitan que el modelo esté en CPU para bajarlo. Con `to("cuda")` delante
+    # el pipeline entero (unos 7 GB) queda en la tarjeta y el offload no tiene
+    # de dónde bajar nada: es un OOM antes de empezar a renderizar.
+    #
+    # Tampoco se sube el VAE a fp32. Ayuda un poco de calidad en clips largos,
+    # pero se come VRAM, que aquí es el recurso escaso.
     apply_offload(pipeline, arguments.offload)
-    pipeline.enable_vae_tiling()  # type: ignore[attr-defined]
-    pipeline.enable_vae_slicing()  # type: ignore[attr-defined]
+    # En diffusers 0.39 el VAE de LTX no tiene tiling/slicing; la palanca que
+    # sí existe para el pico de memoria de la atención es esta.
+    pipeline.enable_attention_slicing()
 
     generator = torch.Generator(device="cpu").manual_seed(arguments.semilla)
     try:
@@ -238,7 +315,7 @@ def main(argv: list[str] | None = None) -> int:
             "--offload sequential. Los pasos no afectan a la memoria."
         )
 
-    export_to_video(frames, str(output), fps=arguments.fps)
+    save_video(frames, output, arguments.fps)
     elapsed = time.time() - started
 
     # La portada en PNG es lo que el usuario mira primero, y la guarda el

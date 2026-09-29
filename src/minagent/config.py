@@ -14,7 +14,13 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
 
 from .capabilities import DEFAULT_CAPABILITY_IDLE_TURNS
-from .compute import DEFAULT_JOB_TIMEOUT_SECONDS, DEFAULT_VRAM_TOTAL_MIB, VOICE_TIMEOUT_SECONDS
+from .compute import (
+    DEFAULT_JOB_TIMEOUT_SECONDS,
+    DEFAULT_QUEUE_LIMIT,
+    DEFAULT_VRAM_TOTAL_MIB,
+    VOICE_TIMEOUT_SECONDS,
+    parse_ollama_mode,
+)
 from .context_budget import ContextPolicy
 from .errors import AgentError, find_application_root
 
@@ -150,6 +156,17 @@ def parse_ratio_setting(value: str | None, name: str, fallback: float) -> float:
     return ratio
 
 
+def parse_ollama_unload_mode(value: str | None) -> str:
+    """Parse ``COMPUTE_UNLOAD_OLLAMA``, which decides who may evict a model.
+
+    The default is ``off`` because unloading is not free for the user: the
+    model reloads on the next request. It is a cache Ollama keeps on purpose, so
+    dropping it to start a video is a trade the person at the keyboard should
+    agree to, not one the agent should make silently.
+    """
+    return parse_ollama_mode(value)
+
+
 def parse_boolean_setting(value: str | None, name: str, fallback: bool) -> bool:
     """Parse an ``on``/``off`` boolean setting."""
     cleaned = _cleaned(value)
@@ -272,6 +289,8 @@ class Config:
     compute_vram_total_mib: int
     compute_job_timeout_seconds: int
     compute_voice_timeout_seconds: int
+    compute_unload_ollama: str
+    compute_queue_limit: int
 
 
 def load_configuration(
@@ -414,5 +433,13 @@ def load_configuration(
             environment.get("COMPUTE_VOICE_TIMEOUT_SECONDS"),
             "COMPUTE_VOICE_TIMEOUT_SECONDS",
             VOICE_TIMEOUT_SECONDS,
+        ),
+        compute_unload_ollama=parse_ollama_unload_mode(
+            environment.get("COMPUTE_UNLOAD_OLLAMA")
+        ),
+        compute_queue_limit=parse_positive_integer(
+            environment.get("COMPUTE_QUEUE_LIMIT"),
+            "COMPUTE_QUEUE_LIMIT",
+            DEFAULT_QUEUE_LIMIT,
         ),
     )
