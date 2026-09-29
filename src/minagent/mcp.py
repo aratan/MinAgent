@@ -890,25 +890,25 @@ def create_mcp_authoring_tools() -> list[dict[str, Any]]:
     ]
 
 
-def format_mcp_context(server_guidance: Sequence[dict[str, str]]) -> str:
-    """Render bounded per-server instructions for the system prompt."""
-    if not server_guidance:
+def format_mcp_server_context(server_name: str, instructions: str) -> str:
+    """Render one server's instructions, sanitised and bounded.
+
+    Server instructions are untrusted text that ends up in the system prompt, so
+    they are stripped of control characters and cut to the shared guidance
+    budget. Each server is rendered on its own because a server's guidance now
+    travels with that server's capability, not in one blob for all of them.
+    """
+    safe_name = _CONTROL_CHARS.sub(" ", str(server_name))[:128]
+    heading = f"### {json_stringify(safe_name)}\n"
+    remaining = MAX_MCP_GUIDANCE_CHARS - len(heading)
+    if remaining <= 0:
         return ""
-    context = "MCP server guidance:"
-    for entry in server_guidance:
-        safe_name = _CONTROL_CHARS.sub(" ", str(entry["server_name"]))[:128]
-        heading = f"\n\n### {json_stringify(safe_name)}\n"
-        remaining = MAX_MCP_GUIDANCE_CHARS - len(context) - len(heading)
-        if remaining <= 0:
-            break
-        safe_instructions = _UNSAFE_CHARS.sub(" ", str(entry["instructions"]))
-        if len(safe_instructions) > remaining:
-            marker = "\n[truncated]"
-            content_limit = max(0, remaining - len(marker))
-            context += heading + safe_instructions[:content_limit] + (marker if remaining > len(marker) else "")
-            break
-        context += heading + safe_instructions
-    return context
+    safe_instructions = _UNSAFE_CHARS.sub(" ", str(instructions))
+    if len(safe_instructions) > remaining:
+        marker = "\n[truncated]"
+        content_limit = max(0, remaining - len(marker))
+        return heading + safe_instructions[:content_limit] + (marker if remaining > len(marker) else "")
+    return heading + safe_instructions
 
 
 async def execute_mcp_tool(

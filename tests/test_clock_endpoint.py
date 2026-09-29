@@ -43,6 +43,26 @@ def _stream(*events: dict[str, Any]) -> bytes:
     return f"{frames}data: [DONE]\n\n".encode()
 
 
+def _tool_call(call_id: str, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    """One streamed tool call, the way an endpoint would send it."""
+    return {
+        "choices": [
+            {
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": name, "arguments": json.dumps(arguments)},
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+
+
 class _ClockEndpoint(ThreadingHTTPServer):
     """A throwaway OpenAI-compatible endpoint that asks for ``date``, then answers with it."""
 
@@ -76,27 +96,16 @@ class _ClockEndpointHandler(BaseHTTPRequestHandler):
             ),
             None,
         )
-        if tool_result is None:
+        # The shell is not sent with every request, so the model asks for the
+        # capability that carries it, then runs the command, then answers.
+        if len(endpoint.requests) == 1:
             payload = _stream(
-                {
-                    "choices": [
-                        {
-                            "delta": {
-                                "tool_calls": [
-                                    {
-                                        "index": 0,
-                                        "id": "call_clock",
-                                        "type": "function",
-                                        "function": {
-                                            "name": "run_terminal",
-                                            "arguments": json.dumps({"command": "date"}),
-                                        },
-                                    }
-                                ]
-                            }
-                        }
-                    ]
-                },
+                _tool_call("call_load", "load_capability", {"capabilities": ["terminal"]}),
+                {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+            )
+        elif len(endpoint.requests) == 2:
+            payload = _stream(
+                _tool_call("call_clock", "run_terminal", {"command": "date"}),
                 {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
             )
         else:
@@ -142,14 +151,17 @@ async def test_a_clock_question_runs_date_against_a_streaming_endpoint(tmp_path,
         server.shutdown()
         server.server_close()
 
-    assert len(server.requests) == 2, "expected one tool round and then the final answer"
-    sent_tools = [tool["function"]["name"] for tool in server.requests[0]["tools"]]
-    assert "run_terminal" in sent_tools
+    assert len(server.requests) == 3, "expected a load, a tool round, and then the final answer"
+    first_tools = [tool["function"]["name"] for tool in server.requests[0]["tools"]]
+    assert "load_capability" in first_tools
+    assert "run_terminal" not in first_tools, "the shell must not ride along with every request"
+    second_tools = [tool["function"]["name"] for tool in server.requests[1]["tools"]]
+    assert "run_terminal" in second_tools, "loading the capability must publish its tools"
 
-    tool_messages = [message["content"] for message in server.requests[1]["messages"] if message.get("role") == "tool"]
-    assert len(tool_messages) == 1
-    assert str(datetime.now().year) in tool_messages[0]
-    stamp = re.search(r"\d{2}:\d{2}:\d{2}", tool_messages[0])
+    tool_messages = [message["content"] for message in server.requests[2]["messages"] if message.get("role") == "tool"]
+    assert len(tool_messages) == 2, "the load result and the date both come back"
+    assert str(datetime.now().year) in tool_messages[1]
+    stamp = re.search(r"\d{2}:\d{2}:\d{2}", tool_messages[1])
     assert stamp, tool_messages[0]
-    assert answer == f"La hora del sistema es {tool_messages[0].strip().splitlines()[-1]}"
+    assert answer == f"La hora del sistema es {tool_messages[1].strip().splitlines()[-1]}"
     assert stamp.group(0) in answer

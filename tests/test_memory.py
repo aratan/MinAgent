@@ -171,6 +171,8 @@ async def test_lookup_only_answers_strong_confident_memories(tmp_path):
 async def test_memory_tools_are_exposed_and_callable(tmp_path):
     app = _memory_app(tmp_path)
     assert await app.initialize_optional_features() == []
+    assert not {"recall", "remember"} & {tool["function"]["name"] for tool in app.tools}
+    app.load_capabilities(["memory"])
     names = {tool["function"]["name"] for tool in app.tools}
     assert {"recall", "remember", "record_outcome"} <= names
 
@@ -185,6 +187,7 @@ async def test_memory_tools_are_exposed_and_callable(tmp_path):
 async def test_hints_are_injected_into_the_system_prompt(tmp_path):
     app = _memory_app(tmp_path)
     await app.initialize_optional_features()
+    app.load_capabilities(["memory"])
     await app.execute_tool("remember", {"title": "Deploy checklist", "content": "run make deploy"})
 
     await app.refresh_memory_hints("what is the deploy checklist")

@@ -17,6 +17,7 @@ import pytest
 
 from minagent.app import (
     _ANNOUNCED_ACTION,
+    _CLAIMED_WRITE,
     _MISSING_CAPABILITY_REQUEST,
     UI_COLORS,
     MinAgent,
@@ -788,9 +789,15 @@ def test_stable_prompt_sections_come_before_the_volatile_ones():
     nombres = [section["name"] for section in app._current_system_prompt_sections]
     base = [section["name"] for section in app._base_system_prompt_sections]
     assert nombres[: len(base)] == base, "the stable sections are not first"
-    assert nombres.index("Current time") == len(base), "the clock should open the volatile block"
+    # The capability index and the guidance of what is loaded change when a skill
+    # appears or a capability is loaded, so they belong with the stable prefix but
+    # before the clock, which changes on every single request.
+    guidance = [nombre for nombre in nombres if nombre.startswith("Capability: ")]
+    assert nombres[len(base) : len(base) + 1 + len(guidance)] == ["Capability index", *guidance]
+    assert nombres.index("Current time") == len(base) + 1 + len(guidance)
     for nombre in ("AGENTS.md", "Conversation summary", "Workspace inventory", "Memory hints"):
         assert nombre in nombres
+        assert nombres.index(nombre) > nombres.index("Current time")
 
 
 async def test_the_request_cache_replays_an_identical_request_without_calling_the_endpoint(tmp_path, monkeypatch):
@@ -1896,6 +1903,10 @@ async def test_skill_tools_are_available_before_any_skill_exists(tmp_path):
     app = _skill_app(tmp_path)
     assert "write_skill" not in [tool["function"]["name"] for tool in app.tools]
     await app.initialize_optional_features()
+    # The skill tools are registered, and reach the model as soon as the skills
+    # capability is loaded, without waiting for a skill to exist.
+    assert {"load_skill", "write_skill"} <= set(app._tool_schemas)
+    app.load_capabilities(["skills"])
     names = [tool["function"]["name"] for tool in app.tools]
     assert names.count("write_skill") == 1 and "load_skill" in names
     assert "write_skill" in app.skill_prompt_context
@@ -1904,6 +1915,7 @@ async def test_skill_tools_are_available_before_any_skill_exists(tmp_path):
 async def test_write_skill_registers_the_skill_without_a_restart(tmp_path):
     app = _skill_app(tmp_path)
     await app.initialize_optional_features()
+    app.load_capabilities(["skills"])
     saved = await app.execute_tool(
         "write_skill",
         {
@@ -1917,6 +1929,7 @@ async def test_write_skill_registers_the_skill_without_a_restart(tmp_path):
     assert "release-notes" in app.skill_prompt_context
     loaded = await app.execute_tool("load_skill", {"name": "release-notes"})
     assert "Collect the commits" in loaded["tool_text"]
+    app.load_capabilities(["skills"])
     assert [tool["function"]["name"] for tool in app.tools].count("write_skill") == 1
 
 
@@ -1936,6 +1949,9 @@ async def test_the_system_prompt_catalogue_follows_a_new_skill(tmp_path):
     app = _skill_app(tmp_path)
     await app.initialize_optional_features()
     app._base_system_prompt_sections = app.build_base_system_prompt()
+    # The catalogue rides with the skills capability, so it is only in the prompt
+    # once that capability is loaded.
+    app.load_capabilities(["skills"])
     assert "changelog" not in app.messages[0]["content"]
     manual = tmp_path / "skills" / "changelog"
     manual.mkdir(parents=True)
@@ -1951,6 +1967,7 @@ async def test_the_system_prompt_catalogue_follows_a_new_skill(tmp_path):
 async def test_write_skill_refuses_to_replace_an_existing_skill(tmp_path):
     app = _skill_app(tmp_path)
     await app.initialize_optional_features()
+    app.load_capabilities(["skills"])
     args = {"name": "demo", "description": "Demo skill", "instructions": "Do the demo."}
     await app.execute_tool("write_skill", args)
     with pytest.raises(AgentError, match="already exists"):
@@ -1960,6 +1977,7 @@ async def test_write_skill_refuses_to_replace_an_existing_skill(tmp_path):
 
 async def test_a_turn_creates_the_requested_folder_and_file(tmp_path, monkeypatch):
     app = _skill_app(tmp_path)
+    app.load_capabilities(["files.write"])
     responses = [
         {
             "payload": {"usage": {}},
@@ -1998,11 +2016,17 @@ async def test_a_turn_creates_the_requested_folder_and_file(tmp_path, monkeypatc
 
 def test_the_prompt_gives_the_clock_and_says_which_tool_checks_the_system(tmp_path):
     app = _skill_app(tmp_path)
-    app.tools.append(build_terminal_tool())
+    app.register_tool_schemas([build_terminal_tool()])
     app._base_system_prompt_sections = app.build_base_system_prompt()
     app.refresh_system_prompt()
     sections = {section["name"]: section["content"] for section in app._current_system_prompt_sections}
-    assert "run_terminal" in sections["Core"] and "run_terminal" in sections["Terminal"]
+    assert "run_terminal" in sections["Core"]
+    assert "Capability: terminal" not in sections
+    # The shell instructions travel with the shell, so they are absent until the
+    # capability that brings run_terminal is loaded.
+    app.load_capabilities(["terminal"])
+    sections = {section["name"]: section["content"] for section in app._current_system_prompt_sections}
+    assert "run_terminal" in sections["Capability: terminal"]
     stamp = re.search(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", sections["Current time"])
     assert stamp, sections["Current time"]
     assert abs((datetime.fromisoformat(stamp.group(0)) - datetime.now()).total_seconds()) < 60
@@ -2051,9 +2075,10 @@ def test_no_startup_warning_when_the_fixed_prompt_is_small(tmp_path):
 
 
 def _refusal_app(tmp_path, monkeypatch):
-    """An app with the terminal tool registered, ready to answer a clock question."""
+    """An app with the terminal capability loaded, ready to answer a clock question."""
     app = _skill_app(tmp_path)
-    app.tools.append(build_terminal_tool())
+    app.register_tool_schemas([build_terminal_tool()])
+    app.load_capabilities(["terminal"])
     commands: list[str] = []
 
     async def fake_terminal(args, **kwargs):
@@ -2149,10 +2174,221 @@ async def test_a_second_refusal_is_returned_instead_of_looping(tmp_path, monkeyp
         "Primero comprobaré la cuenta. A continuación listaré los mensajes.",
         "I'll read your inbox now.",
         "Let me fetch the messages.",
+        # A create request is narrated with a mutating verb, not a reading one.
+        # These were the replies the guard could not see.
+        "I'll create the file now.",
+        "Let me write this in pure HTML/CSS/JavaScript.",
+        "Let me build the snake game.",
+        "I will save the report to docs/out.md.",
     ],
 )
 def test_announced_plans_are_detected(text):
     assert _ANNOUNCED_ACTION.search(text), text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Los tests pasan y el informe explica cómo se escribe el juego.",
+        "He creado el juego en salida/snake.html.",
+        "The build passes and the tests are green.",
+        "The file was created successfully.",
+    ],
+)
+def test_a_finished_answer_is_not_mistaken_for_an_announced_plan(text):
+    """Naming a verb in past or hypothetical form is not announcing the next step."""
+    assert not _ANNOUNCED_ACTION.search(text), text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "El archivo ./salida/snake.html ha sido creado correctamente.",
+        "He creado el juego en salida/snake.html.",
+        "He guardado el informe.",
+        "The file has been created successfully.",
+        "I have written the report to docs/out.md.",
+        "File created.",
+    ],
+)
+def test_claims_of_a_completed_write_are_detected(text):
+    assert _CLAIMED_WRITE.search(text), text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "No he creado ningún archivo todavía.",
+        "Voy a crear el juego ahora.",
+        "I have not written it yet.",
+        "The tests are green and the build passes.",
+    ],
+)
+def test_a_honest_answer_is_not_mistaken_for_a_false_write_claim(text):
+    """The guard must not fire on a denial or on an honest report."""
+    assert not _CLAIMED_WRITE.search(text), text
+
+
+async def test_a_write_claimed_without_a_tool_call_is_retried(tmp_path, monkeypatch):
+    """The failure that matters: a file reported as created that does not exist.
+
+    A small model mis-called a capability name, spent the turn on corrections,
+    and then reported the write as done. The other two guards are keyed on a
+    turn that called no tool, so they never see this one.
+    """
+    app = _skill_app(tmp_path)
+    await app.initialize_optional_features()
+    app.load_capabilities(["files.write"])
+    app.messages.append({"role": "user", "content": "créame el juego de snake en html ./salida/snake.html"})
+    _queued_responses(
+        app,
+        monkeypatch,
+        [
+            {
+                "payload": {"usage": {}},
+                "message": {
+                    "content": "El archivo ./salida/snake.html ha sido creado correctamente.",
+                    "tool_calls": [],
+                },
+            },
+            {
+                "payload": {"usage": {}},
+                "message": {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": json.dumps({"path": "salida/snake.html", "content": "<html></html>"}),
+                            },
+                        }
+                    ],
+                },
+            },
+            {"payload": {"usage": {}}, "message": {"content": "Listo, ahora sí existe.", "tool_calls": []}},
+        ],
+    )
+    assert await app.request_assistant_turn(None) == "Listo, ahora sí existe."
+    assert (tmp_path / "salida" / "snake.html").read_text() == "<html></html>"
+    notes = [
+        message
+        for message in app.messages
+        if message["role"] == "user" and "system-note" in str(message["content"])
+    ]
+    assert len(notes) == 1
+    assert "write_file(path, content)" in str(notes[0]["content"])
+
+
+async def test_a_write_claim_is_accepted_once_the_tool_actually_ran(tmp_path, monkeypatch):
+    """No second correction: after a real write the same words are the truth."""
+    app = _skill_app(tmp_path)
+    await app.initialize_optional_features()
+    app.load_capabilities(["files.write"])
+    app.messages.append({"role": "user", "content": "crea salida/snake.html"})
+    _queued_responses(
+        app,
+        monkeypatch,
+        [
+            {
+                "payload": {"usage": {}},
+                "message": {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": json.dumps({"path": "salida/snake.html", "content": "<html></html>"}),
+                            },
+                        }
+                    ],
+                },
+            },
+            {
+                "payload": {"usage": {}},
+                "message": {"content": "El archivo ha sido creado correctamente.", "tool_calls": []},
+            },
+        ],
+    )
+    assert await app.request_assistant_turn(None) == "El archivo ha sido creado correctamente."
+    notes = [
+        message
+        for message in app.messages
+        if message["role"] == "user" and "system-note" in str(message["content"])
+    ]
+    assert notes == []
+
+
+async def test_an_announced_write_after_a_read_is_retried(tmp_path, monkeypatch):
+    """The real trace: the model spent a call on list_directory, then narrated.
+
+    Gating on "no tool call at all" let this through, because the turn was not
+    empty. What matters is whether the promised write happened, and it had not.
+    """
+    app = _skill_app(tmp_path)
+    await app.initialize_optional_features()
+    app.load_capabilities(["files.read", "files.write"])
+    app.messages.append({"role": "user", "content": "crea el juego de snake en ./salida/snake.html"})
+    _queued_responses(
+        app,
+        monkeypatch,
+        [
+            {
+                "payload": {"usage": {}},
+                "message": {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "function": {"name": "list_directory", "arguments": json.dumps({"path": "./salida"})},
+                        }
+                    ],
+                },
+            },
+            {
+                "payload": {"usage": {}},
+                "message": {"content": "Now I'll create the Snake game as a single HTML file.", "tool_calls": []},
+            },
+            {
+                "payload": {"usage": {}},
+                "message": {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "c2",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": json.dumps({"path": "salida/snake.html", "content": "<html></html>"}),
+                            },
+                        }
+                    ],
+                },
+            },
+            {"payload": {"usage": {}}, "message": {"content": "Creado.", "tool_calls": []}},
+        ],
+    )
+    assert await app.request_assistant_turn(None) == "Creado."
+    assert (tmp_path / "salida" / "snake.html").read_text() == "<html></html>"
+
+
+async def test_a_repeated_false_write_claim_is_returned_rather_than_looping(tmp_path, monkeypatch):
+    """One correction, then the user gets the answer and can judge it."""
+    app = _skill_app(tmp_path)
+    await app.initialize_optional_features()
+    app.load_capabilities(["files.write"])
+    app.messages.append({"role": "user", "content": "crea salida/snake.html"})
+    claim = "El archivo ha sido creado correctamente."
+    _queued_responses(
+        app,
+        monkeypatch,
+        [
+            {"payload": {"usage": {}}, "message": {"content": claim, "tool_calls": []}},
+            {"payload": {"usage": {}}, "message": {"content": claim, "tool_calls": []}},
+        ],
+    )
+    assert await app.request_assistant_turn(None) == claim
+    assert not (tmp_path / "salida" / "snake.html").exists()
 
 
 async def test_an_announced_plan_without_a_tool_call_is_retried(tmp_path, monkeypatch):
@@ -2337,6 +2573,8 @@ async def test_mcp_tools_follow_a_configuration_change(tmp_path, monkeypatch):
 
     await app.initialize_optional_features()
     names = lambda: [tool["function"]["name"] for tool in app.tools]
+    assert "mcp_0_0_echo" not in names(), "a server's tools wait for their capability"
+    app.load_capabilities(["mcp.one"])
     assert "mcp_0_0_echo" in names()
     assert await app.refresh_mcp_servers() == []  # Unchanged file: no reconnect.
     assert len(connects) == 1
@@ -2344,6 +2582,8 @@ async def test_mcp_tools_follow_a_configuration_change(tmp_path, monkeypatch):
     state["tool"] = "two"
     config_file.write_text('{"mcpServers": {"two": {"url": "http://127.0.0.1:1/mcp"}}}')
     assert await app.refresh_mcp_servers() == ["add"]
+    assert "mcp_0_0_echo" not in names(), "a removed server stops being callable"
+    app.load_capabilities(["mcp.two"])
     assert "mcp_0_0_sum" in names() and "mcp_0_0_echo" not in names()
     assert len(connects) == 2
 
@@ -2351,6 +2591,11 @@ async def test_mcp_tools_follow_a_configuration_change(tmp_path, monkeypatch):
 async def test_authoring_an_mcp_server_needs_approval_and_registers_its_tools(tmp_path, monkeypatch):
     app = _mcp_app(tmp_path)
     await app.initialize_optional_features()
+    # The authoring tool is part of the mcp.manage capability, which is offered
+    # by the index rather than sent with every request.
+    assert "write_mcp_server" not in [tool["function"]["name"] for tool in app.tools]
+    assert "mcp.manage" in app._unloaded_tool_hint()
+    app.load_capabilities(["mcp.manage"])
     assert "write_mcp_server" in [tool["function"]["name"] for tool in app.tools]
 
     class _AnsweringEditor:
@@ -2403,6 +2648,17 @@ async def test_each_request_sends_the_current_tool_list(tmp_path, monkeypatch):
     with pytest.raises(_TurnStopped):
         await app.request_assistant_turn(None)
     assert captured["available_tools"] is app.tools
+    assert "write_skill" not in [tool["function"]["name"] for tool in captured["available_tools"]]
+    app.load_capabilities(["skills"])
+    captured.clear()
+
+    async def stop_again(messages, options=None):
+        captured.update(options or {})
+        raise _TurnStopped
+
+    monkeypatch.setattr(app, "call_chat_completions", stop_again)
+    with pytest.raises(_TurnStopped):
+        await app.request_assistant_turn(None)
     assert "write_skill" in [tool["function"]["name"] for tool in captured["available_tools"]]
 
 
@@ -2606,3 +2862,107 @@ async def test_a_new_conversation_starts_empty_with_no_state_from_the_last_one(t
     assert usage["used"] == pytest.approx(usage["fixed"])
     assert "The conversation is empty" in app._stdout.text
     assert "Fixed" in app._stdout.text
+
+
+# ------------------------------------------------------------- MCP approval
+
+def _mcp_call_app(tmp_path, mode: str) -> MinAgent:
+    """An app with one MCP tool registered, in the given approval mode."""
+    app = _mcp_app(tmp_path)
+    app.mcp_approval_mode = mode
+    app.mcp_connections = {
+        "tool_lookup": {"mcp_0_0_echo": {"server_name": "eco", "remote_tool_name": "echo"}}
+    }
+    return app
+
+
+def test_mcp_approval_defaults_to_asking(tmp_path):
+    assert _configuration(tmp_path).mcp_approval_mode == "ask"
+    assert _configuration(tmp_path, MCP_APPROVAL_MODE="").mcp_approval_mode == "ask"
+
+
+def test_mcp_approval_mode_accepts_auto_ask_and_off(tmp_path):
+    for mode in ("auto", "ask", "off"):
+        assert _configuration(tmp_path, MCP_APPROVAL_MODE=mode).mcp_approval_mode == mode
+
+
+def test_mcp_approval_mode_rejects_anything_else(tmp_path):
+    with pytest.raises(AgentError, match="MCP_APPROVAL_MODE must be lowercase"):
+        _configuration(tmp_path, MCP_APPROVAL_MODE="AUTO")
+
+
+async def test_an_mcp_call_is_confirmed_in_ask_mode(tmp_path, monkeypatch):
+    class _Editor:
+        def __init__(self) -> None:
+            self.asked = 0
+
+        async def question(self, prompt: str) -> str:
+            self.asked += 1
+            return "n"
+
+    executed: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_execute(name, args, lookup, images):
+        executed.append((name, args))
+        return "ejecutado"
+
+    app = _mcp_call_app(tmp_path, "ask")
+    editor = _Editor()
+    app.editor = editor
+    monkeypatch.setattr("minagent.app.execute_mcp_tool", fake_execute)
+
+    result = await app._dispatch_tool("mcp_0_0_echo", {"texto": "hola"})
+    assert "denied" in result
+    assert executed == []
+    assert editor.asked == 1
+    assert "MCP permission requested" in app._stdout.text
+
+
+async def test_auto_mode_runs_the_call_without_asking_but_still_traces_it(tmp_path, monkeypatch):
+    executed: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_execute(name, args, lookup, images):
+        executed.append((name, args))
+        return "ejecutado"
+
+    class _EditorThatMustNotBeUsed:
+        async def question(self, prompt: str) -> str:
+            raise AssertionError("auto mode must not ask")
+
+    app = _mcp_call_app(tmp_path, "auto")
+    app.editor = _EditorThatMustNotBeUsed()
+    monkeypatch.setattr("minagent.app.execute_mcp_tool", fake_execute)
+
+    result = await app._dispatch_tool("mcp_0_0_echo", {"texto": "hola"})
+    assert result == "ejecutado"
+    assert executed == [("mcp_0_0_echo", {"texto": "hola"})]
+    # The call ran unconfirmed, so it has to stay visible on screen.
+    assert "MCP call auto-approved" in app._stdout.text
+    assert "eco/echo" in app._stdout.text
+    assert "hola" in app._stdout.text
+
+
+async def test_off_mode_refuses_every_mcp_call_without_asking(tmp_path, monkeypatch):
+    async def fake_execute(name, args, lookup, images):
+        raise AssertionError("off mode must not run the call")
+
+    class _EditorThatMustNotBeUsed:
+        async def question(self, prompt: str) -> str:
+            raise AssertionError("off mode must not ask")
+
+    app = _mcp_call_app(tmp_path, "off")
+    app.editor = _EditorThatMustNotBeUsed()
+    monkeypatch.setattr("minagent.app.execute_mcp_tool", fake_execute)
+
+    with pytest.raises(AgentError, match="disabled by MCP_APPROVAL_MODE"):
+        await app._dispatch_tool("mcp_0_0_echo", {"texto": "hola"})
+
+
+async def test_the_prompt_warns_the_model_only_in_auto_mode(tmp_path):
+    def guidance(mode: str) -> str:
+        app = _mcp_call_app(tmp_path, mode)
+        return " ".join(section["content"] for section in app.build_base_system_prompt())
+
+    assert "without asking the user first" in guidance("auto")
+    assert "without asking the user first" not in guidance("ask")
+    assert "without asking the user first" not in guidance("off")

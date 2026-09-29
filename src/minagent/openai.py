@@ -42,6 +42,8 @@ RETRYABLE_NETWORK_ERRORS = (
 
 # A busy server is worth retrying; a client error is not.
 RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+REJECTED_STATUSES = {400, 404, 405, 415, 422}
+"""Statuses a strict endpoint uses to reject a request body it does not know."""
 DEFAULT_RETRY_DELAY_SECONDS = 0.25
 MAX_RETRY_AFTER_SECONDS = 30.0
 MAX_REQUEST_ATTEMPTS = 3
@@ -141,14 +143,17 @@ def _consume_frame(
     if not isinstance(delta, dict):
         return
 
-    reasoning_summary = delta.get("reasoning_summary")
-    reasoning_content = delta.get("reasoning_content")
-    if isinstance(reasoning_summary, str) and reasoning_summary:
-        reasoning_delta = reasoning_summary
-    elif isinstance(reasoning_content, str):
-        reasoning_delta = reasoning_content
-    else:
-        reasoning_delta = ""
+    # Three spellings for the same channel: llama.cpp sends reasoning_content,
+    # some gateways send reasoning_summary, and Ollama's OpenAI-compatible
+    # surface sends reasoning. Missing one of them is not cosmetic: a thinking
+    # model that answers only in this channel would look like it returned
+    # nothing at all.
+    reasoning_delta = ""
+    for field in ("reasoning_summary", "reasoning_content", "reasoning"):
+        value = delta.get(field)
+        if isinstance(value, str) and value:
+            reasoning_delta = value
+            break
     if reasoning_delta:
         # Keep the reasoning even when nothing renders it: a reasoning model can
         # finish a turn with only this channel filled, and dropping it would look
@@ -450,6 +455,9 @@ class OpenAiClient:
             "messages": list(request_messages),
             "stream": True,
         }
+        # Token usage is opt-in while streaming, and without it the context
+        # meter can never be checked against what the endpoint really read.
+        request_body["stream_options"] = {"include_usage": True}
         if options.get("with_tools"):
             request_body["tools"] = options.get("available_tools", self.tools)
             request_body["tool_choice"] = options.get("tool_choice", "auto")
@@ -489,6 +497,17 @@ class OpenAiClient:
                     await _wait_for_retry_delay(
                         signal, retry_after if retry_after is not None else DEFAULT_RETRY_DELAY_SECONDS * (attempt + 1)
                     )
+                    continue
+                if response.status_code in REJECTED_STATUSES and "stream_options" in request_body:
+                    # A strict endpoint may refuse the field rather than ignore
+                    # it. Drop it and ask again: the usage frame is worth
+                    # asking for, but not worth failing the turn over.
+                    await stream.__aexit__(None, None, None)
+                    stream = None
+                    response = None
+                    del request_body["stream_options"]
+                    if last_attempt:
+                        break
                     continue
                 break
 

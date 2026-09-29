@@ -1,8 +1,11 @@
 """Turning a typed message into a model request.
 
-Selected ``@`` files become inline excerpts and any image path written directly
-in the message is attached as image input with the path removed from the text,
-so the model receives the pixels rather than a filename.
+Selected ``@`` files become inline excerpts. An image is a thousand tokens and
+more, so attaching one costs a quarter of an 8k window whether or not the model
+ends up needing the pixels. In the default on-demand mode an image path is only
+*noticed*: the message names the image and the model has to ask for it with
+``view_image`` before the pixels exist. ``eager`` mode keeps the old behaviour
+of attaching them straight away.
 """
 
 from __future__ import annotations
@@ -19,6 +22,14 @@ from .workspace import MAX_READ_BYTES, MAX_READ_OUTPUT_BYTES
 
 MAX_ATTACHED_IMAGES = 4
 MAX_ATTACHED_FILES = 8
+
+# The message that tells the model an image is there but not yet loaded. The
+# paths stay in the text too, because that string is the handle the model has to
+# pass to view_image.
+DEFERRED_NOTICE = (
+    "Image(s) available but not loaded, to keep the context small: {paths}. "
+    "Call view_image(path) to actually see one, and only when the answer needs the pixels."
+)
 
 IMAGE_PATH_PATTERN = re.compile(
     r'"([^"\r\n]+?\.(?:png|jpe?g|gif|webp))"'
@@ -78,9 +89,16 @@ async def prepare_user_message(
     selected_file_references: Sequence[str],
     workspace_access: Any,
     input_modalities: Sequence[str],
+    on_demand_images: bool = True,
 ) -> dict[str, Any]:
-    """Build the user message for one turn plus the events worth showing."""
+    """Build the user message for one turn plus the events worth showing.
+
+    Returns the message, the events for the UI, and ``deferred_images``: the
+    images that were noticed but deliberately not attached, which is what the
+    ``view_image`` tool later turns into actual pixels.
+    """
     images: list[dict[str, Any]] = []
+    deferred: list[dict[str, Any]] = []
     text_attachments: list[str] = []
     events: list[dict[str, Any]] = []
     remover = _ReferenceRemover()
@@ -105,12 +123,20 @@ async def prepare_user_message(
             if mime_type:
                 if not image_enabled:
                     raise AgentError("The configured model does not accept images.")
-                if len(images) >= MAX_ATTACHED_IMAGES:
+                if len(images) + len(deferred) >= MAX_ATTACHED_IMAGES:
                     raise AgentError(f"The {MAX_ATTACHED_IMAGES}-image limit was reached.")
+                position = text_input.find(relative_path)
+                if on_demand_images:
+                    # The path stays in the text: it is what the model passes to
+                    # view_image, and stripping it would leave no handle at all.
+                    deferred.append({"path": relative_path, "mime_type": mime_type})
+                    seen_paths.add(path_key)
+                    attached_file_count += 1
+                    events.append({"kind": "deferred", "path": relative_path})
+                    continue
                 images.append(
                     {"path": relative_path, "mime_type": mime_type, "data": base64.b64encode(data).decode("ascii")}
                 )
-                position = text_input.find(relative_path)
                 while position >= 0:
                     remover.remove(position, position + len(relative_path))
                     position = text_input.find(relative_path, position + len(relative_path))
@@ -132,7 +158,7 @@ async def prepare_user_message(
             events.append({"kind": "error", "path": relative_path, "message": str(error)})
 
     for match in IMAGE_PATH_PATTERN.finditer(text_input):
-        if len(images) >= MAX_ATTACHED_IMAGES:
+        if len(images) + len(deferred) >= MAX_ATTACHED_IMAGES:
             break
         entered_path = match.group(1) or match.group(2) or match.group(3)
         try:
@@ -146,23 +172,30 @@ async def prepare_user_message(
             mime_type = detect_image_mime_type(data)
             if not mime_type:
                 raise AgentError("Unsupported format; use PNG, JPEG, GIF, or WebP.")
-            images.append(
-                {"path": entered_path, "mime_type": mime_type, "data": base64.b64encode(data).decode("ascii")}
-            )
             seen_paths.add(path_key)
-            remover.remove(match.start(), match.end())
-            events.append({"kind": "attached", "path": entered_path})
+            if on_demand_images:
+                deferred.append({"path": entered_path, "mime_type": mime_type})
+                events.append({"kind": "deferred", "path": entered_path})
+            else:
+                images.append(
+                    {"path": entered_path, "mime_type": mime_type, "data": base64.b64encode(data).decode("ascii")}
+                )
+                remover.remove(match.start(), match.end())
+                events.append({"kind": "attached", "path": entered_path})
         except Exception as error:
             events.append({"kind": "error", "path": entered_path, "message": str(error)})
 
     text = remover.apply(text_input)
+    if deferred:
+        listed = ", ".join(entry["path"] for entry in deferred)
+        text = f"{text.rstrip()}\n\n{DEFERRED_NOTICE.format(paths=listed)}".lstrip()
     prompt = "\n\n".join([text.strip(), *text_attachments]) or "Analyze the attached image."
     message: dict[str, Any]
     if not images and not text_attachments:
-        message = {"role": "user", "content": text_input}
+        message = {"role": "user", "content": text}
     else:
         message = {
             "role": "user",
             "content": [{"type": "text", "text": prompt}, *[image_content_part(image) for image in images]],
         }
-    return {"message": message, "events": events}
+    return {"message": message, "events": events, "deferred_images": deferred}

@@ -16,17 +16,17 @@ def build_tools() -> list[dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read a workspace file or a specifically user-provided file path outside it; never list outside directories.",
+                "description": "Read a workspace file, or a specifically user-provided path outside it.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {"type": "string"},
-                        "offset": {"type": "integer", "minimum": 1, "description": "First line to return, starting at 1"},
-                        "limit": {"type": "integer", "minimum": 1, "description": "Maximum number of lines to return"},
+                        "offset": {"type": "integer", "minimum": 1, "description": "First line to return, from 1"},
+                        "limit": {"type": "integer", "minimum": 1, "description": "Maximum lines to return"},
                         "column": {
                             "type": "integer",
                             "minimum": 1,
-                            "description": "Character position within the first returned line, starting at 1; use the continuation value for long lines",
+                            "description": "Character to start at within the first line; use the continuation value of a long line",
                         },
                     },
                     "required": ["path"],
@@ -145,10 +145,8 @@ def build_tool_output_recall_tool() -> dict[str, Any]:
         "function": {
             "name": "recall_tool_output",
             "description": (
-                "Read back a tool result that was too large to keep in the conversation. A truncated "
-                "result ends with a note naming its id; pass that id here, with an offset and limit, "
-                "to read any character range of the original output. Reread before assuming what a "
-                "truncated result said."
+                "Read back a tool result that was too large to keep. A truncated result ends with a note "
+                "naming its id; pass that id to read any part of the original. Never guess what it omitted."
             ),
             "parameters": {
                 "type": "object",
@@ -157,13 +155,13 @@ def build_tool_output_recall_tool() -> dict[str, Any]:
                     "offset": {
                         "type": "integer",
                         "minimum": 0,
-                        "description": "First character to return, starting at 0",
+                        "description": "First character to return, from 0",
                     },
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": 40000,
-                        "description": "Maximum number of characters to return; defaults to 8000",
+                        "description": "Characters to return; defaults to 8000",
                     },
                 },
                 "required": ["id"],

@@ -145,6 +145,10 @@ def _web_app(tmp_path) -> MinAgent:
 async def test_app_dispatches_web_search(tmp_path):
     app = _web_app(tmp_path)
     names = {tool["function"]["name"] for tool in app.tools}
+    assert not {"web_search", "web_fetch"} & names, "the web tools wait to be loaded"
+    assert "load_capability('web')" in app._unloaded_tool_hint()
+    app.load_capabilities(["web"])
+    names = {tool["function"]["name"] for tool in app.tools}
     assert {"web_search", "web_fetch"} <= names
     result = await app.execute_tool("web_search", {"query": "how do I do this"})
     assert "R" in result and "untrusted" in result

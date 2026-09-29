@@ -31,6 +31,19 @@ dist/
 # Dependencies of the local MCP servers in .agents/mcp/
 node_modules/
 
+# Scratch left in the workspace root by tooling, not part of the project.
+# `None` is a saved page from a fetch that was handed a null URL.
+/None
+/config.json
+/mcp_server.md
+.atl/
+
+# Screen captures written by the captura-pantalla skill, not part of the project.
+/capturas/
+
+# Snapshots, console logs and screenshots the Playwright MCP server writes.
+/.playwright-mcp/
+
 *.log
 .DS_Store
 Thumbs.db
