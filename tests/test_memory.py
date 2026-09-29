@@ -8,11 +8,14 @@ from minagent.app import MinAgent
 from minagent.config import load_configuration
 from minagent.errors import AgentError
 from minagent.memory import (
+    AUTO_CAPTURE_SOURCE,
     MemoryStore,
     format_memory_hints,
     format_recall,
+    format_remember_result,
     match_ratio,
     query_tokens,
+    says_the_same_thing,
 )
 from minagent.workspace import WorkspaceAccess
 
@@ -254,3 +257,94 @@ async def test_recall_without_memory_enabled_raises(tmp_path):
     app.memory_enabled = False
     with pytest.raises(AgentError, match="not enabled"):
         await app.recall_memory({"query": "anything"})
+
+
+# ----------------------------------------------------------------- deduplicar
+
+
+async def test_the_same_thing_stored_twice_becomes_one_memory(tmp_path):
+    store = await _store(tmp_path)
+    first = await store.remember(
+        "procedure",
+        "Instalar y ejecutar el proyecto",
+        "Las dependencias se instalan con uv pip install y los tests se lanzan con "
+        "uv run pytest -q desde la raíz del repositorio.",
+    )
+    # A different title, the same knowledge: the title is not the identity.
+    again = await store.remember(
+        "procedure",
+        "Cómo correr la suite",
+        "Usar uv: instalar dependencias con uv pip install y correr la suite con "
+        "uv run pytest -q en la raíz.",
+    )
+
+    assert again["status"] == "duplicate"
+    assert again["id"] == first["id"]
+    assert len(await store.recent()) == 1
+
+
+async def test_a_merge_keeps_the_newest_wording_and_counts_as_a_reinforcement(tmp_path):
+    store = await _store(tmp_path)
+    first = await store.remember("fact", "transformers 4.49.0", "La versión que funciona es la 4.49.0")
+    before = (await store.recent())[0]["confidence"]
+
+    await store.remember("fact", "Versión de transformers", "transformers 4.49.0 es la que funciona")
+
+    entry = (await store.recent())[0]
+    assert entry["id"] == first["id"]
+    assert entry["title"] == "Versión de transformers"
+    assert entry["success_count"] == 1
+    assert entry["confidence"] > before
+
+
+async def test_a_near_neighbour_on_the_same_subject_stays_its_own_memory(tmp_path):
+    store = await _store(tmp_path)
+    await store.remember(
+        "fact", "Voz de Kokoro", "La voz por defecto no puede ser ef_heart porque no existe; en español solo hay ef_dora."
+    )
+    # Same domain, same kind, nothing in common: merging these would lose one.
+    await store.remember("fact", "Ocupación de la GPU", "llama-server ocupa 5.5 GB de los 8188 MiB de la tarjeta.")
+
+    assert len(await store.recent()) == 2
+
+
+async def test_the_log_of_turns_is_never_merged(tmp_path):
+    store = await _store(tmp_path)
+    content = "Request: correr los tests\nTools used: run_terminal\nSteps: run_terminal(command=uv run pytest -q)"
+    # Real turns are titled by the request, so the same work asked twice lands
+    # as two entries with different titles and the same steps.
+    await store.remember("experience", "correr los tests", content, None, AUTO_CAPTURE_SOURCE)
+    await store.remember("experience", "vuelve a correr los tests", content, None, AUTO_CAPTURE_SOURCE)
+
+    assert len(await store.recent()) == 2
+
+
+def test_a_restatement_in_another_language_is_not_merged():
+    # The limit of a lexical check, pinned so it is a known behaviour: the same
+    # fact in two languages shares no words to compare, and a store that merged
+    # on a guess would lose the memory instead of duplicating it.
+    assert not says_the_same_thing(
+        "Compute Environment Execution Pattern|Run computation scripts using .venv-compute/bin/python. "
+        "Install dependencies within this specific compute venv.",
+        "Configurar el render de vídeo|Para ejecutar el renderizado usar .venv-compute/bin/python e "
+        "instalar las dependencias en el venv de cómputo.",
+    )
+
+
+def test_a_technical_identifier_counts_once_not_as_its_parts():
+    # Split into four tokens it shares almost nothing with the other memory,
+    # and two memories about the same interpreter stop looking alike.
+    assert says_the_same_thing(
+        "Render|Los backends corren con .venv-compute/bin/python, no con el venv del agente.",
+        "Intérprete de cómputo|El render se ejecuta con .venv-compute/bin/python porque el venv del "
+        "agente no tiene la pila de generación.",
+    )
+
+
+def test_the_remember_tool_says_when_it_merged_instead_of_saving():
+    said = format_remember_result(
+        {"status": "duplicate", "id": 7, "kind": "procedure", "title": "T", "confidence": 0.6, "success_count": 2}
+    )
+    # Telling the model is the point: it should learn the store already had it.
+    assert "already said this" in said
+    assert "merged into that one" in said

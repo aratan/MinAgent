@@ -55,9 +55,35 @@ REVIEWED_SOURCE = "kept by the memory review"
 # A review is a second opinion on something that already succeeded once, so it
 # moves confidence less than recording the same memory again would.
 REVIEW_REINFORCE_STEP = 0.1
+# Two memories that say the same thing are one memory said twice. The share has
+# to be high, because merging two genuinely different lessons loses one of them
+# and there is no way to get it back. Calibrated against paraphrases of the same
+# memory and against near neighbours on the same subject: the paraphrases score
+# 0.55 to 1.0 on overlap, the neighbours 0.0, so the two populations do not meet.
+DUPLICATE_OVERLAP = 0.55
+# A paraphrase can use mostly different words, so overlap alone misses some. The
+# symmetric measure catches those, at a lower bar because it already insists that
+# neither side has much the other lacks.
+DUPLICATE_SIMILARITY = 0.35
+# Below this many shared distinctive tokens the overlap is vocabulary rather than
+# meaning. Two is low on purpose and is the most a technical subject shares by
+# accident: a version number and a library name.
+MIN_SHARED_TOKENS = 2
+# The log of what was done is never merged. Two turns can run the same tools
+# and still be two separate things that happened.
+DEDUPED_KINDS = ("procedure", "solution", "fact", "preference")
 
 _QUERY_TOKEN = re.compile(r"[0-9A-Za-z_]{2,}")
 _WORD = re.compile(r"[^a-z0-9]+")
+# Unicode-aware, unlike ``_QUERY_TOKEN``: the store holds Spanish, and an ASCII
+# pattern turns "video" into "deo", which quietly breaks any comparison that
+# depends on whole words. It also keeps technical identifiers whole, so
+# ".venv-compute/bin/python" is one token instead of four - splitting it left two
+# memories about the same interpreter sharing almost nothing.
+_DEDUP_TOKEN = re.compile(
+    r"[^\W_]*[0-9][^\W_./+-]*[./+-][^\W]*|[.~/][\w./-]{3,}|[\w-]{4,}",
+    re.UNICODE,
+)
 
 _BASE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS memories (
@@ -151,6 +177,55 @@ def match_ratio(tokens: Sequence[str], memory: dict[str, Any]) -> float:
     ).casefold()
     hits = sum(1 for token in tokens if token in haystack)
     return hits / len(tokens)
+
+
+def content_tokens(text: str) -> set[str]:
+    """Whole words worth comparing two memories by."""
+    return {match.group(0).casefold() for match in _DEDUP_TOKEN.finditer(text or "")}
+
+
+def similarity(left: str, right: str) -> float:
+    """How much two texts say the same thing, symmetrically, from 0 to 1.
+
+    Jaccard rather than containment: containment would call a short memory a
+    duplicate of any long one that happens to contain its words, and the short
+    memory is usually the precise new one. This only calls it a duplicate when
+    neither side has much the other lacks.
+    """
+    first, second = content_tokens(left), content_tokens(right)
+    if not first or not second:
+        return 0.0
+    return len(first & second) / len(first | second)
+
+
+def overlap(left: str, right: str) -> float:
+    """How much of the smaller text the larger one already says, from 0 to 1.
+
+    This is the measure that survives a paraphrase, where the same fact comes
+    back with a different sentence around it: the two texts share the subject's
+    words without sharing their length.
+    """
+    first, second = content_tokens(left), content_tokens(right)
+    if not first or not second:
+        return 0.0
+    return len(first & second) / min(len(first), len(second))
+
+
+def says_the_same_thing(left: str, right: str) -> bool:
+    """Whether two memories are one memory said twice.
+
+    The shared-token floor is checked first because it is what actually
+    separates the two populations: a paraphrase shares the subject's distinctive
+    words, a near neighbour on the same subject shares none. The two ratios then
+    only have to agree once that has been established.
+    """
+    first, second = content_tokens(left), content_tokens(right)
+    if len(first & second) < MIN_SHARED_TOKENS:
+        return False
+    return (
+        overlap(left, right) >= DUPLICATE_OVERLAP
+        or similarity(left, right) >= DUPLICATE_SIMILARITY
+    )
 
 
 def _clean_text(value: Any, limit: int, field: str) -> str:
@@ -407,6 +482,42 @@ class MemoryStore:
                     "confidence": confidence,
                     "success_count": existing["success_count"] + 1,
                 }
+            duplicate = self._find_duplicate_sync(connection, kind, title, content, tags)
+            if duplicate is not None:
+                # The title is not the identity, the content is. The same lesson
+                # learned twice arrives worded differently - the model invents
+                # its own title each time - and storing it twice fills the hint
+                # block with one answer in two voices and makes both look
+                # weaker. The newer wording is kept because it is the one
+                # written with everything known so far.
+                confidence = min(1.0, duplicate["confidence"] + REINFORCE_CONFIDENCE_STEP)
+                connection.execute(
+                    "UPDATE memories SET title = ?, content = ?, tags = ?, source = ?, "
+                    "success_count = success_count + 1, uses = uses + 1, confidence = ?, "
+                    "updated_at = ?, last_used_at = ? WHERE id = ?",
+                    (
+                        title,
+                        content,
+                        tags,
+                        source,
+                        confidence,
+                        now,
+                        now,
+                        duplicate["id"],
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO outcomes (memory_id, outcome, note, created_at) VALUES (?, ?, ?, ?)",
+                    (duplicate["id"], "success", "merged a memory that said the same thing", now),
+                )
+                return {
+                    "status": "duplicate",
+                    "id": duplicate["id"],
+                    "kind": duplicate["kind"],
+                    "title": title,
+                    "confidence": confidence,
+                    "success_count": duplicate["success_count"] + 1,
+                }
             cursor = connection.execute(
                 "INSERT INTO memories "
                 "(kind, title, title_key, content, tags, source, confidence, created_at, updated_at) "
@@ -422,6 +533,37 @@ class MemoryStore:
                 "confidence": DEFAULT_CONFIDENCE,
                 "success_count": 0,
             }
+
+    def _find_duplicate_sync(
+        self, connection: sqlite3.Connection, kind: str, title: str, content: str, tags: str
+    ) -> dict[str, Any] | None:
+        """The memory this one repeats, if any.
+
+        Only the knowledge kinds are compared: the log of what was done is
+        deliberately allowed to hold many similar entries, because two turns
+        can look alike and still be two things that happened.
+        """
+        if kind not in DEDUPED_KINDS:
+            return None
+        text = f"{title}\n{content}\n{tags}"
+        if len(content_tokens(text)) < MIN_SHARED_TOKENS:
+            return None
+        placeholders = ",".join("?" for _ in DEDUPED_KINDS)
+        rows = connection.execute(
+            f"SELECT * FROM memories WHERE kind IN ({placeholders})",
+            DEDUPED_KINDS,
+        ).fetchall()
+        best: dict[str, Any] | None = None
+        best_score = 0.0
+        for row in rows:
+            candidate = dict(row)
+            other = f"{candidate['title']}\n{candidate['content']}\n{candidate['tags']}"
+            if not says_the_same_thing(text, other):
+                continue
+            score = overlap(text, other)
+            if score >= best_score:
+                best, best_score = candidate, score
+        return best
 
     def _prune(self, connection: sqlite3.Connection) -> None:
         """Drop the weakest memories once the cap is exceeded."""
@@ -742,6 +884,14 @@ def create_memory_tools() -> list[dict[str, Any]]:
 
 def format_remember_result(result: dict[str, Any]) -> str:
     """Render the confirmation for ``remember``."""
+    if result.get("status") == "duplicate":
+        # Saying so is the point: the model should learn that the store already
+        # had this, rather than believing it taught the agent something new.
+        return (
+            f"Memory #{result['id']} [{result['kind']}] already said this, so it was merged into that one "
+            f"instead of stored twice ({result['success_count']} successes, confidence "
+            f"{result['confidence']:.2f}). Recall it rather than saving it again."
+        )
     if result.get("status") == "reinforced":
         return (
             f"Reinforced memory #{result['id']} [{result['kind']}] \"{result['title']}\" "
