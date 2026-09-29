@@ -43,6 +43,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 # Debe fijarse antes de que torch inicialice CUDA: si torch ya se ha importado,
 # CUDA ha reservado su pool con la configuración por defecto y esto llega tarde.
@@ -147,27 +148,45 @@ def _output_path(requested: str, stem: str, suffix: str) -> Path:
     return path
 
 
-def _check_transformers_compatibility() -> None:
-    """Fail early, with the fix, if the tokenizer cannot be read.
+def _check_transformers_compatibility() -> str:
+    """Return why this transformers cannot read the tokenizer, or an empty string.
 
-    transformers 5 routes the SentencePiece tokenizer of LTX-Video through the
-    fast converter, which cannot parse the binary protobuf form; it then falls
-    back to a TikToken extractor rather than to sentencepiece, and the error
-    surfaces as a protobuf parse failure 80 seconds into loading the weights.
-    Checking first turns that into a one-line instruction.
+    Two incompatible versions, both found by running this rather than by
+    reading the changelog:
+
+    * 5.x routes the SentencePiece tokenizer through the fast converter, which
+      cannot parse the binary protobuf form, and then falls back to a TikToken
+      extractor instead of to sentencepiece.
+    * 4.55+ removed `GPT2Model._update_model_kwargs_for_generation`, which the
+      sibling AudioLDM2 backend calls.
+
+    4.49 is the version that works for both. The check runs before the weights
+    are loaded, because otherwise the failure is a protobuf traceback 80
+    seconds into a load rather than one line of instruction.
     """
     try:
         import transformers
     except ImportError:
-        return
-    major = int(str(getattr(transformers, "__version__", "0")).split(".")[0] or 0)
-    if major < 5:
-        return
-    return fail(
-        "LTX-Video necesita transformers 4.x: en la 5.x el tokenizer SentencePiece se intenta leer "
-        "con el conversor rápido y falla con 'Error parsing line'. Instala:\n"
-        "    uv pip install 'transformers<5' protobuf sentencepiece"
-    )
+        return ""
+    version = str(getattr(transformers, "__version__", "0"))
+    try:
+        major, minor = (int(part) for part in version.split(".")[:2])
+    except ValueError:
+        return ""
+
+    if major >= 5:
+        return (
+            f"LTX-Video necesita transformers 4.x y hay {version} instalada: en la 5.x el tokenizer "
+            "SentencePiece se intenta leer con el conversor rápido y falla con 'Error parsing line'.\n"
+            f"    {sys.executable} -m pip install 'transformers==4.49.0' protobuf sentencepiece"
+        )
+    if (major, minor) >= (4, 55):
+        return (
+            f"LTX-Video necesita transformers <4.55 y hay {version}: a partir de la 4.55 se quitó un "
+            "método que necesita el backend de música.\n"
+            f"    {sys.executable} -m pip install 'transformers==4.49.0'"
+        )
+    return ""
 
 
 def save_video(frames: list, output: Path, fps: int) -> None:
@@ -182,7 +201,7 @@ def save_video(frames: list, output: Path, fps: int) -> None:
     import imageio
     import numpy as np
 
-    array = [np.asarray(frame) for frame in frames]
+    array: list[Any] = [np.asarray(frame) for frame in frames]
     imageio.mimsave(
         str(output), array, fps=fps, quality=8, macro_block_size=1, ffmpeg_log_level="error"
     )
@@ -265,12 +284,11 @@ def main(argv: list[str] | None = None) -> int:
             "uv pip install torch diffusers transformers accelerate imageio imageio-ffmpeg"
         )
 
-    # El tokenizer de LTX-Video es un SentencePiece en formato protobuf binario.
-    # transformers 5 intenta leerlo con el conversor rápido de `tokenizers`, que
-    # falla con "Error parsing line b'\\x0e'", y cae a un extractor equivocado
-    # en lugar de a sentencepiece. Se comprueba aquí para que el fallo sea una
-    # instrucción, no un volcado de una traza a mitad de la carga de pesos.
-    _check_transformers_compatibility()
+    # Before loading anything: the version failure otherwise surfaces 80 seconds
+    # later, once the tokenizer has already pulled half a gigabyte of weights.
+    incompatible = _check_transformers_compatibility()
+    if incompatible:
+        return fail(incompatible)
 
     if not torch.cuda.is_available():
         return fail("No hay CUDA disponible. LTX-Video en CPU es impracticable.")
@@ -320,7 +338,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # La portada en PNG es lo que el usuario mira primero, y la guarda el
     # mismo render: no hay que volver a generar para tener una miniatura.
-    poster = output.with_suffix(".png")
+    poster: Path | None = output.with_suffix(".png")
     try:
         frames[0].save(poster)
     except Exception:  # noqa: BLE001 - el png es una comodidad, no el resultado

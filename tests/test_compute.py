@@ -10,6 +10,7 @@ cases - a refused job, two jobs racing, an offload choice - testable at all.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import time
@@ -48,6 +49,12 @@ def _orchestrator(tmp_path: Path, **overrides: Any) -> ComputeOrchestrator:
 
     The backends are stubbed into the temporary project so the real script
     resolution runs: a test that skipped that path would not notice a rename.
+
+    The VRAM reading is fixed here, and that is load-bearing rather than
+    incidental. A test that measures the real card passes or fails depending on
+    whether Ollama happens to have a model resident, which is not something a
+    test about job ordering should care about. One test did, and failed for a
+    reason that had nothing to do with what it was checking.
     """
     scripts = tmp_path / "scripts" / "compute"
     scripts.mkdir(parents=True, exist_ok=True)
@@ -554,6 +561,41 @@ async def test_a_late_poll_still_gets_the_result(tmp_path: Path) -> None:
     assert orchestrator.queued == 0
 
 
+async def test_a_refused_job_keeps_answering_its_id(tmp_path: Path) -> None:
+    """A job that cannot run must still answer, saying why.
+
+    It failed because the card was full, which is the whole point of the VRAM
+    check. The bug this pins down is that the background task swallowed the
+    refusal, so the id left the queue without an outcome and every later poll
+    reported "No job with id 'job-1'" - a job that was refused reading as one
+    that was never created.
+    """
+    orchestrator = _orchestrator(tmp_path)
+    orchestrator._vram_probe = lambda: VramReading(total_mib=FULL_CARD, free_mib=200)
+    job_id = orchestrator.submit_music("jazz", seconds=5)
+    answer = ""
+    for _ in range(100):
+        answer = orchestrator.result_text(job_id)
+        if "failed" in answer:
+            break
+        await asyncio.sleep(0.01)
+    assert "failed" in answer
+    assert "VRAM" in answer, "the refusal has to name why, not just that it failed"
+    assert orchestrator.queued == 0
+
+
+async def test_a_job_that_ends_without_an_outcome_is_still_reachable(
+    tmp_path: Path,
+) -> None:
+    """The id must survive even the bookkeeping path that has no reason."""
+    orchestrator = _orchestrator(tmp_path)
+    entry = orchestrator._register("Music generation", "musica.py", ["--x"], 100)
+    orchestrator._retire(entry)
+    answer = orchestrator.result_text("job-1")
+    assert "failed" in answer
+    assert "without recording" in answer
+
+
 def test_an_unknown_job_id_is_a_clear_error(tmp_path: Path) -> None:
     orchestrator = _orchestrator(tmp_path)
     with pytest.raises(AgentError) as failure:
@@ -613,6 +655,30 @@ async def test_a_queued_job_and_a_blocking_one_share_the_card(tmp_path: Path) ->
 
 
 # ------------------------------------------------------------- the VRAM hold
+async def test_the_ollama_mode_means_the_same_thing_however_it_is_spelled(
+    tmp_path: Path,
+) -> None:
+    """``on`` is what the .env file says, and it has to behave like ``auto``.
+
+    The field was compared against the string ``auto`` directly, so a caller
+    who wrote ``on`` - the spelling in the documentation and in .env - silently
+    got the behaviour of ``off`` and no model was ever unloaded.
+    """
+    for spelling in ("on", "auto", "ON", " on "):
+        orchestrator = _orchestrator(tmp_path, ollama_mode=spelling)
+        orchestrator._vram_probe = lambda: VramReading(
+            total_mib=FULL_CARD, free_mib=200, used_by_others_mib=7000,
+            processes=("llama-server (7000 MiB)",),
+        )
+        assert await orchestrator._release_vram(), f"{spelling!r} did not unload"
+    for spelling in ("off", "ask", ""):
+        orchestrator = _orchestrator(tmp_path, ollama_mode=spelling)
+        orchestrator._vram_probe = lambda: VramReading(
+            total_mib=FULL_CARD, free_mib=200, used_by_others_mib=7000,
+        )
+        assert await orchestrator._release_vram() == "", f"{spelling!r} unloaded anyway"
+
+
 async def test_ollama_is_never_unloaded_unless_asked(tmp_path: Path) -> None:
     """Evicting someone's warm model is their decision, not the agent's."""
     orchestrator = _orchestrator(tmp_path, ollama_mode="off")
@@ -763,6 +829,12 @@ async def test_the_mcp_server_queues_and_collects() -> None:
     async def runner(script: Path, argv: list[str], timeout: int) -> str:
         return 'RESULT {"ok": true, "path": "salida/q.wav"}'
 
+    # The card is not under the test's control - an Ollama model may be
+    # resident on it - so the reading is fixed rather than measured. Otherwise
+    # this test fails for a reason that has nothing to do with the queue.
+    server.orchestrator._vram_probe = lambda: VramReading(
+        total_mib=FULL_CARD, free_mib=FULL_CARD
+    )
     server.orchestrator._spawn = runner  # type: ignore[method-assign]
     answer = await server.call(QUEUE_TOOL_NAME, {"kind": "music", "prompt": "jazz", "seconds": 5})
     assert "job-1" in answer
@@ -771,6 +843,51 @@ async def test_the_mcp_server_queues_and_collects() -> None:
             break
         await asyncio.sleep(0.01)
     assert "salida/q.wav" in await server.call(RESULT_TOOL_NAME, {"job_id": "job-1"})
+
+
+def test_the_video_backend_rejects_incompatible_transformers() -> None:
+    """The guard has to return a reason, not print one and carry on.
+
+    It was written as ``return fail(...)`` and called as a bare statement, so
+    the message was emitted and then ignored: the run still reached the
+    tokenizer and failed 80 seconds later with the traceback the check exists
+    to prevent. The versions that break it are 5.x and 4.55+, both found by
+    running the real pipeline.
+    """
+    import importlib.util
+
+    root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location("video_ltx_mod", root / "scripts" / "compute" / "video_ltx.py")
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    import transformers
+
+    version = transformers.__version__
+    reason = module._check_transformers_compatibility()
+    if version.startswith("5."):
+        assert reason, f"transformers {version} is incompatible and must be refused"
+        assert "transformers==4.49.0" in reason
+    else:
+        # Whatever this environment runs, the check must not block a version
+        # that works: a guard that always fires would refuse every render.
+        assert not reason or "necesita" in reason
+
+
+def test_the_video_backend_names_the_version_that_works() -> None:
+    """Whatever is refused, the message has to say what to install instead."""
+    import importlib.util
+
+    root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location("video_ltx_mod2", root / "scripts" / "compute" / "video_ltx.py")
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    source = inspect.getsource(module._check_transformers_compatibility)
+    assert "4.49.0" in source, "the message must name the version that works"
+    assert "sys.executable" in source, "the install line must use the running interpreter"
 
 
 async def test_the_backend_runs_under_this_interpreter_not_bare_python3(tmp_path: Path) -> None:

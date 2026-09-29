@@ -313,7 +313,14 @@ class ComputeOrchestrator:
     voice_timeout_seconds: int = VOICE_TIMEOUT_SECONDS
     output_dirname: str = "salida"
     ollama_mode: str = "off"
-    """Whether a heavy job may unload a resident Ollama model to free VRAM."""
+    """Whether a heavy job may unload a resident Ollama model to free VRAM.
+
+    Read through ``parse_ollama_mode`` wherever it is acted on, so that ``on``,
+    ``auto`` and ``ask`` all mean the same thing however the value was set. The
+    field is compared in one place only for speed, and comparing it directly
+    meant a caller who wrote ``on`` - the name the .env file uses - silently
+    got the behaviour of ``off``.
+    """
     queue_limit: int = DEFAULT_QUEUE_LIMIT
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     _queue: list[QueueEntry] = field(default_factory=list, repr=False)
@@ -644,15 +651,28 @@ class ComputeOrchestrator:
             entry.event.set()
 
     def _retire(self, entry: QueueEntry) -> None:
-        """Move a finished job out of the queue, keeping it answerable by id."""
+        """Move a finished job out of the queue, keeping it answerable by id.
+
+        Every job leaves through here, whatever the outcome, because an id that
+        stops answering is indistinguishable from one that was never created -
+        and that is what a caller sees when a job is refused. A job still marked
+        ``queued`` on the way out means something failed before it could record
+        itself, and it is retired anyway so the id at least reports a failure.
+        """
         if entry in self._queue:
             self._queue.remove(entry)
-        if entry.record.outcome in {"done", "failed", "cancelled"}:
-            self._retired[f"job-{entry.record.sequence}"] = entry
-            # Bounded, like the history: a poll cannot resurrect every job ever
-            # run, only the recent ones.
-            for stale in list(self._retired)[:-self.queue_limit]:
-                del self._retired[stale]
+        if entry.record.outcome == "queued":
+            entry.record.outcome = "failed"
+            entry.record.output = entry.record.output or "The job ended without recording an outcome."
+        self._retired[f"job-{entry.record.sequence}"] = entry
+        # Bounded, like the history: a poll cannot resurrect every job ever run,
+        # only the recent ones. The running job is never dropped, so the
+        # oldest *other* entry goes first.
+        while len(self._retired) > self.queue_limit:
+            oldest = next(iter(self._retired))
+            if oldest == f"job-{entry.record.sequence}":
+                break
+            del self._retired[oldest]
 
     def _can_fit(self, needed_mib: int) -> bool:
         return self.read_vram().available_for_heavy_mib >= needed_mib
@@ -665,7 +685,7 @@ class ComputeOrchestrator:
         that reason: silently evicting someone's warm model to start a video is
         not a decision the agent should make on its own.
         """
-        if self.ollama_mode != "auto":
+        if parse_ollama_mode(self.ollama_mode) != "auto":
             return ""
         reading = self.read_vram()
         if reading.used_by_others_mib <= 0:
@@ -717,10 +737,20 @@ class ComputeOrchestrator:
         It takes the same lock as a blocking call, so a queued job and a
         directly requested one share the single slot on the card rather than
         each assuming it has the GPU to itself.
+
+        A failure is recorded rather than raised, because nobody is awaiting
+        this task: the caller already has its job id and will read the outcome
+        back. Swallowing it silently is what made a refused job look like one
+        that never existed, so the reason is kept on the record.
         """
         try:
             return await self._run_queued(entry, script_name, argv)
-        except Exception:  # noqa: BLE001 - the outcome is read back, not raised
+        except asyncio.CancelledError:
+            entry.record.outcome = "cancelled"
+            raise
+        except Exception as error:  # noqa: BLE001 - reported through the id
+            entry.record.outcome = "failed"
+            entry.record.output = str(error)
             return entry.record
         finally:
             self._retire(entry)
@@ -737,6 +767,8 @@ class ComputeOrchestrator:
         if record.outcome == "done":
             note = f"\n{entry.released}" if entry.released else ""
             return f"Job {job_id} finished in {record.seconds:.0f}s.{note}\n{record.output}"
+        if record.outcome == "failed":
+            return f"Job {job_id} failed: {record.output or 'no reason was recorded.'}"
         return f"Job {job_id} {record.outcome}."
 
     def _job(self, job_id: str) -> QueueEntry:
