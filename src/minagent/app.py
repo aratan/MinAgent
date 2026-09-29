@@ -17,6 +17,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from .attachments import prepare_user_message as prepare_attachments
 from .capabilities import (
     DEFAULT_CAPABILITY_IDLE_TURNS,
@@ -99,6 +101,7 @@ from .mcp import (
     write_mcp_server as author_mcp_server,
 )
 from .memory import (
+    AUTO_CAPTURE_SOURCE,
     DEFAULT_RECALL_LIMIT,
     MAX_RECALL_LIMIT,
     MemoryStore,
@@ -111,6 +114,15 @@ from .memory import (
     format_remember_result,
 )
 from .openai import OpenAiClient
+from .reflection import (
+    REFLECTION_MAX_TOKENS,
+    build_review_prompt,
+    build_verdict_prompt,
+    detect_eureka,
+    format_review_result,
+    parse_review,
+    parse_verdict,
+)
 from .request_cache import RequestCache
 from .secrets import approval_preview, redact_likely_secrets
 from .skills import (
@@ -465,6 +477,8 @@ class MinAgent:
         self.memory_enabled = False
         self.memory_db_path = ""
         self.memory_direct_answer = True
+        self.memory_eureka = True
+        self.memory_reflection_interval = 0
         self.memory_store: MemoryStore | None = None
         self.memory_hint_context = ""
         self.web_search_enabled = False
@@ -509,6 +523,7 @@ class MinAgent:
         self._turn_first_message_index = 0
         self._steps_this_turn: list[str] = []
         self._tools_used_this_turn: list[str] = []
+        self._turns_since_reflection = 0
         # Token telemetry: what each tool actually costs the context window.
         self._turn_tool_tokens: dict[str, int] = {}
         self._turn_tool_calls: dict[str, int] = {}
@@ -616,6 +631,8 @@ class MinAgent:
         self.memory_enabled = config.memory_enabled
         self.memory_db_path = config.memory_db_path
         self.memory_direct_answer = config.memory_direct_answer
+        self.memory_eureka = config.memory_eureka
+        self.memory_reflection_interval = config.memory_reflection_interval
         self.web_search_enabled = config.web_search_enabled
         self.ollama_api_key = config.ollama_api_key
         self.web_search_base_url = config.web_search_base_url
@@ -991,17 +1008,39 @@ class MinAgent:
         self.refresh_system_prompt()
 
     async def capture_experience(self, final_text: str) -> None:
-        """Record a verified successful turn, with the steps that worked.
+        """Record a finished turn, and decide what about it is worth keeping.
 
-        The recursive part: a turn that used tools and finished without a tool error
-        becomes knowledge for a later session, unless the model already saved one.
-        Storing the concrete steps - not just the tool names - means a later session
-        can repeat what worked instead of rediscovering it.
+        Three layers, cheapest first. The raw capture that was already here
+        stays: it is a faithful log, and the review needs a backlog to cull.
+        What is new is that a turn is no longer kept merely because it used
+        tools - the eureka check asks the model about the turns that look
+        like a discovery, and the periodic review prunes what accumulated in
+        between.
+
+        None of the three layers can fail a turn. The reply is already on
+        screen by the time this runs, so anything that goes wrong here is a
+        memory that was not written, never an error the user has to see.
+        """
+        self._turns_since_reflection += 1
+        store = self.memory_store
+        if not self.memory_enabled or store is None:
+            return
+        try:
+            await self._store_raw_turn(store, final_text)
+            await self._judge_finished_turn(store, final_text)
+            await self._maybe_review(store)
+        except (AgentError, OSError, ValueError):
+            return
+
+    async def _store_raw_turn(self, store: MemoryStore, final_text: str) -> None:
+        """Record a successful tool turn verbatim, as the log a review culls.
+
+        Storing the concrete steps - not just the tool names - is what makes
+        the entry worth reviewing later: a session can repeat what worked
+        instead of rediscovering it.
         """
         if (
-            not self.memory_enabled
-            or self.memory_store is None
-            or self._memory_remembered_this_turn
+            self._memory_remembered_this_turn
             or self._tool_error_this_turn
             or not self._tools_used_this_turn
         ):
@@ -1016,12 +1055,95 @@ class MinAgent:
         if steps:
             content += f"\nSteps: {steps}"
         content += f"\nOutcome: {outcome}"
-        try:
-            await self.memory_store.remember(
-                "experience", request[:160], content, tools, "auto-captured after a successful turn"
-            )
-        except AgentError:
+        await store.remember("experience", request[:160], content, tools, AUTO_CAPTURE_SOURCE)
+
+    async def _judge_finished_turn(self, store: MemoryStore, final_text: str) -> None:
+        """Ask the model whether a turn that looks like a discovery is worth keeping.
+
+        Skipped when the model already called ``remember`` this turn: it has
+        the context and has made the call, and a second opinion on a memory
+        that was just written deliberately is not worth a request.
+        """
+        if not self.memory_eureka or self._memory_remembered_this_turn:
             return
+        signal = detect_eureka(
+            tool_errors=self._tool_errors_this_turn,
+            steps=list(dict.fromkeys(self._steps_this_turn)),
+            turn_succeeded=not self._tool_error_this_turn,
+        )
+        if signal is None:
+            return
+        answer = await self._ask_about(build_verdict_prompt(
+            request=" ".join(self._current_user_request.split()),
+            steps=list(dict.fromkeys(self._steps_this_turn)),
+            outcome=" ".join(final_text.split()),
+            signal=signal,
+        ))
+        if answer is None:
+            return
+        verdict = parse_verdict(answer)
+        if not verdict.keep:
+            return
+        await store.remember(
+            verdict.kind,
+            verdict.title,
+            verdict.content,
+            f"eureka:{signal.reason}",
+            "judged worth keeping from the turn that produced it",
+        )
+
+    async def _maybe_review(self, store: MemoryStore) -> None:
+        """Cull the auto-captured log once the interval has elapsed."""
+        interval = self.memory_reflection_interval
+        if interval <= 0 or self._turns_since_reflection < interval:
+            return
+        self._turns_since_reflection = 0
+        entries = await store.reviewable()
+        if not entries:
+            return
+        actions = parse_review(await self._ask_about(build_review_prompt(entries)) or "", entries)
+        if not actions:
+            return
+        await store.apply_review(actions)
+        self.ui_print_wrapped(
+            ((format_review_result(actions), "muted", False),)
+        )
+
+    async def _ask_about(self, messages: list[dict[str, str]]) -> str | None:
+        """One tool-free completion for a judgement, or ``None`` if it cannot be had.
+
+        No tools are offered, so a reflection can never call back into the
+        agent, and thinking is switched off: judging whether a turn is worth
+        keeping is a classification, not a puzzle, and a reasoning model spends
+        enormously on it. Measured against the 9B model this project runs, the
+        review answered in 55 tokens and 1.5s with thinking off, and in 2398
+        tokens and 58s with it on, for the same verdict. ``reasoning_effort``
+        is dropped and the request retried if the endpoint refuses the field,
+        which a non-Ollama one may do.
+
+        The token cap stays high for that same reason: a cap that looks
+        generous for one small JSON object can be spent entirely on thinking
+        by an endpoint that ignores the field above, and it then answers with
+        an empty ``content`` - a 600-token cap did exactly that, while the same
+        request answered in 606. The cap bounds a runaway; it does not squeeze
+        the answer out, and an answer that is not there is a memory silently
+        not written.
+        """
+        client = self.open_ai_client
+        if client is None:
+            return None
+        try:
+            result = await client.complete(
+                messages,
+                {"max_tokens": REFLECTION_MAX_TOKENS, "extra_body": {"reasoning_effort": "none"}},
+            )
+        except (AgentError, httpx.HTTPError, OSError):
+            return None
+        # The client wraps the completion as {"message": ..., "payload": ...};
+        # reading the outer mapping finds no content and silently judges nothing.
+        message = result.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        return content if isinstance(content, str) and content.strip() else None
 
     # ------------------------------------------------------------ capabilities
 
@@ -2830,6 +2952,7 @@ class MinAgent:
         self._memory_remembered_this_turn = False
         self._tool_error_this_turn = False
         self._tool_errors_this_turn = 0
+        self._turns_since_reflection = 0
         self._web_search_prompted_this_turn = False
         # A new conversation has no task left over from the last one, so every
         # capability that was loaded only for that task goes back to the index.

@@ -463,6 +463,13 @@ class OpenAiClient:
             request_body["tool_choice"] = options.get("tool_choice", "auto")
         if options.get("max_tokens"):
             request_body["max_tokens"] = options["max_tokens"]
+        # Optional fields a caller knows about and the endpoint may not. They
+        # are tracked together so one rejection can drop all of them and the
+        # retry is a plain request every endpoint understands.
+        optional: list[str] = ["stream_options"]
+        for key, value in (options.get("extra_body") or {}).items():
+            request_body[key] = value
+            optional.append(key)
 
         timeout = httpx.Timeout(self.timeout_ms / 1000) if self.timeout_ms > 0 else httpx.Timeout(None)
         async with httpx.AsyncClient(
@@ -498,14 +505,18 @@ class OpenAiClient:
                         signal, retry_after if retry_after is not None else DEFAULT_RETRY_DELAY_SECONDS * (attempt + 1)
                     )
                     continue
-                if response.status_code in REJECTED_STATUSES and "stream_options" in request_body:
-                    # A strict endpoint may refuse the field rather than ignore
-                    # it. Drop it and ask again: the usage frame is worth
-                    # asking for, but not worth failing the turn over.
+                if response.status_code in REJECTED_STATUSES and any(
+                    field in request_body for field in optional
+                ):
+                    # A strict endpoint may refuse a field rather than ignore
+                    # it. Drop them all and ask again: the usage frame and the
+                    # caller's hints are both worth asking for, and neither is
+                    # worth failing the turn over.
                     await stream.__aexit__(None, None, None)
                     stream = None
                     response = None
-                    del request_body["stream_options"]
+                    for field in optional:
+                        request_body.pop(field, None)
                     if last_attempt:
                         break
                     continue

@@ -276,6 +276,8 @@ class Config:
     memory_enabled: bool
     memory_db_path: str
     memory_direct_answer: bool
+    memory_eureka: bool
+    memory_reflection_interval: int
     web_search_enabled: bool
     ollama_api_key: str | None
     web_search_base_url: str
@@ -398,6 +400,10 @@ def load_configuration(
         memory_enabled=parse_boolean_setting(environment.get("MEMORY_ENABLED"), "MEMORY_ENABLED", False),
         memory_db_path=(environment.get("MEMORY_DB_PATH") or "").strip()
         or os.path.join(root, ".agents", "memory", "memoria.db"),
+        memory_eureka=parse_boolean_setting(environment.get("MEMORY_EUREKA"), "MEMORY_EUREKA", True),
+        memory_reflection_interval=parse_positive_integer(
+            environment.get("MEMORY_REFLECTION_INTERVAL"), "MEMORY_REFLECTION_INTERVAL", 10
+        ),
         memory_direct_answer=parse_boolean_setting(
             environment.get("MEMORY_DIRECT_ANSWER"), "MEMORY_DIRECT_ANSWER", True
         ),

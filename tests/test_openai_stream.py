@@ -91,6 +91,35 @@ async def test_an_endpoint_that_rejects_the_option_is_asked_again_without_it():
     assert len(calls) == 2, "the field is dropped and the request is retried once"
 
 
+async def test_an_endpoint_that_rejects_a_caller_hint_is_asked_again_without_it():
+    calls: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json as _json
+
+        body = _json.loads(request.content)
+        calls.append(body)
+        if "reasoning_effort" in body:
+            return httpx.Response(400, json={"error": "unknown field reasoning_effort"})
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_TEXT_FRAME + b"data: [DONE]\n\n",
+        )
+
+    client = OpenAiClient(ENDPOINT, None, "m", [], timeout_ms=5000, transport=httpx.MockTransport(handler))
+    result = await client.complete(
+        [{"role": "user", "content": "hi"}],
+        {"max_tokens": 3000, "extra_body": {"reasoning_effort": "none"}},
+    )
+    assert result["message"]["content"] == "hi"
+    assert calls[0]["reasoning_effort"] == "none"
+    # An endpoint that does not know the field still gets a plain question, and
+    # the hint is not worth failing a reflection over.
+    assert "reasoning_effort" not in calls[1]
+    assert calls[1]["max_tokens"] == 3000
+
+
 async def test_the_usage_frame_from_the_endpoint_is_read():
     usage_frame = b'data: {"choices":[],"usage":{"prompt_tokens":4321,"completion_tokens":12}}\n\n'
     body = _TEXT_FRAME + usage_frame + b"data: [DONE]\n\n"

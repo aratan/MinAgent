@@ -256,6 +256,18 @@ To save a whole model round-trip, MinAgent first asks the store whether it alrea
 
 Learning is recursive: after a turn that used tools and finished without a tool error, MinAgent stores the request, the tools used with the concrete arguments that ran (for example `run_terminal(command=uv run pytest -q)`), and the outcome as an `experience` entry unless the model already saved one with `remember`. A later session therefore starts from how the work was actually done, not just that it was. The model calls `remember` for the concrete procedure after a verified success and `record_outcome` to reinforce or correct a recalled memory, so confidence reflects what actually works across sessions.
 
+### Deciding what is worth keeping
+
+That automatic capture is a faithful log and a poor memory: most turns are a question that will not come up again, and a hint block built from all of them is mostly noise. Three layers decide what survives, cheapest first.
+
+**In the turn.** The memory capability tells the model to call `remember` at the moment it notices something durable - a method that worked after several attempts failed, a constraint it discovered, a preference the user stated. This is free, because it already has the context, and it is the layer that gets the judgement right.
+
+**Eureka.** Cheap signals mark a turn as a candidate and only then is the model asked whether it is worth keeping: a turn that failed two or more times and then worked, which is the shape of an actual discovery, or a turn of six or more steps, which is more method than a single call. A signal that fired on most turns would cost a model call on most turns, which is the same as having no signal, so the thresholds are deliberately conservative. A turn the model already remembered itself is never asked about again, and an answer that cannot be read as JSON keeps nothing: storing on a garbled answer is how a store fills up with guesses. Set `MEMORY_EUREKA=off` to skip it.
+
+**A review.** Every `MEMORY_REFLECTION_INTERVAL` turns (10 by default) the auto-captured log is put in front of the model, which answers with the ids to keep and the ids to forget. A kept entry is reinforced and marked as judged, so it is never offered to a later cull; a forgotten one is deleted. An id the model invented is dropped rather than honoured, because forgetting the wrong memory is not recoverable. Set `MEMORY_REFLECTION_INTERVAL` higher for a longer backlog.
+
+None of the three can fail a turn. The reply is already on screen by the time they run, so a reflection that fails costs a memory that was not written and never an error the user has to see.
+
 ## Web search
 
 When `WEB_SEARCH_ENABLED=on` and `OLLAMA_API_KEY` is set, the model can reach the web through Ollama's hosted API. It is told to call `web_search` when it does not know how to do something, when a task has already failed three or more times, or when it needs current information, and `web_fetch` to read one result page in full. MinAgent also nudges the model toward `web_search` on its own after three tool errors in one turn, instead of letting it retry the same approach.

@@ -22,6 +22,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from .errors import AgentError
+from .reflection import ReviewAction
 
 MAX_TITLE_CHARS = 160
 MAX_CONTENT_CHARS = 8000
@@ -45,6 +46,15 @@ FAILURE_CONFIDENCE_STEP = 0.2
 REINFORCE_CONFIDENCE_STEP = 0.05
 
 ALLOWED_KINDS = ("procedure", "solution", "fact", "preference", "experience")
+
+# The two sources that make a reviewable log visible. What the turn wrote by
+# itself is still up for judgement; what the review kept is not, and is never
+# offered to a later cull.
+AUTO_CAPTURE_SOURCE = "auto-captured after a successful turn"
+REVIEWED_SOURCE = "kept by the memory review"
+# A review is a second opinion on something that already succeeded once, so it
+# moves confidence less than recording the same memory again would.
+REVIEW_REINFORCE_STEP = 0.1
 
 _QUERY_TOKEN = re.compile(r"[0-9A-Za-z_]{2,}")
 _WORD = re.compile(r"[^a-z0-9]+")
@@ -498,6 +508,73 @@ class MemoryStore:
     async def recent(self, limit: int = 10) -> list[dict[str, Any]]:
         """The strongest memories, for display."""
         return await asyncio.to_thread(self._recent_sync, limit)
+
+    async def reviewable(self, limit: int = 40) -> list[dict[str, Any]]:
+        """Auto-captured entries still waiting to be judged, oldest first.
+
+        Oldest first because the review is a cull of a backlog: the entries
+        that have been waiting longest are the ones that survived a turn
+        without anyone deciding they mattered.
+        """
+        return await asyncio.to_thread(self._reviewable_sync, limit)
+
+    def _reviewable_sync(self, limit: int) -> list[dict[str, Any]]:
+        bounded = max(1, min(int(limit), 100))
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM memories WHERE source = ? ORDER BY created_at ASC, id ASC LIMIT ?",
+                (AUTO_CAPTURE_SOURCE, bounded),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    async def apply_review(self, actions: Sequence[ReviewAction]) -> int:
+        """Reinforce or delete each entry the review judged, and count the changes.
+
+        A kept entry is reinforced *and* marked as judged in the same
+        statement, because a cull that left the survivors still looking
+        unreviewed would offer them again on the next pass and the log would
+        grow without end instead of shrinking.
+        """
+        return await asyncio.to_thread(self._apply_review_sync, list(actions))
+
+    def _apply_review_sync(self, actions: list[ReviewAction]) -> int:
+        if not actions:
+            return 0
+        now = _now()
+        changed = 0
+        with self._connect() as connection:
+            for action in actions:
+                if action.keep:
+                    note = action.note or "kept by the memory review"
+                    row = connection.execute(
+                        "SELECT confidence FROM memories WHERE id = ? AND source = ?",
+                        (action.entry_id, AUTO_CAPTURE_SOURCE),
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    connection.execute(
+                        "UPDATE memories SET success_count = success_count + 1, uses = uses + 1, "
+                        "confidence = ?, source = ?, updated_at = ?, last_used_at = ? WHERE id = ?",
+                        (
+                            min(1.0, row["confidence"] + REVIEW_REINFORCE_STEP),
+                            REVIEWED_SOURCE,
+                            now,
+                            now,
+                            action.entry_id,
+                        ),
+                    )
+                    connection.execute(
+                        "INSERT INTO outcomes (memory_id, outcome, note, created_at) VALUES (?, ?, ?, ?)",
+                        (action.entry_id, "success", note, now),
+                    )
+                    changed += 1
+                else:
+                    cursor = connection.execute(
+                        "DELETE FROM memories WHERE id = ? AND source = ?",
+                        (action.entry_id, AUTO_CAPTURE_SOURCE),
+                    )
+                    changed += cursor.rowcount if cursor.rowcount > 0 else 0
+        return changed
 
     def _recent_sync(self, limit: int) -> list[dict[str, Any]]:
         bounded = max(1, min(int(limit), 50))

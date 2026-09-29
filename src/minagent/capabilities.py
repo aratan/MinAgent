@@ -327,7 +327,12 @@ def build_builtin_capabilities(
                     "Call recall before a non-trivial task to reuse verified knowledge, and remember the "
                     "concrete procedure after a verified success. Successful tool turns are captured "
                     "automatically with the steps that worked, so reinforce or correct them with "
-                    "record_outcome instead of relearning."
+                    "record_outcome instead of relearning.\n"
+                    "Call remember the moment something turns out to be worth keeping, without waiting to be "
+                    "asked: a method that worked after several attempts failed, a constraint you discovered "
+                    "the hard way, a preference the user stated. Write it so a later session can act on it "
+                    "without this conversation. Do not save what only matters to the request in front of "
+                    "you, and do not save anything the result does not actually show to be true."
                 ),
             )
         )
