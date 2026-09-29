@@ -208,6 +208,9 @@ def build_session_prompt(
                 "next time. Answer with one JSON object and nothing else.\n"
                 'Write a hypothesis only when the material supports one. A hypothesis is an extrapolation: '
                 "a pattern across several items, not a restatement of one of them.\n"
+                "Fill in every field of every hypothesis. If you cannot name the specific items from the "
+                "material that support one, do not write it: a hypothesis whose evidence field is empty or "
+                "missing is dropped, and it is dropped for a reason.\n"
                 '{"hypotheses": [{"title": "short name", "kind": "insight|improvement", "target": '
                 '"agent|project", "statement": "what this session shows", "evidence": "the specific items '
                 'that support it", "expected": "what would be better next time", "verify": "how to check '

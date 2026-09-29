@@ -338,6 +338,11 @@ class ComputeOrchestrator:
     job_timeout_seconds: int = DEFAULT_JOB_TIMEOUT_SECONDS
     voice_timeout_seconds: int = VOICE_TIMEOUT_SECONDS
     output_dirname: str = "salida"
+    # Counted where the decision is taken, not where the error is read: telling
+    # a refusal for lack of VRAM from a job that failed by looking at the
+    # message would make a wording change into a measurement change.
+    refusals: int = 0
+    failures: int = 0
     ollama_mode: str = "off"
     """Whether a heavy job may unload a resident Ollama model to free VRAM.
 
@@ -652,6 +657,7 @@ class ComputeOrchestrator:
                     release = await self._release_vram()
                     entry.released = release.message
                 if not self._can_fit(entry.needed_mib):
+                    self.refusals += 1
                     self.require_headroom(entry.kind, entry.needed_mib)
                 record.started_at = loop.time()
                 record.outcome = "running"
@@ -668,6 +674,7 @@ class ComputeOrchestrator:
                 except AgentError:
                     record.outcome = "failed"
                     record.finished_at = loop.time()
+                    self.failures += 1
                     raise
                 finally:
                     # Whatever the job did, the model that was evicted to make

@@ -88,6 +88,7 @@ from .errors import AgentError, CancellationToken, OperationAborted, find_applic
 from .image import image_content_part
 from .images import VIEW_IMAGE_TOOL_NAME, create_image_tools, run_view_image
 from .improvement import (
+    Adjustment,
     append_document,
     apply_adjustments,
     build_session_prompt,
@@ -111,6 +112,14 @@ from .mcp import (
 )
 from .mcp import (
     write_mcp_server as author_mcp_server,
+)
+from .measure import (
+    Scorecard,
+    Trial,
+    describe_trial,
+    judge,
+    load_trial,
+    save_trial,
 )
 from .memory import (
     AUTO_CAPTURE_SOURCE,
@@ -547,6 +556,12 @@ class MinAgent:
         self._session_refusals = 0
         self._session_reviews = 0
         self._session_reflections = 0
+        self._session_job_failures = 0
+        # The context the tools of this session have spent, which is the cost the
+        # agent actually decides. Prompt tokens are deliberately not counted:
+        # they mostly track how long the conversation is.
+        self._window_tool_tokens = 0
+        self._window_turns = 0
         # Token telemetry: what each tool actually costs the context window.
         self._turn_tool_tokens: dict[str, int] = {}
         self._turn_tool_calls: dict[str, int] = {}
@@ -1063,6 +1078,9 @@ class MinAgent:
         # to say, or the counter that drives it never advances and the periodic
         # pass starves while the session-end one does all the work.
         await self._maybe_improve()
+        verdict = self._advance_trial()
+        if verdict:
+            self.ui_print_wrapped(((verdict, "muted", False),))
 
     async def _maybe_improve(self) -> None:
         """Reflect every ``IMPROVEMENT_INTERVAL`` turns of a session.
@@ -1218,11 +1236,22 @@ class MinAgent:
         }
 
     def _apply_self_adjustments(self, hypotheses: Sequence[Any]) -> list[str]:
-        """Move the allowlisted settings the evidence supports, and log the rest."""
+        """Start a measured trial for the allowlisted settings the evidence supports.
+
+        A change is not applied so much as *put on probation*. The value moves,
+        a baseline is taken, and ``_advance_trial`` decides at the end of a
+        window of real turns whether it earned its place. Applying without
+        measuring is how a store of settings fills with edits nobody chose and
+        nobody can account for.
+        """
         import time as _time
 
         now = _time.time()
         log = load_adjustment_log(self.application_root)
+        if load_trial(self.application_root) is not None:
+            # One trial at a time. Two changes at once would make the verdicts
+            # unreadable: if the pair improved, nothing says which one did.
+            return []
         # Read from the environment rather than the orchestrator: the value the
         # user set is the one a change should be measured against, and the
         # orchestrator may not even exist in a session with compute disabled.
@@ -1238,26 +1267,106 @@ class MinAgent:
         planned = plan_adjustments(hypotheses, current, log, now)
         if not planned:
             return []
-        _, applied = apply_adjustments(self.application_root, planned)
+        adjustment = planned[0]
+        _, applied = apply_adjustments(self.application_root, [adjustment])
         if not applied:
             return []
-        for entry in applied.splitlines():
-            log.record(entry.split(":", 1)[0], now)
+        log.record(adjustment.name, now)
         save_adjustment_log(self.application_root, log)
-        # Applied to the running session too, so the change is not something the
-        # user has to restart to see. The file carries it to the next start.
-        for adjustment in planned:
-            if adjustment.name == "MEMORY_REFLECTION_INTERVAL":
-                value = int(adjustment.proposed)
-                self.memory_reflection_interval = value
-                self._turns_since_reflection = 0
-            elif self.orchestrator is not None and adjustment.name == "COMPUTE_QUEUE_LIMIT":
-                self.orchestrator.queue_limit = int(adjustment.proposed)
-            elif self.orchestrator is not None and adjustment.name == "COMPUTE_JOB_TIMEOUT_SECONDS":
-                self.orchestrator.job_timeout_seconds = int(adjustment.proposed)
-            elif self.orchestrator is not None and adjustment.name == "COMPUTE_VOICE_TIMEOUT_SECONDS":
-                self.orchestrator.voice_timeout_seconds = int(adjustment.proposed)
-        return applied.splitlines()
+        self._set_setting(adjustment.name, adjustment.proposed)
+        before = self._window_scorecard(window=False)
+        trial = Trial(
+            setting=adjustment.name,
+            previous=adjustment.previous,
+            proposed=adjustment.proposed,
+            reason=adjustment.reason,
+            started_at=datetime.now().astimezone().strftime("%Y-%m-%d %H:%M"),
+            before=before,
+            baseline_refusals=self.orchestrator.refusals if self.orchestrator else 0,
+            baseline_failures=self.orchestrator.failures if self.orchestrator else 0,
+        )
+        save_trial(self.application_root, trial)
+        # The window starts clean at the change. A baseline that still carried
+        # the turns the change was meant to fix would be measuring the fix
+        # against the problem it was supposed to remove.
+        self._session_tool_errors = 0
+        self._window_tool_tokens = 0
+        self._window_turns = 0
+        return [f"{adjustment.name}: {adjustment.previous} -> {adjustment.proposed} (en medición)"]
+
+    def _window_scorecard(self, *, window: bool = True) -> Scorecard:
+        """The session so far, or the turns since the change was made.
+
+        Two different things, and mixing them makes every change look neutral:
+        the window counters start at zero, so a baseline read from them is an
+        empty measurement and the verdict is always "nothing improved".
+        """
+        orchestrator = self.orchestrator
+        return Scorecard(
+            turns=self._window_turns if window else self._session_turns,
+            tool_errors=self._session_tool_errors,
+            job_refusals=max(0, orchestrator.refusals) if orchestrator else 0,
+            job_failures=max(0, orchestrator.failures) if orchestrator else 0,
+            tool_tokens=self._window_tool_tokens,
+        )
+
+    def _advance_trial(self) -> str:
+        """Add this turn to the open trial and judge it once the window is full.
+
+        A change that is reverted is written back to ``.env`` so the next start
+        is right, and said out loud: silently disagreeing with what is on screen
+        would be worse than the change itself.
+        """
+        trial = load_trial(self.application_root)
+        if trial is None or trial.judged:
+            return ""
+        self._window_turns += 1
+        card = self._window_scorecard()
+        card.turns = self._window_turns
+        card.job_refusals = max(0, card.job_refusals - trial.baseline_refusals)
+        card.job_failures = max(0, card.job_failures - trial.baseline_failures)
+        trial.after = card
+        save_trial(self.application_root, trial)
+        verdict = judge(trial)
+        if verdict.startswith("undecided"):
+            return ""
+        trial.judged = True
+        trial.kept = verdict.startswith("keep")
+        trial.verdict = verdict
+        save_trial(self.application_root, trial)
+        if trial.kept:
+            self._window_turns = 0
+            self._session_tool_errors = 0
+            self._window_tool_tokens = 0
+            return f"Medición: {verdict}"
+        apply_adjustments(
+            self.application_root,
+            [Adjustment(
+                name=trial.setting,
+                previous=trial.proposed,
+                proposed=trial.previous,
+                reason="reverted by measurement",
+            )],
+        )
+        self._set_setting(trial.setting, trial.previous)
+        return f"Medición: {verdict}. {trial.setting} vuelve a {trial.previous}."
+
+    def _set_setting(self, name: str, value: str) -> None:
+        """Apply a setting to the running session, not only to the file."""
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return
+        if name == "MEMORY_REFLECTION_INTERVAL":
+            self.memory_reflection_interval = number
+            self._turns_since_reflection = 0
+        elif name == "COMPUTE_QUEUE_LIMIT" and self.orchestrator is not None:
+            self.orchestrator.queue_limit = number
+        elif name == "COMPUTE_JOB_TIMEOUT_SECONDS" and self.orchestrator is not None:
+            self.orchestrator.job_timeout_seconds = number
+        elif name == "COMPUTE_VOICE_TIMEOUT_SECONDS" and self.orchestrator is not None:
+            self.orchestrator.voice_timeout_seconds = number
+
 
     async def _store_hypothesis(self, store: MemoryStore, hypothesis: Any) -> None:
         """Keep a hypothesis in memory as well as in the document.
@@ -1294,6 +1403,7 @@ class MinAgent:
                 self.ui_print_wrapped((("No salió nada aplicable de esta sesión.", "muted", False),))
         else:
             text = read_document(self.application_root)
+            self.ui_print_wrapped((("│ ", "magenta", False), (describe_trial(load_trial(self.application_root)), "cyan", False)))
             if not text:
                 self.ui_print_wrapped(
                     (("Todavía no hay reflexiones. Usa /mejoras now para forzar una.", "muted", False),)
@@ -1721,6 +1831,9 @@ class MinAgent:
         self._session_tool_calls[name] = self._session_tool_calls.get(name, 0) + 1
         self._turn_archived_tokens += archived
         self._session_archived_tokens += archived
+        # The window the validation phase judges cost by: what the tools of this
+        # window spent, as opposed to what the conversation did.
+        self._window_tool_tokens += spent
 
     def reset_turn_token_usage(self) -> None:
         """Start a fresh per-turn tally without losing the session totals."""
@@ -3153,6 +3266,9 @@ class MinAgent:
         self._session_refusals = 0
         self._session_reviews = 0
         self._session_reflections = 0
+        self._session_job_failures = 0
+        self._window_tool_tokens = 0
+        self._window_turns = 0
         # A new conversation has no task left over from the last one, so every
         # capability that was loaded only for that task goes back to the index.
         self.reset_capabilities()
@@ -4211,6 +4327,7 @@ class MinAgent:
                 if isinstance(result, str) and (result.startswith("Error:") or _DENIED_RESULT.match(result)):
                     self._tool_error_this_turn = True
                     self._tool_errors_this_turn += 1
+                    self._session_tool_errors += 1
                 if isinstance(result, str) and _DENIED_RESULT.match(result):
                     denied_tool_calls += 1
                 if isinstance(result, dict) and "tool_text" in result:

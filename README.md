@@ -287,6 +287,28 @@ Five rules decide whether a proposal becomes a change, and each exists because r
 
 What the guards cannot do is check that a number moves in the right direction. Every value in range is survivable, which is what the bounds are for, but the reason a change is defensible is the evidence in the document, not the number in the file. Source code is deliberately not in the set: an agent that rewrites itself has no way to notice that it made things worse.
 
+### Validating the change
+
+The first version of this applied a change and never found out whether it was right, which is not a loop - it is a sequence of unverified edits and a growing pile of settings nobody chose. A change is now put on probation instead: the value moves, a baseline is taken, and at the end of a window of real turns it is judged and either kept or **reverted on its own**, with the verdict said out loud and `.env` left in the state the verdict implies.
+
+What is measured is deliberately narrow, because a system that reported a capability number would be reporting one it cannot defend:
+
+- **Failures per turn** - tool errors, jobs refused for VRAM, and jobs that failed. The primary number: it is the one that maps onto the user being blocked. Refusals and failures are counted by the orchestrator, where the decision is taken, rather than by reading an error message, so a rewording would not silently become a measurement change.
+- **Tool-result tokens per turn** - the context the agent spends on the tools it chose to use. Prompt tokens are deliberately excluded: they mostly track how long the conversation is, which is not something a change can be judged on.
+
+Both are **rates**. A session with fewer errors because it was shorter is not a better setting, and dividing by turns is what stops the loop from learning to end conversations early.
+
+The verdict is "no harm, and some gain", with a five percent bar on either metric:
+
+- Failures per turn getting worse by more than 5% reverts it. So does failures appearing where there were none.
+- Tool tokens per turn getting worse by more than 5% reverts it too - **fewer failures bought with much more context is a trade, not an improvement**, and the one nobody asked for.
+- A window under 8 turns is not judged at all. The trial stays open, because reverting on two clean turns is worse than leaving a change in place for a while.
+- A change that neither helps nor hurts is reverted, since leaving it in spends that setting's cooldown on nothing.
+
+One change is tried at a time. Two at once would make the verdicts unreadable: if the pair improved, nothing says which one did. The trial lives in `.minagent/prueba.json` and is written on every turn, because a measurement that restarted on every restart would let a change that was never judged sit there for ever. `/mejoras` shows what is being measured.
+
+Measured on the 9B model this project runs: a reflection produced a *plannable* hypothesis - one that names an allowlisted setting and a number - in roughly **one session in three**. The other two produce an insight, or a hypothesis without evidence, and are recorded and applied to nothing. That is the honest state of it. The loop closes; how often it has anything to try is the model's own reliability, and no amount of prompt tuning measured here changed that by much.
+
 ## Web search
 
 When `WEB_SEARCH_ENABLED=on` and `OLLAMA_API_KEY` is set, the model can reach the web through Ollama's hosted API. It is told to call `web_search` when it does not know how to do something, when a task has already failed three or more times, or when it needs current information, and `web_fetch` to read one result page in full. MinAgent also nudges the model toward `web_search` on its own after three tool errors in one turn, instead of letting it retry the same approach.
