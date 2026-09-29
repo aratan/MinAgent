@@ -87,6 +87,18 @@ from .editor import (
 from .errors import AgentError, CancellationToken, OperationAborted, find_application_root
 from .image import image_content_part
 from .images import VIEW_IMAGE_TOOL_NAME, create_image_tools, run_view_image
+from .improvement import (
+    append_document,
+    apply_adjustments,
+    build_session_prompt,
+    format_adjustment_report,
+    format_document_section,
+    load_adjustment_log,
+    parse_hypotheses,
+    plan_adjustments,
+    read_document,
+    save_adjustment_log,
+)
 from .init_project import collect_project_essentials
 from .jsutil import json_stringify
 from .line_editor import EditorClosed, LineEditor
@@ -240,6 +252,7 @@ _RELEASED_IMAGE_NOTE = "[pixels released from context; view_image(path) shows it
 _SKILLS_COMMAND = re.compile(r"^\/skills(?:\s+([\s\S]*))?$", re.IGNORECASE)
 _SKILL_COMMAND = re.compile(r"^\/skill(?:\s+([\s\S]*))?$", re.IGNORECASE)
 _MEMORY_COMMAND = re.compile(r"^\/memory(?:\s+([\s\S]*))?$", re.IGNORECASE)
+_IMPROVEMENT_COMMAND = re.compile(r"^\/mejoras(?:\s+([\s\S]*))?$", re.IGNORECASE)
 _DOCTOR_COMMAND = re.compile(r"^\/doctor(?:\s+([\s\S]*))?$", re.IGNORECASE)
 _MODEL_COMMAND = re.compile(r"^\/model(?:\s+([\s\S]*))?$", re.IGNORECASE)
 # A line that is selecting a model (``/model `` with a space), for autocomplete.
@@ -382,6 +395,7 @@ SLASH_COMMANDS = [
     {"name": "skills", "description": "List, reload, or delete local skills"},
     {"name": "skill", "description": "Draft a new skill from a description"},
     {"name": "memory", "description": "Show what MinAgent has learned, or forget an entry"},
+    {"name": "mejoras", "description": "Reflect now, or read what past reflections concluded"},
     {"name": "doctor", "description": "Check the model, context window, and fixed prompt"},
     {"name": "model", "description": "List the endpoint's models, or switch to one"},
     {"name": "new", "description": "Start a new conversation and clear the screen"},
@@ -479,6 +493,9 @@ class MinAgent:
         self.memory_direct_answer = True
         self.memory_eureka = True
         self.memory_reflection_interval = 0
+        self.improvement_enabled = True
+        self.improvement_auto = True
+        self.improvement_interval = 0
         self.memory_store: MemoryStore | None = None
         self.memory_hint_context = ""
         self.web_search_enabled = False
@@ -524,6 +541,12 @@ class MinAgent:
         self._steps_this_turn: list[str] = []
         self._tools_used_this_turn: list[str] = []
         self._turns_since_reflection = 0
+        self._session_turns = 0
+        self._session_tool_errors = 0
+        self._session_jobs = 0
+        self._session_refusals = 0
+        self._session_reviews = 0
+        self._session_reflections = 0
         # Token telemetry: what each tool actually costs the context window.
         self._turn_tool_tokens: dict[str, int] = {}
         self._turn_tool_calls: dict[str, int] = {}
@@ -633,6 +656,9 @@ class MinAgent:
         self.memory_direct_answer = config.memory_direct_answer
         self.memory_eureka = config.memory_eureka
         self.memory_reflection_interval = config.memory_reflection_interval
+        self.improvement_enabled = config.improvement_enabled
+        self.improvement_auto = config.improvement_auto
+        self.improvement_interval = config.improvement_interval
         self.web_search_enabled = config.web_search_enabled
         self.ollama_api_key = config.ollama_api_key
         self.web_search_base_url = config.web_search_base_url
@@ -1008,6 +1034,7 @@ class MinAgent:
         self.refresh_system_prompt()
 
     async def capture_experience(self, final_text: str) -> None:
+        self._session_turns += 1
         """Record a finished turn, and decide what about it is worth keeping.
 
         Three layers, cheapest first. The raw capture that was already here
@@ -1030,7 +1057,26 @@ class MinAgent:
             await self._judge_finished_turn(store, final_text)
             await self._maybe_review(store)
         except (AgentError, OSError, ValueError):
+            pass
+        # Outside the memory work on purpose: a reflection has to happen even
+        # in a session where the log came out empty or the review had nothing
+        # to say, or the counter that drives it never advances and the periodic
+        # pass starves while the session-end one does all the work.
+        await self._maybe_improve()
+
+    async def _maybe_improve(self) -> None:
+        """Reflect every ``IMPROVEMENT_INTERVAL`` turns of a session.
+
+        Counted in turns rather than in memory reviews: a session can be full
+        of work and still leave nothing to cull, and tying the two together
+        would let an empty log postpone the reflection indefinitely.
+        """
+        interval = self.improvement_interval
+        if not self.improvement_enabled or interval <= 0 or self._session_turns < interval:
             return
+        self._session_turns = 0
+        self._session_reflections += 1
+        await self.reflect_on_session("periodic")
 
     async def _store_raw_turn(self, store: MemoryStore, final_text: str) -> None:
         """Record a successful tool turn verbatim, as the log a review culls.
@@ -1105,11 +1151,158 @@ class MinAgent:
         if not actions:
             return
         await store.apply_review(actions)
+        self._session_reviews += 1
         self.ui_print_wrapped(
             ((format_review_result(actions), "muted", False),)
         )
 
-    async def _ask_about(self, messages: list[dict[str, str]]) -> str | None:
+    async def reflect_on_session(self, reason: str = "") -> str:
+        """Ask what the session teaches beyond what it already recorded.
+
+        Runs when a session ends and every ``IMPROVEMENT_INTERVAL`` turns. The
+        two are not the same: at the end there is the whole arc of what
+        happened, and periodically there is a chance to notice a trend before it
+        costs a whole session.
+
+        What comes back is proposals, always, plus - for the small allowlist of
+        settings that are numbers with bounds - the moves it was confident enough
+        to make on its own. Source code is not in that set and never will be: an
+        agent that rewrites itself has no way to tell that it made things worse.
+        """
+        store = self.memory_store
+        if not self.improvement_enabled or store is None:
+            return ""
+        try:
+            knowledge = await store.recent(12)
+            pending = await store.reviewable()
+            answer = await self._ask_about(build_session_prompt(
+                knowledge=knowledge,
+                log=pending,
+                stats=self._session_counters(),
+            ), max_tokens=REFLECTION_MAX_TOKENS)
+            if answer is None:
+                return ""
+            hypotheses = parse_hypotheses(answer)
+            if not hypotheses:
+                return ""
+            applied: list[str] = []
+            proposed: list[str] = []
+            if self.improvement_auto:
+                applied = self._apply_self_adjustments(hypotheses)
+            else:
+                proposed = [f"{item.setting}={item.value}" for item in hypotheses if item.setting]
+            for hypothesis in hypotheses:
+                await self._store_hypothesis(store, hypothesis)
+            append_document(
+                self.application_root,
+                format_document_section(hypotheses, applied),
+            )
+            report = format_adjustment_report(applied, proposed, count=len(hypotheses))
+            if report:
+                self.ui_print_wrapped(((f"Reflexión: {report}", "muted", False),))
+            return report
+        except (AgentError, OSError, ValueError):
+            # A reflection that fails is a session that was not learned from.
+            # It must never be the thing that ends a session.
+            return ""
+
+    def _session_counters(self) -> dict[str, str]:
+        """The handful of numbers that show where the friction was."""
+        return {
+            "turns finished": str(self._session_turns),
+            "tool errors": str(self._session_tool_errors),
+            "heavy jobs run": str(self._session_jobs),
+            "jobs refused for VRAM": str(self._session_refusals),
+            "memory reviews": str(self._session_reviews),
+            "reflections": str(self._session_reflections),
+        }
+
+    def _apply_self_adjustments(self, hypotheses: Sequence[Any]) -> list[str]:
+        """Move the allowlisted settings the evidence supports, and log the rest."""
+        import time as _time
+
+        now = _time.time()
+        log = load_adjustment_log(self.application_root)
+        # Read from the environment rather than the orchestrator: the value the
+        # user set is the one a change should be measured against, and the
+        # orchestrator may not even exist in a session with compute disabled.
+        current = {
+            name: str(os.environ.get(name, "")).strip()
+            for name in (
+                "MEMORY_REFLECTION_INTERVAL",
+                "COMPUTE_QUEUE_LIMIT",
+                "COMPUTE_JOB_TIMEOUT_SECONDS",
+                "COMPUTE_VOICE_TIMEOUT_SECONDS",
+            )
+        }
+        planned = plan_adjustments(hypotheses, current, log, now)
+        if not planned:
+            return []
+        _, applied = apply_adjustments(self.application_root, planned)
+        if not applied:
+            return []
+        for entry in applied.splitlines():
+            log.record(entry.split(":", 1)[0], now)
+        save_adjustment_log(self.application_root, log)
+        # Applied to the running session too, so the change is not something the
+        # user has to restart to see. The file carries it to the next start.
+        for adjustment in planned:
+            if adjustment.name == "MEMORY_REFLECTION_INTERVAL":
+                value = int(adjustment.proposed)
+                self.memory_reflection_interval = value
+                self._turns_since_reflection = 0
+            elif self.orchestrator is not None and adjustment.name == "COMPUTE_QUEUE_LIMIT":
+                self.orchestrator.queue_limit = int(adjustment.proposed)
+            elif self.orchestrator is not None and adjustment.name == "COMPUTE_JOB_TIMEOUT_SECONDS":
+                self.orchestrator.job_timeout_seconds = int(adjustment.proposed)
+            elif self.orchestrator is not None and adjustment.name == "COMPUTE_VOICE_TIMEOUT_SECONDS":
+                self.orchestrator.voice_timeout_seconds = int(adjustment.proposed)
+        return applied.splitlines()
+
+    async def _store_hypothesis(self, store: MemoryStore, hypothesis: Any) -> None:
+        """Keep a hypothesis in memory as well as in the document.
+
+        In the document it is something the user reads once. In the store it is
+        something that can resurface at the moment it is relevant, which is the
+        whole reason to keep it twice.
+        """
+        content = hypothesis.statement
+        if hypothesis.evidence:
+            content += f"\nEvidencia: {hypothesis.evidence}"
+        if hypothesis.expected:
+            content += f"\nEfecto esperado: {hypothesis.expected}"
+        try:
+            await store.remember(
+                "hypothesis",
+                hypothesis.title[:160],
+                content,
+                f"{hypothesis.target},ajuste",
+                f"reflexión: {hypothesis.verify or 'sin criterio de comprobación'}",
+            )
+        except AgentError:
+            return
+
+    async def handle_improvement_command(self, argument: str) -> None:
+        """Run ``/mejoras``: read what past reflections said, or reflect now."""
+        if not self.memory_enabled or self.memory_store is None:
+            raise AgentError("Memory is disabled. Set MEMORY_ENABLED=on to use it.")
+        self.print("")
+        if argument.strip().lower().startswith("now"):
+            self.ui_print_wrapped((("Reflexionando sobre esta sesión…", "muted", False),))
+            report = await self.reflect_on_session("asked for")
+            if not report:
+                self.ui_print_wrapped((("No salió nada aplicable de esta sesión.", "muted", False),))
+        else:
+            text = read_document(self.application_root)
+            if not text:
+                self.ui_print_wrapped(
+                    (("Todavía no hay reflexiones. Usa /mejoras now para forzar una.", "muted", False),)
+                )
+            for line in text.splitlines():
+                self.ui_print_wrapped((("│ ", "magenta", False), (line, "pale", False)))
+        self.ui_print_wrapped((("╰─ ", "magenta", False), ("/mejoras now", "muted", False)))
+
+    async def _ask_about(self, messages: list[dict[str, str]], max_tokens: int = REFLECTION_MAX_TOKENS) -> str | None:
         """One tool-free completion for a judgement, or ``None`` if it cannot be had.
 
         No tools are offered, so a reflection can never call back into the
@@ -1135,7 +1328,7 @@ class MinAgent:
         try:
             result = await client.complete(
                 messages,
-                {"max_tokens": REFLECTION_MAX_TOKENS, "extra_body": {"reasoning_effort": "none"}},
+                {"max_tokens": max_tokens, "extra_body": {"reasoning_effort": "none"}},
             )
         except (AgentError, httpx.HTTPError, OSError):
             return None
@@ -2954,6 +3147,12 @@ class MinAgent:
         self._tool_errors_this_turn = 0
         self._turns_since_reflection = 0
         self._web_search_prompted_this_turn = False
+        self._session_turns = 0
+        self._session_tool_errors = 0
+        self._session_jobs = 0
+        self._session_refusals = 0
+        self._session_reviews = 0
+        self._session_reflections = 0
         # A new conversation has no task left over from the last one, so every
         # capability that was loaded only for that task goes back to the index.
         self.reset_capabilities()
@@ -2962,7 +3161,15 @@ class MinAgent:
         self.request_cache.clear()
 
     async def start_new_conversation(self) -> None:
-        """Clear the conversation and redraw the startup panel."""
+        """Clear the conversation and redraw the startup panel.
+
+        The reflection runs first, on the session that is about to end. This is
+        the one moment where the whole arc is available, and it is the last one:
+        afterwards the turns it is made of are gone.
+        """
+        if self._session_turns and self.memory_enabled:
+            self._session_reflections += 1
+            await self.reflect_on_session("session ended")
         self._reset_conversation_state()
         await self.refresh_workspace_snapshot()
         self._stdout.write("\x1b[2J\x1b[H")
@@ -4155,6 +4362,7 @@ class MinAgent:
                     skills_match = _SKILLS_COMMAND.match(text_input)
                     skill_match = _SKILL_COMMAND.match(text_input)
                     memory_match = _MEMORY_COMMAND.match(text_input)
+                    improvement_match = _IMPROVEMENT_COMMAND.match(text_input)
                     doctor_match = _DOCTOR_COMMAND.match(text_input)
                     model_match = _MODEL_COMMAND.match(text_input)
                     try:
@@ -4224,6 +4432,12 @@ class MinAgent:
                             self.clear_submitted_input(text_input, PROMPT_VISIBLE_LENGTH, input_rows_to_clear)
                             self.print_user_bubble(text_input)
                             await self.handle_memory_command(memory_match.group(1) or "")
+                            continue
+                        if improvement_match:
+                            state["selected_files"].clear()
+                            self.clear_submitted_input(text_input, PROMPT_VISIBLE_LENGTH, input_rows_to_clear)
+                            self.print_user_bubble(text_input)
+                            await self.handle_improvement_command(improvement_match.group(1) or "")
                             continue
                         if doctor_match:
                             state["selected_files"].clear()

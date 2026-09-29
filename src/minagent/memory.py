@@ -45,7 +45,18 @@ SUCCESS_CONFIDENCE_STEP = 0.15
 FAILURE_CONFIDENCE_STEP = 0.2
 REINFORCE_CONFIDENCE_STEP = 0.05
 
-ALLOWED_KINDS = ("procedure", "solution", "fact", "preference", "experience")
+# ``hypothesis`` is what a session reflection leaves behind: something the
+# evidence points at but that has not happened yet. It is listed here rather
+# than folded into the others because ``_clean_kind`` turns anything unknown
+# into ``procedure``, which would file every conjecture as a method that works.
+ALLOWED_KINDS = (
+    "procedure",
+    "solution",
+    "fact",
+    "preference",
+    "experience",
+    "hypothesis",
+)
 
 # The two sources that make a reviewable log visible. What the turn wrote by
 # itself is still up for judgement; what the review kept is not, and is never

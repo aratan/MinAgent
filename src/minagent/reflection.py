@@ -51,7 +51,7 @@ MAX_ENTRY_EXCERPT_CHARS = 600
 REFLECTION_MAX_TOKENS = 3000
 
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
-_KINDS = ("procedure", "solution", "fact", "preference", "experience")
+_KINDS = ("procedure", "solution", "fact", "preference", "experience", "hypothesis")
 
 
 @dataclass(frozen=True)
@@ -176,8 +176,13 @@ def build_review_prompt(entries: Sequence[dict[str, Any]]) -> list[dict[str, str
     ]
 
 
-def _first_object(text: str) -> dict[str, Any] | None:
-    """Pull the first balanced JSON object out of a model answer."""
+def first_json_object(text: str) -> dict[str, Any] | None:
+    """Pull the first balanced JSON object out of a model answer.
+
+    Shared with the improvement pass, which asks the model the same way and has
+    to be just as forgiving: prose around the object is discarded, and anything
+    unparseable comes back as ``None`` for the caller to treat as "no answer".
+    """
     fenced = _FENCE.search(text)
     candidate = fenced.group(1) if fenced else text
     start = candidate.find("{")
@@ -213,7 +218,7 @@ def parse_verdict(text: str) -> Verdict:
     is not confident, and storing on a guess is how a memory store fills up
     with things that were never verified.
     """
-    payload = _first_object(text)
+    payload = first_json_object(text)
     if payload is None:
         return Verdict(keep=False, reason="the answer could not be read as JSON, so nothing was kept")
     if payload.get("keep") is not True:
@@ -238,7 +243,7 @@ def parse_review(text: str, entries: Sequence[dict[str, Any]]) -> list[ReviewAct
     model invented the number for is impossible, and the one it got wrong by
     mistake should survive.
     """
-    payload = _first_object(text)
+    payload = first_json_object(text)
     if payload is None:
         return []
     known = {int(entry["id"]) for entry in entries}

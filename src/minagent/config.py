@@ -278,6 +278,9 @@ class Config:
     memory_direct_answer: bool
     memory_eureka: bool
     memory_reflection_interval: int
+    improvement_enabled: bool
+    improvement_auto: bool
+    improvement_interval: int
     web_search_enabled: bool
     ollama_api_key: str | None
     web_search_base_url: str
@@ -401,6 +404,18 @@ def load_configuration(
         memory_db_path=(environment.get("MEMORY_DB_PATH") or "").strip()
         or os.path.join(root, ".agents", "memory", "memoria.db"),
         memory_eureka=parse_boolean_setting(environment.get("MEMORY_EUREKA"), "MEMORY_EUREKA", True),
+        improvement_enabled=parse_boolean_setting(
+            environment.get("IMPROVEMENT_ENABLED"), "IMPROVEMENT_ENABLED", True
+        ),
+        # On by default because the surface it reaches is a list of numbers with
+        # bounds and a cooldown, and because the alternative - an agent that can
+        # only ever say "I should tighten this" - is a suggestion nobody reads.
+        improvement_auto=parse_boolean_setting(
+            environment.get("IMPROVEMENT_AUTO"), "IMPROVEMENT_AUTO", True
+        ),
+        improvement_interval=parse_positive_integer(
+            environment.get("IMPROVEMENT_INTERVAL"), "IMPROVEMENT_INTERVAL", 10
+        ),
         memory_reflection_interval=parse_positive_integer(
             environment.get("MEMORY_REFLECTION_INTERVAL"), "MEMORY_REFLECTION_INTERVAL", 10
         ),

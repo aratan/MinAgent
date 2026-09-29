@@ -180,6 +180,7 @@ Type `/` to open command autocomplete. Use ↑/↓ to choose a command and Enter
 - `/init [focus]`: inspect a one-time workspace inventory and selected project files, show which files were selected, and create or update the workspace root `AGENTS.md`. It reads up to 24 files, with excerpt and total-size limits.
 - `/skills [reload | show <name> | delete <name>]`: list the registered skills, force a rescan, print one skill's instructions, or delete a skill that lives inside the workspace.
 - `/memory [forget <id>]`: show how many memories exist, their success and reuse counts, and the strongest entries; `forget` deletes one entry.
+- `/mejoras [now]`: show what past reflections concluded, or force a reflection on the current session.
 - `/skill <what it should do>`: ask the model to draft a `SKILL.md` for that capability, register it immediately, and report the resulting name and path. An unfinished draft is reported; nothing is registered unless it validates.
 - `/model [name]`: list the models the endpoint advertises through its OpenAI-compatible `/models` endpoint (Ollama and llama.cpp both expose it), marking the current one, or switch to `name` when given. While you type `/model `, ↑/↓ choose from a live picker and Enter completes the name. Switching persists `OPENAI_MODEL` in the project `.env` and warms the model with a one-token request so the first turn is not the load.
 - `/doctor`: check the model, the context window, and the fixed prompt overhead.
@@ -267,6 +268,24 @@ That automatic capture is a faithful log and a poor memory: most turns are a que
 **A review.** Every `MEMORY_REFLECTION_INTERVAL` turns (10 by default) the auto-captured log is put in front of the model, which answers with the ids to keep and the ids to forget. A kept entry is reinforced and marked as judged, so it is never offered to a later cull; a forgotten one is deleted. An id the model invented is dropped rather than honoured, because forgetting the wrong memory is not recoverable. Set `MEMORY_REFLECTION_INTERVAL` higher for a longer backlog.
 
 None of the three can fail a turn. The reply is already on screen by the time they run, so a reflection that fails costs a memory that was not written and never an error the user has to see.
+
+### Improving itself
+
+Knowing things is not the same as acting on them. `IMPROVEMENT_ENABLED=on` adds a reflection that asks what the session *implies*: a session where the same job was refused four times is not four facts, it is a hypothesis about a setting that is too tight. It runs when a session ends with `/new` - the one moment the whole arc is available, and the last one - and every `IMPROVEMENT_INTERVAL` reviews (10 by default) so a trend is caught before it costs a whole session.
+
+What comes out are hypotheses, each with the evidence that supports it and the way to check whether it was right. They go to two places, because they are useful in two ways: `MEJORAS.md` at the project root, which the user reads and can edit, and the memory store, so a hypothesis resurfaces at the moment it is relevant. `/mejoras` shows the document, `/mejoras now` forces a pass.
+
+A hypothesis may also ask for one of four settings to move, and **only** those move on their own - `MEMORY_REFLECTION_INTERVAL`, `COMPUTE_QUEUE_LIMIT`, `COMPUTE_JOB_TIMEOUT_SECONDS` and `COMPUTE_VOICE_TIMEOUT_SECONDS`. Each is a number with a minimum, a maximum and a 24-hour cooldown, written to `.env` and applied to the running session, and every change is listed in the document and in `.minagent/ajustes.json`. Set `IMPROVEMENT_AUTO=off` to keep the proposals and none of the moves.
+
+Five rules decide whether a proposal becomes a change, and each exists because running it against the real 9B model showed what goes wrong without it:
+
+- **Evidence is required.** A hypothesis with nothing behind it is written down and applied to nothing.
+- **Only a named setting moves.** Anything else the model invents is dropped at the parse, before it can reach the file.
+- **Bounded and nudged.** A value outside its range is refused, and so is a move of more than half the allowed span, which is a different setting wearing the same name.
+- **One move per setting per day.** Without it, a hypothesis that is wrong in one direction gets corrected by the next one in the other, forever, with both looking supported.
+- **An observation moves nothing.** Measured against this model: asked to reflect on a session where a render hit the time limit, it noticed that "renders take longer than the timeout" - an insight - and proposed a *shorter* timeout, the opposite of its own evidence. The bounds would have contained that damage, not prevented it.
+
+What the guards cannot do is check that a number moves in the right direction. Every value in range is survivable, which is what the bounds are for, but the reason a change is defensible is the evidence in the document, not the number in the file. Source code is deliberately not in the set: an agent that rewrites itself has no way to notice that it made things worse.
 
 ## Web search
 
