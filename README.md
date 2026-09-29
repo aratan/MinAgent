@@ -44,20 +44,24 @@ MAX_TOOL_ROUNDS=64
 TOOL_PREVIEW_CHARS=12000
 TOOL_RESULT_KEEP=3
 PARALLEL_TOOLS=on
+CAPABILITY_IDLE_TURNS=2
+CONTEXT_HIGH_WATERMARK=75%
+CONTEXT_LOW_WATERMARK=55%
 OPENAI_SHOW_REASONING=off
 WORKSPACE_LIST_LIMIT=0
 TERMINAL_MODE=off
 SKILLS_ENABLED=off
 MCP_ENABLED=off
+MCP_APPROVAL_MODE=ask
 MEMORY_ENABLED=off
 WEB_SEARCH_ENABLED=off
 ```
 
-`OPENAI_MODEL` is required. `OPENAI_BASE_URL` defaults to `https://api.openai.com/v1` and is normalized to the `/chat/completions` endpoint. `OPENAI_API_KEY` is optional. `OPENAI_TIMEOUT_SECONDS`, `MCP_TIMEOUT_SECONDS`, and `TERMINAL_TIMEOUT_SECONDS` are positive integers in seconds and default to `420` (seven minutes); they bound one endpoint request, one MCP request, and one shell command respectively. `MAX_TOOL_ROUNDS` is a positive integer bounding how many tool-call rounds one turn may run before stopping, and defaults to `64`. `TOOL_PREVIEW_CHARS` is a positive integer bounding the inline preview of an oversized tool result, and defaults to `12000`. `TOOL_RESULT_KEEP` is a positive integer bounding how many recent tool results stay verbatim in the transcript, and defaults to `3`.
+`OPENAI_MODEL` is required. `OPENAI_BASE_URL` defaults to `https://api.openai.com/v1` and is normalized to the `/chat/completions` endpoint. `OPENAI_API_KEY` is optional. `OPENAI_TIMEOUT_SECONDS`, `MCP_TIMEOUT_SECONDS`, and `TERMINAL_TIMEOUT_SECONDS` are positive integers in seconds and default to `420` (seven minutes); they bound one endpoint request, one MCP request, and one shell command respectively. `MAX_TOOL_ROUNDS` is a positive integer bounding how many tool-call rounds one turn may run before stopping, and defaults to `64`. `TOOL_PREVIEW_CHARS` is a positive integer bounding the inline preview of an oversized tool result, and defaults to `12000`. `TOOL_RESULT_KEEP` is a positive integer bounding how many recent tool results stay verbatim in the transcript, and defaults to `3`. `CAPABILITY_IDLE_TURNS` is how many turns a loaded capability survives unused before its tools leave the prompt again, and defaults to `2`; `0` keeps everything loaded for the whole conversation. `CONTEXT_HIGH_WATERMARK` and `CONTEXT_LOW_WATERMARK` are the shares of the window at which the context governor starts giving things up and gives them back, and default to `75%` and `55%`; both accept `75%`, `0.75`, or `75`, and the low mark must leave room below the high one.
 
 Boolean settings use only `on` and `off`:
 
-- `OPENAI_SHOW_REASONING=on` displays the reasoning channel as muted gray text while it streams. `off` keeps the regular `Processing...` indicator. The endpoint must send `choices[0].delta.reasoning_content` (llama.cpp) or `choices[0].delta.reasoning_summary`.
+- `OPENAI_SHOW_REASONING=on` displays the reasoning channel as muted gray text while it streams. `off` keeps the regular `Processing...` indicator. The endpoint may send that channel as `choices[0].delta.reasoning_content` (llama.cpp), `choices[0].delta.reasoning_summary` (some gateways) or `choices[0].delta.reasoning` (Ollama's OpenAI-compatible surface); all three are read. This is not cosmetic: a thinking model that answers only in that channel would otherwise look like an endpoint that returned nothing.
 - `SKILLS_ENABLED=on` loads local skills. The default is `off`.
 - `MCP_ENABLED=on` loads configured MCP servers. The default is `off`.
 - `MEMORY_ENABLED=on` loads MinAgent's persistent SQLite memory, which recalls what already worked and records what works. The default is `off`. `MEMORY_DB_PATH` overrides the database location; the default is `.agents/memory/memoria.db` in the MinAgent project directory. `MEMORY_DIRECT_ANSWER=off` stops MinAgent from answering a known request straight from memory; the default is `on`.
@@ -65,7 +69,7 @@ Boolean settings use only `on` and `off`:
 
 For llama.cpp, use `--reasoning-format deepseek` when the model template does not automatically emit a separate `reasoning_content` channel. MinAgent displays that channel as progress text and keeps the final answer in its normal response presentation.
 
-`OPENAI_INPUT` must contain `text` and may also contain `image`. `OPENAI_CONTEXT_WINDOW` is a positive integer and defaults to `262144` tokens; set it to the actual model context limit, because this setting does not enlarge the model. When the endpoint is Ollama, MinAgent also reads the model's real runtime window from `POST /api/show` (`num_ctx`), so the effective window is the smaller of `OPENAI_CONTEXT_WINDOW` and that value even when the model name states nothing. A value above the model's real window lets the server truncate silently, and a large workspace inventory can then push the user's own question out of context. Too small a value is reported before the request instead, with the largest prompt components to trim. `WORKSPACE_LIST_LIMIT` defaults to `0`, which disables recursive inventory in the model context. `@` file autocomplete still searches a local index bounded to 10,000 entries and excludes common generated directories. The model can also call `list_directory` for a focused listing. A positive value includes up to that many entries per directory; `-1` includes all entries. Inventories stop at 10,000 entries or 128 KiB of text. `/init` builds a one-time inventory regardless of this setting. `TERMINAL_MODE` accepts lowercase `auto`, `ask`, or `off`, and defaults to `ask` when it is not set.
+`OPENAI_INPUT` must contain `text` and may also contain `image`. `OPENAI_CONTEXT_WINDOW` is a positive integer and defaults to `262144` tokens; set it to the actual model context limit, because this setting does not enlarge the model. When the endpoint is Ollama, MinAgent also reads the model's real runtime window from `POST /api/show` (`num_ctx`), so the effective window is the smaller of `OPENAI_CONTEXT_WINDOW` and that value even when the model name states nothing. A value above the model's real window lets the server truncate silently, and a large workspace inventory can then push the user's own question out of context. Too small a value is reported before the request instead, with the largest prompt components to trim. `WORKSPACE_LIST_LIMIT` defaults to `0`, which disables recursive inventory in the model context. `@` file autocomplete still searches a local index bounded to 10,000 entries and excludes common generated directories. The model can also call `list_directory` for a focused listing. A positive value includes up to that many entries per directory; `-1` includes all entries. Inventories stop at 10,000 entries or 128 KiB of text. `/init` builds a one-time inventory regardless of this setting. `TERMINAL_MODE` accepts lowercase `auto`, `ask`, or `off`, and defaults to `ask` when it is not set. `MCP_APPROVAL_MODE` takes the same three values for MCP tool calls and also defaults to `ask`: `ask` confirms each call, `off` refuses them all, and `auto` runs them without asking. In `auto` the call and its arguments are still printed before execution, so an unconfirmed call stays visible, and the system prompt tells the model that nobody will stop it. An MCP server executes with the user's own permissions, so `auto` means any configured server can act on this machine without a human in the loop.
 
 ## Starting MinAgent
 
@@ -86,13 +90,44 @@ File paths are relative to that directory. To read a file outside it, pass its e
 
 The final answer streams into a shaded assistant response as tokens arrive. Press `Esc` while a model response or compaction summary is streaming to stop that request; MinAgent returns to the prompt so you can send a correction. A partial answer is kept in the conversation when available. Markdown headings, lists, code fences, links, inline formatting, and tables are rendered for the terminal. Tables are aligned to the terminal width and long cell contents wrap across lines.
 
-When `OPENAI_SHOW_REASONING=on` and the endpoint supplies a supported reasoning delta, the reasoning is printed before the final response as muted gray text without a separate panel or background, wrapped to the terminal width so it stays aligned as a block. If the endpoint does not supply that field, MinAgent continues to show `Processing...` and the final response normally.
+When `OPENAI_SHOW_REASONING=on` and the endpoint supplies a reasoning delta, the reasoning is printed before the final response as muted gray text without a separate panel or background, wrapped to the terminal width so it stays aligned as a block. If the endpoint does not supply that field, MinAgent continues to show `Processing...` and the final response normally. The channel is also kept when nothing renders it: a model that finishes a turn having written only its reasoning is answered with that reasoning rather than reported as an empty response.
 
 The model chooses when it needs workspace contents. With `WORKSPACE_LIST_LIMIT=0`, no recursive inventory is injected, while `@` file autocomplete remains available from a bounded local index. The model can call `list_directory` to inspect a specific directory's immediate entries. Otherwise, the inventory supplies paths but no file contents. MinAgent does not force an initial `read_file` call merely because files exist. When a request depends on project files, the model should call `read_file` before planning, diagnosing, or changing them. `list_directory` includes hidden entries, does not recurse, and returns at most 500 entries by default. Successful edits and writes are verified internally by MinAgent; the model does not need to read the same file back. After a failed edit, reread the file before retrying so the new edit is based on its current contents.
 
 MinAgent verifies the persisted contents before a successful edit or write tool reports completion. A model response may request at most 16 tool calls; a turn may use at most `MAX_TOOL_ROUNDS` tool rounds (64 by default). Tool output stored in the conversation is compressed first (ANSI colour stripped, line endings normalised, blank-line and space runs collapsed, whole-JSON payloads minified) and, when it still exceeds `TOOL_PREVIEW_CHARS`, reduced to a head-and-tail preview. The omitted text is not discarded: it is stored zlib-compressed under `.minagent/tool-outputs/`, and the truncation note names an id the model passes to `recall_tool_output` to read any character range of the original back. Recall is exact, so a result is never permanently lost, and a single recall is capped so it cannot refill the window the archive just freed.
 
 Keeping the result recoverable is what lets the inline preview stay small. Before, one result was allowed to occupy up to a quarter of the window - roughly 65,000 tokens on the default window - and whatever did not fit was gone. Now a single result costs at most `TOOL_PREVIEW_CHARS` (about 2,800 tokens by default) and the rest is one `recall_tool_output` call away. Compression earns its place here by making the off-window copy cheap to keep: an archive is capped at 64 MB and its oldest entries are pruned past that, a single result over 8 MB is not archived at all, and a session with no archive root falls back to the old truncation.
+
+## Loading capabilities on demand
+
+Sending every tool schema and every guidance section up front costs a fixed slice of the context window on every single request: measured on this project, 3.6k tokens - 44% of an 8k window - before the user types a word, whether or not the task needs a shell, a browser or a database.
+
+So the prompt carries only an index: one line per capability, naming what it does, which tools it brings, and whether it is always loaded, loaded, or still on demand. The model asks for what the task needs with `load_capability`, and from the next request on the full schemas and the guidance for it ride along. Only two things are always loaded: the loader itself, and `recall_tool_output`, because a session that cannot read back what it archived is stuck. Everything else, reading files included, is one call away - and a call that arrives without it is answered with the name to load, so the cost of forgetting is one round trip rather than a broken task. A capability that the agent stops reaching for is dropped again after `CAPABILITY_IDLE_TURNS` idle turns, which is what stops a one-off detour from taxing every later request, and a new conversation starts from the always-loaded set again.
+
+On this project that is 1,343 tokens of fixed prompt at startup instead of 2,259, and 2,243 for a task that has loaded reads, writes and the shell. Three things do the work. The loader does not repeat the catalogue: the index is the one copy of the names, so the schema stays small and a name that does not match comes back as an error that lists the real ones. The index names at most three tools per line and says how many more there are. And the core prompt states only the rules that hold whatever else is loaded - how to use the shell, the memory or the web is said once, by the capability that carries those tools, instead of twice.
+
+Three things keep that safe. Guidance travels with the tools it explains: the shell instructions ride with the shell, a server's own instructions with that server's tools, because a bare schema list is not enough to drive either correctly. A tool that is not loaded is not callable, and the error names the capability to load rather than leaving a dead end: `web_search` reports that it belongs to `web`, which is not loaded. And a tool no capability claims could never be loaded at all, so a test asserts that every registered schema is claimed by exactly one group.
+
+The index and the loaded guidance sit after the stable core and before the clock, so loading or unloading something changes the tail of the prompt rather than invalidating the cached prefix the provider can reuse.
+
+## Governing the context while it fills
+
+Loading on demand keeps the prompt small at rest, but a long task still grows: every tool result is real text, and a session that reads forty files carries them. So the context is measured before every request and, once it passes `CONTEXT_HIGH_WATERMARK` (75% of the window by default), given up in a fixed order - most tokens for the least loss first:
+
+1. Old tool results become archive references. This is the only step that frees thousands of tokens rather than hundreds, and it is lossless: the full text is archived, and one `recall_tool_output` call brings back any of it.
+2. Memory hints are dropped. They are a recall aid, and the same knowledge is one `recall` call away.
+3. Capabilities the agent has not touched during the current turn are unloaded at once, instead of after the usual grace turns. Anything it has called since the turn started stays, so a task in flight never loses the tool it is using halfway through.
+4. The capability index loses its summaries, and goes last on purpose: the names stay so anything can still be loaded, but stripping it early leaves the agent unable to tell what anything is for exactly when it is short on room.
+
+How far down the cascade it goes depends on how far past the mark the context is: at 75% one step, at the top of the window all of them. A step the session has nothing to give is stepped over rather than counted, so a conversation with no old results does not stall on the first step. Nothing that could be lost is ever given up - the always-loaded tools, the core rules and the conversation itself are not on the list. Once the context drops under `CONTEXT_LOW_WATERMARK` (55%) everything that can be restored is. That gap is deliberate: without it a conversation hovering at the threshold would shed and restore on every turn, changing the shape of the prompt constantly and defeating the cache the ordering above protects.
+
+`/context` shows what the governor is doing, and every shed is printed as it happens, so a prompt that changes shape is never a mystery. Compaction is not part of the cascade: the turn loop already runs it, and it wants the room these steps free.
+
+### Is the meter telling the truth?
+
+Every number on screen - the status bar, `/context`, the watermarks the governor uses - comes from a character-count heuristic, while the endpoint counts real tokens with its own tokenizer. A meter that reads 30% low is a governor that trims a third of the way too late, so the two are compared: MinAgent records what it predicted immediately before sending each request, and what the endpoint reported for that same request, and `/context` shows the drift and what it means for the thresholds. Getting the endpoint to report at all takes a request option, `stream_options.include_usage`, that a strict endpoint may reject; when it does, the field is dropped and the request is retried once, because the usage frame is worth asking for but not worth failing a turn over.
+
+Against a local Ollama serving a 9B model the estimate runs about 3% under, so `CONTEXT_HIGH_WATERMARK=75%` really trims at roughly 73% of the window - close enough that the numbers on screen can be trusted, and worth checking on your own endpoint rather than assuming.
 
 ## Running reads together
 
@@ -128,9 +163,11 @@ Press `Ctrl+J` to insert a newline without sending the message. Multiline text p
 
 While a response is streaming the prompt is not waiting for input, so keystrokes are ignored rather than collected into the next line; `Esc` still stops the request. A lone `Esc` is recognised after a 50 ms grace period, which is what tells it apart from the escape sequences that arrow keys and other special keys send.
 
-Type `@` followed by a filename fragment to search workspace files. Use ↑/↓ to select a result and Enter to replace the fragment with its complete path in the current line; press Enter again to submit. Selecting a text file attaches an excerpt of up to 48 KiB. Selecting an image attaches it as multimodal input. Up to eight files and four images can be attached to one message; each file is limited to 10 MiB.
+Type `@` followed by a filename fragment to search workspace files. Use ↑/↓ to select a result and Enter to replace the fragment with its complete path in the current line; press Enter again to submit. Selecting a text file attaches an excerpt of up to 48 KiB. Selecting an image makes it available to the model, which loads it when the answer needs it (see below). Up to eight files and four images can be attached to one message; each file is limited to 10 MiB.
 
-Image paths written directly in a message are detected for PNG, JPEG, GIF, and WebP files inside or outside the workspace. Outside images must be named explicitly; MinAgent does not list outside directories. It attaches the image data and removes the path from the text sent to the model. The model endpoint must support image input.
+Image paths written directly in a message are detected for PNG, JPEG, GIF, and WebP files inside or outside the workspace. Outside images must be named explicitly; MinAgent does not list outside directories. The model endpoint must support image input.
+
+By default an image is *noticed, not sent*: the message keeps the path and names the images it found, and the pixels only enter the context when the model loads the `images` capability and calls `view_image`. A single 1024×1024 screenshot is roughly 1000 tokens, a twenty-fifth of an 8k window, and most turns that mention an image never need the pixels. Loaded images are released again when the context fills: the encoding is dropped and the path stays, so the same call brings the picture back. `IMAGE_INPUT_MODE=eager` attaches images with the message instead, as previous versions did.
 
 Set `NO_COLOR` to disable terminal colors.
 
@@ -155,18 +192,20 @@ Compaction also runs automatically as the usable context window fills. The usabl
 
 The model can use these built-in tools; directory listings and file changes stay within the workspace root:
 
-- `read_file`: read a specifically named UTF-8 text file inside or outside the workspace, or a supported image when image input is enabled. It cannot list directories. Text output is limited to 300 lines and 48 KiB. For a long line, use the returned `offset` and `column` to continue within that line.
-- `list_directory`: list immediate files and subdirectories, including hidden entries, without recursion. It defaults to the workspace root and 500 entries; pass a workspace-relative `path` or a larger `limit` when needed. Output is capped at 50 KiB and 10,000 entries; symbolic links are shown but never followed.
-- `edit_file`: replace one exact, unique text block in an existing file.
-- `write_file`: create or atomically replace one UTF-8 file, creating its missing parent directories. It writes a file, never a folder: a path ending in `/` is refused.
-- `create_directory`: create a folder and any missing parent folders; an existing folder is reported as such.
-- `delete_file`: delete one regular file.
-- `delete_directory`: recursively delete a regular subdirectory after validating its contents.
-- `run_terminal`: available only when `TERMINAL_MODE` is `auto` or `ask`. It runs in the workspace directory; `ask` requires approval for each command. It is the tool for system facts such as the current date and time, the environment, or installed tools.
-- `recall`, `remember`, and `record_outcome`: available only when `MEMORY_ENABLED` is `on`. `recall` searches the persistent memory before a task, `remember` saves a verified procedure or conclusion, and `record_outcome` reinforces or degrades a memory after it is reused.
-- `web_search` and `web_fetch`: available only when `WEB_SEARCH_ENABLED` is `on`. `web_search` returns titles, URLs, and snippets; `web_fetch` reads one result page. Web content is untrusted data.
+- `read_file`: read a specifically named UTF-8 text file inside or outside the workspace, or a supported image when image input is enabled. It cannot list directories. Text output is limited to 300 lines and 48 KiB. For a long line, use the returned `offset` and `column` to continue within that line. Part of the `files.read` capability.
+- `view_image`: load an image's pixels so the model can see it. The path is the one from the conversation; the pixels arrive in the next request. Part of the `images` capability, which is loaded on demand like the rest.
+- `download_file`: save a file from an http(s) URL. Every download lands in `salida/` and nowhere else: a path in the requested name is reduced to its last segment, a name that resolves outside the folder is refused, and a repeated download is numbered rather than overwriting. The cap is 64 MiB. Part of the `files.download` capability.
+- `list_directory`: list immediate files and subdirectories, including hidden entries, without recursion. It defaults to the workspace root and 500 entries; pass a workspace-relative `path` or a larger `limit` when needed. Output is capped at 50 KiB and 10,000 entries; symbolic links are shown but never followed. Part of the `files.read` capability.
+- `edit_file`: replace one exact, unique text block in an existing file. Part of the `files.write` capability.
+- `write_file`: create or atomically replace one UTF-8 file, creating its missing parent directories. It writes a file, never a folder: a path ending in `/` is refused. Part of the `files.write` capability.
+- `create_directory`: create a folder and any missing parent folders; an existing folder is reported as such. Part of the `files.write` capability.
+- `delete_file`: delete one regular file. Part of the `files.delete` capability.
+- `delete_directory`: recursively delete a regular subdirectory after validating its contents. Part of the `files.delete` capability.
+- `run_terminal`: available only when `TERMINAL_MODE` is `auto` or `ask`, and part of the `terminal` capability. It runs in the workspace directory; `ask` requires approval for each command. It is the tool for system facts such as the current date and time, the environment, or installed tools.
+- `recall`, `remember`, and `record_outcome`: available only when `MEMORY_ENABLED` is `on`, and part of the `memory` capability. `recall` searches the persistent memory before a task, `remember` saves a verified procedure or conclusion, and `record_outcome` reinforces or degrades a memory after it is reused.
+- `web_search` and `web_fetch`: available only when `WEB_SEARCH_ENABLED` is `on`, and part of the `web` capability. `web_search` returns titles, URLs, and snippets; `web_fetch` reads one result page. Web content is untrusted data.
 
-The prompt carries the host's local date and time, refreshed with every request, so a time question is answered from the real clock instead of a guess. When `TERMINAL_MODE` is not `off`, the prompt also states that `run_terminal` can read the rest of the system. If a reply claims a capability is unavailable without calling any tool, MinAgent sends one corrective message listing the tools that are actually available and asks the model to use one, or to save a reusable skill with `write_skill` when something is genuinely missing, rather than ending the turn on "I have no access". A reply that only describes the next step ("voy a listar los correos") without calling a tool gets the same single nudge, so an announced plan is not mistaken for the work. A second refusal is returned as the answer, so the turn never loops over it.
+The prompt carries the host's local date and time, refreshed with every request, so a time question is answered from the real clock instead of a guess. When `TERMINAL_MODE` is not `off`, the prompt also states that `run_terminal` can read the rest of the system, and the shell instructions themselves arrive with the `terminal` capability. If a reply claims a capability is unavailable without calling any tool, MinAgent sends one corrective message naming the tools that are callable right now and the capabilities that are not loaded yet, and asks the model to use one, or to save a reusable skill with `write_skill` when something is genuinely missing, rather than ending the turn on "I have no access". A reply that only describes the next step ("voy a listar los correos") without calling a tool gets the same single nudge, so an announced plan is not mistaken for the work. A second refusal is returned as the answer, so the turn never loops over it.
 
 Reads check file identity and changes around opening and reading. `read_file` can read only a specifically named outside file; outside directories cannot be discovered through `list_directory`, and edit, write, and delete tools remain confined to the workspace. Within the workspace, file operations check for symbolic links, hard links, special files, and paths outside the workspace. Individual reads and writes are limited to 10 MiB. The workspace root cannot be deleted. A successful edit or write is reread and compared with the requested content before the tool reports success. As with all path-based file operations, an untrusted process that concurrently swaps parent directories can still race a rename or deletion; use a workspace directory tree that other untrusted processes cannot modify.
 
@@ -227,6 +266,8 @@ Web results are untrusted data: the tool descriptions and the prompt say so, and
 
 - `src/minagent/app.py`: TUI, conversation loop, tool dispatch, and commands.
 - `src/minagent/attachments.py` and `src/minagent/image.py`: file attachments and image handling.
+- `src/minagent/images.py`: the `view_image` tool, which turns a path into pixels on request.
+- `src/minagent/download.py`: the `download_file` tool and the `salida/` destination rule.
 - `src/minagent/markdown_terminal.py` and `src/minagent/terminal_text.py`: streaming Markdown and terminal text layout.
 - `src/minagent/line_editor.py` and `src/minagent/editor.py`: the raw-mode prompt, autocomplete, and key handling.
 - `src/minagent/terminal_command.py` and `src/minagent/processes.py`: terminal execution and process cleanup.
@@ -241,6 +282,62 @@ Web results are untrusted data: the tool descriptions and the prompt say so, and
 - `src/minagent/web_search.py`: the Ollama-backed `web_search` and `web_fetch` tools.
 - `.agents/skills/` and `.agents/mcp/`: local skills and local MCP servers that ship with MinAgent.
 - `minagent.sh`: the uv launcher.
+
+## Local media generation
+
+Two standalone scripts, outside the package, for generating media on this machine. Neither is a
+MinAgent tool: they are run from the terminal.
+
+- `scripts/generar_imagen.py` — Qwen-Image-2.1 (GGUF, quantized) through diffusers, writing PNGs
+  to `salida/`. The text encoder stays in RAM and only the embeddings reach the GPU, because in
+  bf16 it does not fit alongside the denoiser on an 8 GB card.
+- `scripts/generar_video.py` — Wan 2.1 T2V-1.3B through diffusers, writing MP4s to `salida/`. This
+  is the light variant, chosen so it fits in 8 GB of VRAM: 480p, 81 frames, with the UMT5-XXL text
+  encoder loaded in fp8 and `enable_model_cpu_offload()` moving the rest to system RAM. The 14B
+  model does not fit on a consumer card and is not attempted.
+- `scripts/compute/` — the backends behind the `compute` capability below, which the agent calls
+  as tools instead of you running them by hand.
+
+```bash
+python scripts/generar_video.py "un dron sobrevolando una selva con niebla"
+python scripts/generar_video.py "un gato" --pasos 20 --frames 49
+python scripts/generar_video.py "una astronauta" --semilla 42     # reproducible
+python scripts/generar_video.py --descargar-solo                  # weights only, no generation
+```
+
+The first run downloads about 29 GB from HuggingFace, of which 22.7 GB is the UMT5-XXL text encoder;
+it is cached under `~/.cache/huggingface` and reused afterwards. Expect minutes, not seconds, per
+clip on an 8 GB laptop GPU. `--frames` must be `4n+1` (81, 49, 33, 25): Wan denoises in blocks of
+four, and any other frame count fails later inside the VAE with a shape error that hides the real
+cause. `guidance_scale` of 1 ruins prompt adherence; the default is 5.0.
+
+## GPU compute: voice, video, and music on one card
+
+An RTX 4060 Laptop has 8188 MiB of VRAM. Two heavy models at once is not a slow configuration on
+that card, it is impossible, so `COMPUTE_ENABLED=on` turns the constraint into a policy:
+
+- **The voice engines stay resident.** `speak_text` (Kokoro) and `transcribe_audio` (whisper.cpp)
+  hold under 2.5 GB together and answer immediately — including *while a video is rendering*,
+  because they never queue behind the heavy lock.
+- **Heavy jobs are serialized.** `generate_video` (LTX-Video) and `generate_music` (MusicGen) take
+  the card one at a time, each in its own process with system RAM backing the layer offload.
+- **Free VRAM is measured, not assumed.** A job that will not fit is refused before it starts,
+  naming the process holding the memory. On this machine an Ollama server was once sitting on
+  6390 of 8188 MiB, which is the difference between a render and an OOM. `compute_status` reports
+  the same reading on demand.
+
+```bash
+COMPUTE_ENABLED=on
+```
+
+The tools are a `compute` capability, so they are loaded on demand like the rest and cost nothing
+in a request that does not generate anything. The backends live in `scripts/compute/` and are
+optional dependencies: a missing `diffusers` fails that one call with the install command, and
+never stops the agent from starting. `.agents/skills/compute-gpu/SKILL.md` covers the install
+steps and the frame-count rules.
+
+The same orchestrator is also exposed as an MCP stdio server in `.agents/mcp/compute/index.py`, so
+any MCP client generates under the same VRAM budget rather than a second, divergent one.
 
 ## Tests
 

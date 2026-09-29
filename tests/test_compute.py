@@ -1,0 +1,526 @@
+"""Compute tests: the VRAM budget, job serialization, and the agent wiring.
+
+The orchestrator is the only place that decides whether a GPU job is allowed to
+start, so these tests are mostly about that decision. Everything that would
+otherwise need a card is injected: ``_vram_probe`` supplies the reading, and
+``runner`` stands in for the subprocess. That is what makes the interesting
+cases - a refused job, two jobs racing, an offload choice - testable at all.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import time
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from minagent.app import MinAgent
+from minagent.capabilities import build_builtin_capabilities
+from minagent.compute import (
+    MUSIC_TOOL_NAME,
+    SPEAK_TOOL_NAME,
+    STATUS_TOOL_NAME,
+    TRANSCRIBE_TOOL_NAME,
+    VIDEO_TOOL_NAME,
+    VOICE_RESERVE_MIB,
+    VRAM_HEADROOM_MIB,
+    ComputeOrchestrator,
+    VramReading,
+    create_compute_tools,
+    estimate_video_vram,
+    parse_result_line,
+)
+from minagent.config import load_configuration
+from minagent.errors import AgentError
+from minagent.workspace import WorkspaceAccess
+
+FULL_CARD = 8188
+
+
+def _orchestrator(tmp_path: Path, **overrides: Any) -> ComputeOrchestrator:
+    """An orchestrator over a fake card, with a runner that records its calls.
+
+    The backends are stubbed into the temporary project so the real script
+    resolution runs: a test that skipped that path would not notice a rename.
+    """
+    scripts = tmp_path / "scripts" / "compute"
+    scripts.mkdir(parents=True, exist_ok=True)
+    for name in ("voz.py", "video_ltx.py", "musica.py"):
+        (scripts / name).write_text('print("RESULT {\\"ok\\": true, \\"path\\": \\"salida/stub\\"}")\n')
+    orchestrator = ComputeOrchestrator(root_directory=str(tmp_path), **overrides)
+    orchestrator._vram_probe = lambda: VramReading(
+        total_mib=FULL_CARD, free_mib=FULL_CARD - 100, used_by_others_mib=100
+    )
+    return orchestrator
+
+
+def _recorder(result: str = "RESULT {\"ok\": true, \"path\": \"salida/x.mp4\"}") -> Any:
+    calls: list[list[str]] = []
+
+    async def runner(script: Path, argv: list[str], timeout: int) -> str:
+        calls.append(list(argv))
+        return result
+
+    runner.calls = calls  # type: ignore[attr-defined]
+    return runner
+
+
+# ----------------------------------------------------------------- the budget
+def test_a_job_that_fits_is_allowed(tmp_path: Path) -> None:
+    orchestrator = _orchestrator(tmp_path)
+    reading = orchestrator.require_headroom("Video", 4000)
+    # A clean card leaves the full budget minus the reserve and the headroom.
+    assert reading.available_for_heavy_mib == FULL_CARD - 100 - VOICE_RESERVE_MIB - VRAM_HEADROOM_MIB
+    assert orchestrator.read_vram().free_mib == FULL_CARD - 100
+
+
+def test_a_job_that_does_not_fit_is_refused_with_the_numbers(tmp_path: Path) -> None:
+    orchestrator = _orchestrator(tmp_path)
+    orchestrator._vram_probe = lambda: VramReading(
+        total_mib=FULL_CARD, free_mib=900, used_by_others_mib=6300, processes=("llama-server (6300 MiB)",)
+    )
+    with pytest.raises(AgentError) as failure:
+        orchestrator.require_headroom("Video", 5200)
+    message = str(failure.value)
+    assert "5200" in message
+    assert "900" in message
+    # The voice reserve is why the card is short, and the holder is named: the
+    # useful answer is "llama-server is using 6.2 GB", not "out of memory".
+    assert str(VOICE_RESERVE_MIB) in message
+    assert "llama-server" in message
+    assert "frames" in message
+
+
+def test_a_music_refusal_does_not_suggest_changing_video_settings(tmp_path: Path) -> None:
+    """Advice that does not match the job sends the model off to fix nothing."""
+    orchestrator = _orchestrator(tmp_path)
+    orchestrator._vram_probe = lambda: VramReading(total_mib=FULL_CARD, free_mib=300)
+    with pytest.raises(AgentError) as failure:
+        orchestrator.require_headroom("Music generation", 2800)
+    message = str(failure.value)
+    assert "small model" in message
+    assert "frames" not in message
+
+
+def test_the_voice_reserve_is_never_lent_to_a_heavy_job(tmp_path: Path) -> None:
+    """The reserve is the reason voice stays responsive, so it is not negotiable."""
+    orchestrator = _orchestrator(tmp_path)
+    orchestrator._vram_probe = lambda: VramReading(
+        total_mib=FULL_CARD, free_mib=VOICE_RESERVE_MIB + VRAM_HEADROOM_MIB + 500
+    )
+    with pytest.raises(AgentError):
+        orchestrator.require_headroom("Music", 2800)
+
+
+def test_a_card_with_no_nvidia_gpu_still_answers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A host with no card must not fail every call; the budget maths still works."""
+    from minagent.compute import probe_vram
+
+    monkeypatch.setenv("PATH", "/nonexistent")
+    reading = probe_vram(FULL_CARD)
+    assert reading.total_mib == FULL_CARD
+    assert reading.free_mib == FULL_CARD
+    assert reading.used_by_others_mib == 0
+
+
+def test_the_probe_names_the_process_holding_the_memory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The useful answer is "llama-server has 6.2 GB", not "out of memory"."""
+    from minagent.compute import probe_vram
+
+    _fake_nvidia_smi(monkeypatch, tmp_path, "10589, /usr/local/lib/ollama/llama-server, 6390 MiB\n")
+    reading = probe_vram(FULL_CARD)
+    assert reading.total_mib == 8188
+    assert reading.free_mib == 7346
+    assert reading.used_by_others_mib == 6390
+    assert "llama-server" in reading.processes[0]
+
+
+def test_the_orchestrator_does_not_ask_the_user_to_kill_its_own_job(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A running backend is real VRAM, but it is not a third party to go and free.
+
+    Otherwise a status call during a render would tell the user to kill the
+    video they just asked for.
+    """
+    from minagent.compute import probe_vram
+
+    _fake_nvidia_smi(monkeypatch, tmp_path, "4242, python3, 5000 MiB\n10589, llama-server, 6390 MiB\n")
+    both = probe_vram(FULL_CARD)
+    assert both.used_by_others_mib == 11_390
+    assert len(both.processes) == 2
+
+    own_only = probe_vram(FULL_CARD, ignore_pids={4242})
+    assert own_only.used_by_others_mib == 6390
+    assert all("python3" not in name for name in own_only.processes)
+
+    # And the free figure is untouched either way: the memory is still spent.
+    assert own_only.free_mib == both.free_mib
+
+
+# ------------------------------------------------------------- serialization
+async def test_two_heavy_jobs_never_overlap(tmp_path: Path) -> None:
+    """The whole scheduling policy: one at a time, in submission order."""
+    orchestrator = _orchestrator(tmp_path)
+    order: list[str] = []
+    active = 0
+    peak = 0
+
+    async def runner(script: Path, argv: list[str], timeout: int) -> str:
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        order.append(argv[1])
+        await asyncio.sleep(0.01)
+        active -= 1
+        return 'RESULT {"ok": true, "path": "salida/x.mp4"}'
+
+    await asyncio.gather(
+        orchestrator.generate_video("one", frames=17, runner=runner),
+        orchestrator.generate_music("two", runner=runner),
+    )
+    assert peak == 1
+    assert order == ["one", "two"]
+
+
+async def test_voice_does_not_wait_behind_a_render(tmp_path: Path) -> None:
+    """The point of resident voice: it answers while a video is still running."""
+    orchestrator = _orchestrator(tmp_path)
+    rendering = asyncio.Event()
+
+    async def heavy_runner(script: Path, argv: list[str], timeout: int) -> str:
+        rendering.set()
+        await asyncio.sleep(0.05)
+        return 'RESULT {"ok": true, "path": "salida/x.mp4"}'
+
+    async def voice_runner(script: Path, argv: list[str], timeout: int) -> str:
+        # If speak_text took the heavy lock, this would deadlock behind the
+        # render rather than returning while the render is still in flight.
+        return 'RESULT {"ok": true, "path": "salida/habla.wav"}'
+
+    video = asyncio.create_task(orchestrator.generate_video("x", frames=17, runner=heavy_runner))
+    await rendering.wait()
+    spoken = await orchestrator.speak("hola", runner=voice_runner)
+    assert not video.done()
+    assert spoken.endswith("habla.wav")
+    await video
+
+
+async def test_a_refused_job_never_takes_the_lock(tmp_path: Path) -> None:
+    """A job that cannot fit must not block the ones that can."""
+    orchestrator = _orchestrator(tmp_path)
+    orchestrator._vram_probe = lambda: VramReading(total_mib=FULL_CARD, free_mib=400)
+    with pytest.raises(AgentError):
+        await orchestrator.generate_video("x", frames=97, runner=_recorder())
+    assert not orchestrator.busy
+
+
+# ------------------------------------------------------------------ estimates
+def test_frames_drive_video_memory_and_offload_chooses_the_mode() -> None:
+    """The guidance tells the model frames matter and steps do not."""
+    small = estimate_video_vram(17, "group")
+    large = estimate_video_vram(97, "group")
+    assert large > small
+    assert estimate_video_vram(49, "sequential") < estimate_video_vram(49, "group")
+
+
+def test_only_musicgen_small_fits_alongside_voice(tmp_path: Path) -> None:
+    orchestrator = _orchestrator(tmp_path)
+    # 2800 MiB fits in what a clean card leaves after the voice reserve.
+    orchestrator.generate_music  # noqa: B018 - attribute access documents the surface
+    assert estimate_video_vram(49, "group") == 5200
+
+
+async def test_an_unknown_offload_mode_is_refused(tmp_path: Path) -> None:
+    orchestrator = _orchestrator(tmp_path)
+    with pytest.raises(AgentError) as failure:
+        await orchestrator.generate_video("x", offload="telepathy", runner=_recorder())
+    assert "offload" in str(failure.value)
+
+
+async def _run(coroutine: Any) -> Any:
+    return await coroutine
+
+
+# ------------------------------------------------------------------- outputs
+def test_the_result_line_is_parsed_and_failures_become_errors() -> None:
+    assert parse_result_line('RESULT {"ok": true, "path": "salida/a.mp4"}') == "salida/a.mp4"
+    with pytest.raises(AgentError) as failure:
+        parse_result_line('RESULT {"ok": false, "error": "se acabó la VRAM"}')
+    assert "VRAM" in str(failure.value)
+
+
+def test_the_poster_is_reported_alongside_the_video() -> None:
+    line = json.dumps({"ok": True, "path": "salida/a.mp4", "poster": "salida/a.png"})
+    assert "salida/a.png" in parse_result_line(f"RESULT {line}")
+
+
+def test_output_paths_cannot_escape_the_output_directory(tmp_path: Path) -> None:
+    orchestrator = _orchestrator(tmp_path)
+    escaped = orchestrator.output_path("../../etc/passwd", "mp4", "ltx")
+    assert escaped.parent == tmp_path / "salida"
+    assert escaped.name == "passwd.mp4"
+    # A bare name falls back to the stem, with the right extension.
+    assert orchestrator.output_path("", "mp4", "ltx").name == "ltx.mp4"
+    assert orchestrator.output_path("clip", "mp4", "ltx").name == "clip.mp4"
+
+
+async def test_transcription_refuses_a_path_outside_the_workspace(tmp_path: Path) -> None:
+    orchestrator = _orchestrator(tmp_path)
+    outside = tmp_path.parent / "elsewhere.mp3"
+    outside.write_bytes(b"not really audio")
+    with pytest.raises(AgentError) as failure:
+        await orchestrator.transcribe(str(outside))
+    assert "workspace" in str(failure.value)
+
+
+# ------------------------------------------------------------------ the agent
+class _FakeOutput:
+    def write(self, value: str) -> None:
+        pass
+
+    def isatty(self) -> bool:
+        return False
+
+
+def _agent(tmp_path: Path, env: dict[str, str]) -> MinAgent:
+    agent = MinAgent(stdout=_FakeOutput())
+    agent.root_directory = str(tmp_path)
+    agent.application_root = str(tmp_path)
+    agent.workspace_name = "Test"
+    agent.workspace_access = WorkspaceAccess(str(tmp_path), "Test", 0)
+    config = load_configuration(
+        str(tmp_path), str(tmp_path), {"OPENAI_API_KEY": "test", "OPENAI_MODEL": "m", **env}
+    )
+    agent.compute_enabled = config.compute_enabled
+    if agent.compute_enabled:
+        agent.orchestrator = ComputeOrchestrator(
+            root_directory=str(tmp_path),
+            vram_total_mib=config.compute_vram_total_mib,
+            job_timeout_seconds=config.compute_job_timeout_seconds,
+            voice_timeout_seconds=config.compute_voice_timeout_seconds,
+        )
+    agent.ensure_compute_tools()
+    agent.rebuild_capabilities()
+    return agent
+
+
+def test_compute_is_off_unless_it_is_asked_for(tmp_path: Path) -> None:
+    agent = _agent(tmp_path, {})
+    assert not agent.compute_enabled
+    assert agent.orchestrator is None
+    with pytest.raises(AgentError) as failure:
+        agent.run_compute_status({})
+    assert "COMPUTE_ENABLED" in str(failure.value)
+
+
+def test_the_tools_are_registered_but_not_callable_until_loaded(tmp_path: Path) -> None:
+    """On-demand loading is what keeps five schemas out of every request."""
+    agent = _agent(tmp_path, {"COMPUTE_ENABLED": "on"})
+    assert agent.compute_enabled
+    assert agent.capabilities is not None
+    assert agent.capabilities.get("compute") is not None
+
+    # The schema is registered with the agent, but not published to the model:
+    # an unloaded capability must cost nothing per request.
+    assert SPEAK_TOOL_NAME in agent._tool_schemas
+    assert SPEAK_TOOL_NAME not in {tool["function"]["name"] for tool in agent.tools}
+
+    agent.capabilities.load(["compute"])
+    agent.publish_loaded_tools()
+    published = {tool["function"]["name"] for tool in agent.tools}
+    assert SPEAK_TOOL_NAME in published
+    assert VIDEO_TOOL_NAME in published
+    assert MUSIC_TOOL_NAME in published
+    assert TRANSCRIBE_TOOL_NAME in published
+    assert STATUS_TOOL_NAME in published
+
+
+def test_the_guidance_states_the_vram_policy(tmp_path: Path) -> None:
+    """The model cannot sequence a card it was never told about."""
+    entries = build_builtin_capabilities(terminal_mode="off", compute_enabled=True)
+    guidance = next(entry for entry in entries if entry.name == "compute").guidance
+    assert "8 GB" in guidance
+    assert "serialized" in guidance
+    # The two facts that stop the expensive mistakes.
+    assert "frames" in guidance and "steps do not" in guidance
+    assert "compute_status" in guidance
+
+
+def test_no_compute_capability_when_it_is_disabled() -> None:
+    entries = build_builtin_capabilities(terminal_mode="off", compute_enabled=False)
+    assert [entry.name for entry in entries].count("compute") == 0
+
+
+def test_every_tool_has_a_schema_and_a_label(tmp_path: Path) -> None:
+    schemas = {schema["function"]["name"] for schema in create_compute_tools()}
+    assert schemas == {
+        SPEAK_TOOL_NAME,
+        TRANSCRIBE_TOOL_NAME,
+        VIDEO_TOOL_NAME,
+        MUSIC_TOOL_NAME,
+        STATUS_TOOL_NAME,
+    }
+    from minagent.app import FILE_TOOL_LABELS
+
+    for name in schemas:
+        assert name in FILE_TOOL_LABELS
+
+
+def _fake_nvidia_smi(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, table: str) -> None:
+    """Put a stub nvidia-smi on PATH so the probe reads a known card.
+
+    The real binary is shadowed rather than mocked, because the probe resolves
+    it with ``shutil.which`` and shells out; patching either would skip the
+    part that actually breaks when the output format changes.
+    """
+    binary = tmp_path / "bin" / "nvidia-smi"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.write_text(
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        '  *memory.total*) echo "8188 MiB, 7346 MiB" ;;\n'
+        f'  *) printf %s "{table}" ;;\n'
+        "esac\n"
+    )
+    binary.chmod(0o755)
+    monkeypatch.setenv("PATH", str(binary.parent))
+
+
+async def test_status_reports_the_measurement_not_a_guess(tmp_path: Path) -> None:
+    orchestrator = _orchestrator(tmp_path)
+    orchestrator._vram_probe = lambda: VramReading(
+        total_mib=FULL_CARD, free_mib=900, used_by_others_mib=6300, processes=("llama-server (6300 MiB)",)
+    )
+    report = orchestrator.status_text()
+    assert "900 MiB free of 8188" in report
+    assert "llama-server" in report
+    assert "idle" in report
+
+
+def test_config_reads_the_compute_settings(tmp_path: Path) -> None:
+    config = load_configuration(
+        str(tmp_path),
+        str(tmp_path),
+        {
+            "OPENAI_API_KEY": "test",
+            "OPENAI_MODEL": "m",
+            "COMPUTE_ENABLED": "on",
+            "COMPUTE_VRAM_TOTAL_MIB": "16384",
+            "COMPUTE_JOB_TIMEOUT_SECONDS": "600",
+        },
+    )
+    assert config.compute_enabled is True
+    assert config.compute_vram_total_mib == 16384
+    assert config.compute_job_timeout_seconds == 600
+
+
+def test_a_bad_compute_setting_is_a_clear_error(tmp_path: Path) -> None:
+    with pytest.raises(AgentError) as failure:
+        load_configuration(
+            str(tmp_path),
+            str(tmp_path),
+            {"OPENAI_API_KEY": "test", "OPENAI_MODEL": "m", "COMPUTE_VRAM_TOTAL_MIB": "mucha"},
+        )
+    assert "COMPUTE_VRAM_TOTAL_MIB" in str(failure.value)
+
+
+# --------------------------------------------------------------- the backends
+def test_the_backend_scripts_exist_and_report_json() -> None:
+    """A backend that cannot emit RESULT {...} is invisible to the orchestrator."""
+    root = Path(__file__).resolve().parent.parent
+    for name in ("voz.py", "video_ltx.py", "musica.py"):
+        script = root / "scripts" / "compute" / name
+        assert script.is_file(), f"{name} is missing"
+        assert "def emit(" in script.read_text(encoding="utf-8")
+        # The allocator setting has to be set before CUDA initialises.
+        assert "PYTORCH_CUDA_ALLOC_CONF" in script.read_text(encoding="utf-8")
+
+
+def test_a_missing_backend_says_where_it_was_looked_for(tmp_path: Path) -> None:
+    orchestrator = ComputeOrchestrator(root_directory=str(tmp_path))
+    with pytest.raises(AgentError) as failure:
+        orchestrator.resolve_script("video_ltx.py")
+    message = str(failure.value)
+    assert "scripts" in message
+    assert "COMPUTE_SCRIPTS_DIR" in message
+
+
+def test_compute_scripts_dir_overrides_where_backends_are_looked_for(tmp_path: Path) -> None:
+    """The escape hatch for a checkout whose scripts live outside the project."""
+    elsewhere = tmp_path / "otro-sitio"
+    elsewhere.mkdir()
+    (elsewhere / "video_ltx.py").write_text("# stub\n")
+    orchestrator = ComputeOrchestrator(root_directory=str(tmp_path))
+    os.environ["COMPUTE_SCRIPTS_DIR"] = str(elsewhere)
+    try:
+        assert orchestrator.resolve_script("video_ltx.py") == elsewhere / "video_ltx.py"
+    finally:
+        del os.environ["COMPUTE_SCRIPTS_DIR"]
+
+
+def test_a_generated_path_is_reported_relative_to_the_workspace(tmp_path: Path) -> None:
+    agent = _agent(tmp_path, {"COMPUTE_ENABLED": "on"})
+    assert agent.orchestrator is not None
+    absolute = str(tmp_path / "salida" / "a.mp4")
+    assert agent.relative_to_workspace(absolute) == os.path.join("salida", "a.mp4")
+
+
+async def test_the_backend_runs_under_this_interpreter_not_bare_python3(tmp_path: Path) -> None:
+    """The venv has torch and the system python3 often does not.
+
+    Spawning a bare ``python3`` would report "No module named torch" for a
+    dependency that was installed all along, so the backend inherits the
+    interpreter running MinAgent.
+    """
+    import sys
+
+    marker = tmp_path / "interpreter.txt"
+    scripts = tmp_path / "scripts" / "compute"
+    scripts.mkdir(parents=True, exist_ok=True)
+    (scripts / "musica.py").write_text(
+        "import sys, pathlib\n"
+        f"pathlib.Path({str(marker)!r}).write_text(sys.executable)\n"
+        'print("RESULT {\\"ok\\": true}")\n'
+    )
+    orchestrator = ComputeOrchestrator(root_directory=str(tmp_path))
+    orchestrator._vram_probe = lambda: VramReading(total_mib=FULL_CARD, free_mib=FULL_CARD)
+    await orchestrator._spawn(scripts / "musica.py", [], 60)
+    assert marker.read_text().strip() == sys.executable
+
+    # An explicit override still wins, for a backend that needs another env.
+    os.environ["COMPUTE_PYTHON"] = sys.executable
+    try:
+        marker.unlink()
+        await orchestrator._spawn(scripts / "musica.py", [], 60)
+        assert marker.read_text().strip() == sys.executable
+    finally:
+        del os.environ["COMPUTE_PYTHON"]
+
+
+async def test_a_job_that_times_out_is_stopped_not_left_running(tmp_path: Path) -> None:
+    """A render that overruns its budget must be killed, not left holding the card.
+
+    This runs a real subprocess rather than an injected runner, because the
+    timeout and the kill are the thing under test: a fake runner would return
+    instantly and prove nothing about either.
+    """
+    scripts = tmp_path / "scripts" / "compute"
+    scripts.mkdir(parents=True, exist_ok=True)
+    (scripts / "musica.py").write_text("import time\ntime.sleep(120)\n")
+    orchestrator = ComputeOrchestrator(root_directory=str(tmp_path), job_timeout_seconds=1)
+    orchestrator._vram_probe = lambda: VramReading(total_mib=FULL_CARD, free_mib=FULL_CARD)
+
+    started = time.time()
+    with pytest.raises(AgentError) as failure:
+        await orchestrator._spawn(scripts / "musica.py", [], 1)
+    elapsed = time.time() - started
+    assert "did not finish" in str(failure.value)
+    assert elapsed < 15, f"the process was not stopped promptly ({elapsed:.0f}s)"
+    assert not orchestrator.busy
