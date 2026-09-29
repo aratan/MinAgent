@@ -40,9 +40,12 @@ import re
 import shutil
 import subprocess
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+import httpx
 
 from .errors import AgentError
 
@@ -141,6 +144,10 @@ DEFAULT_VIDEO_STEPS = 40
 DEFAULT_OFFLOAD = "sequential"
 
 MAX_MUSIC_SECONDS = 30
+# How long a reloaded model is asked to stay resident. Ollama's default is five
+# minutes, which is short enough that a slow render would let the model time out
+# again on its own; an hour is long enough to cover the rest of the session.
+RELOAD_KEEP_ALIVE = "1h"
 """The measured ceiling on one music job.
 
 The duration is the input, not a decode budget: AudioLDM2 denoises the whole
@@ -207,8 +214,11 @@ def parse_result_object(output: str) -> dict[str, Any]:
                 return payload
     return {}
 
-# nvidia-smi prints "8188 MiB" and, on some builds, "8188MiB". One pattern for both.
-_MIB = re.compile(r"(\d+(?:\.\d+)?)\s*MiB", re.IGNORECASE)
+# nvidia-smi prints "8188 MiB" and, on some builds, "8188MiB" - and with
+# ``nounits``, which the queries below ask for, it prints "8188". All three are
+# accepted: a pattern that only matched the suffixed form skipped every row of
+# the process table and reported a card that was full as one nothing was using.
+_MIB_OR_BARE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:MiB)?\b", re.IGNORECASE)
 
 
 def _sanitize_name(value: str, fallback: str) -> str:
@@ -285,6 +295,8 @@ class QueueEntry:
     kind: str = ""
     released: str = ""
     """What the VRAM release step did, or an empty string when it did nothing."""
+    restored: str = ""
+    """What putting the model back did, or an empty string when nothing was taken."""
 
 
 def parse_ollama_mode(value: str | None) -> str:
@@ -296,6 +308,20 @@ def parse_ollama_mode(value: str | None) -> str:
     if normalized in ("off", "ask"):
         return normalized
     raise AgentError("COMPUTE_UNLOAD_OLLAMA must be on, off, or ask.")
+
+
+@dataclass
+class VramRelease:
+    """What unloading Ollama did, and what has to go back afterwards.
+
+    The names matter as much as the message. Unloading a model is only half of
+    the job: whoever had it warm gets it back when the render is done, and the
+    only reliable way to do that is to put back exactly what was taken out
+    rather than to guess what the user would have wanted resident.
+    """
+
+    models: list[str] = field(default_factory=list)
+    message: str = ""
 
 
 @dataclass
@@ -621,8 +647,10 @@ class ComputeOrchestrator:
         loop = asyncio.get_running_loop()
         try:
             async with self._lock:
+                release = VramRelease()
                 if not self._can_fit(entry.needed_mib):
-                    entry.released = await self._release_vram()
+                    release = await self._release_vram()
+                    entry.released = release.message
                 if not self._can_fit(entry.needed_mib):
                     self.require_headroom(entry.kind, entry.needed_mib)
                 record.started_at = loop.time()
@@ -641,6 +669,12 @@ class ComputeOrchestrator:
                     record.outcome = "failed"
                     record.finished_at = loop.time()
                     raise
+                finally:
+                    # Whatever the job did, the model that was evicted to make
+                    # room for it goes back. Leaving it unloaded would move the
+                    # cost onto the user's next message, which is the one thing
+                    # a slow render must not do.
+                    entry.restored = await self._restore_vram(release)
                 record.finished_at = loop.time()
                 record.outcome = "done"
                 record.output = parse_result_line(result)
@@ -677,20 +711,32 @@ class ComputeOrchestrator:
     def _can_fit(self, needed_mib: int) -> bool:
         return self.read_vram().available_for_heavy_mib >= needed_mib
 
-    async def _release_vram(self) -> str:
+    async def _release_vram(self) -> VramRelease:
         """Unload a resident Ollama model, if that is what is in the way.
 
         Opt-in via ``COMPUTE_UNLOAD_OLLAMA=on``, because it is the user's
-        server and the model reloads on the next request. Off by default for
-        that reason: silently evicting someone's warm model to start a video is
-        not a decision the agent should make on its own.
+        server. Off by default for that reason: silently evicting someone's
+        warm model to start a video is not a decision the agent should make on
+        its own. When it is on, the model goes back afterwards either way, so
+        the session is only ever cold for as long as the render takes.
         """
         if parse_ollama_mode(self.ollama_mode) != "auto":
-            return ""
+            return VramRelease()
         reading = self.read_vram()
         if reading.used_by_others_mib <= 0:
-            return ""
+            return VramRelease()
         return await unload_ollama(self.root_directory)
+
+    async def _restore_vram(self, release: VramRelease) -> str:
+        """Put back what the release step took, and say so if it could not.
+
+        This runs while the card is still held, before the next queued job
+        starts, so a reload cannot be interrupted by another render and two of
+        them cannot fight over the same memory.
+        """
+        if not release.models:
+            return ""
+        return await reload_ollama(release.models)
 
     # ------------------------------------------------------- the async queue
     def submit(
@@ -973,7 +1019,7 @@ def _terminate(process: Any) -> None:
         return
 
 
-async def unload_ollama(root_directory: str, seconds: float = 20.0) -> str:
+async def unload_ollama(root_directory: str, seconds: float = 20.0) -> VramRelease:
     """Unload whatever Ollama has resident, so the card is actually free.
 
     On this machine an Ollama model was sitting on 6390 of 8188 MiB, which is
@@ -985,13 +1031,12 @@ async def unload_ollama(root_directory: str, seconds: float = 20.0) -> str:
     using for their own requests is a much bigger thing to do than evicting a
     cache entry.
 
-    Returns a line saying what happened, for the caller to fold into its own
-    report. Failure is not an error: the caller is about to re-measure the
-    card anyway, and the answer is in that measurement.
+    The names of what was unloaded come back with the message, because the
+    caller has to be able to put it back when the job is done.
     """
     binary = shutil.which("ollama")
     if binary is None:
-        return "Ollama is not installed; nothing to unload."
+        return VramRelease(message="Ollama is not installed; nothing to unload.")
 
     async def ollama(*arguments: str) -> subprocess.CompletedProcess[str]:
         process = await asyncio.create_subprocess_exec(
@@ -1010,13 +1055,13 @@ async def unload_ollama(root_directory: str, seconds: float = 20.0) -> str:
     try:
         listing = await asyncio.wait_for(ollama("ps"), timeout=15)
     except (TimeoutError, OSError) as error:
-        return f"Could not ask Ollama what it has loaded: {error}"
+        return VramRelease(message=f"Could not ask Ollama what it has loaded: {error}")
 
     if listing.returncode != 0:
-        return "Ollama did not answer, so nothing was unloaded."
+        return VramRelease(message="Ollama did not answer, so nothing was unloaded.")
     rows = [line for line in listing.stdout.splitlines()[1:] if line.strip()]
     if not rows:
-        return "Ollama has no model loaded; the memory is not its."
+        return VramRelease(message="Ollama has no model loaded; the memory is not its.")
 
     unloaded: list[str] = []
     for row in rows:
@@ -1030,13 +1075,18 @@ async def unload_ollama(root_directory: str, seconds: float = 20.0) -> str:
         if stopped.returncode == 0:
             unloaded.append(name)
         else:
-            return (
-                f"Tried to unload {name} and Ollama refused. Free it yourself with "
-                f"`ollama stop {name}`, then retry."
+            # Already partly through: whatever was stopped before this one has
+            # to be named back, or it would stay cold for the whole session.
+            return VramRelease(
+                models=unloaded,
+                message=(
+                    f"Tried to unload {name} and Ollama refused. Free it yourself with "
+                    f"`ollama stop {name}`, then retry."
+                ),
             )
 
     if not unloaded:
-        return "Ollama had a model loaded but none could be named; free it and retry."
+        return VramRelease(message="Ollama had a model loaded but none could be named; free it and retry.")
 
     # The stop is asynchronous: the process has to exit and the driver has to
     # release the memory. Reporting success before that would hand the next
@@ -1050,11 +1100,67 @@ async def unload_ollama(root_directory: str, seconds: float = 20.0) -> str:
         if free_vram_mib() - before > 512:
             break
     reclaimed = max(0, free_vram_mib() - before)
-    return (
-        f"Unloaded {', '.join(unloaded)} from Ollama, which had been holding VRAM; "
-        f"{reclaimed} MiB came back. The next request for that model reloads it, "
-        "which takes a few seconds."
+    return VramRelease(
+        models=unloaded,
+        message=(
+            f"Unloaded {', '.join(unloaded)} from Ollama, which had been holding VRAM; "
+            f"{reclaimed} MiB came back. It goes back after the job finishes."
+        ),
     )
+
+
+async def reload_ollama(models: Sequence[str], seconds: float = 120.0) -> str:
+    """Put back the models a job evicted, so the next request is not the one that pays.
+
+    A minimal generation with an empty prompt and a long keep-alive is the
+    supported way to make Ollama load a model without producing output: the
+    model is read into VRAM and stays there past the usual keep-alive window,
+    which is the warm state a render found in the first place.
+
+    A failure here is reported, never raised. The job already succeeded, and
+    turning a warm model back into a cold one into an error would throw away
+    the render that just worked.
+    """
+    if not models:
+        return ""
+    base = _ollama_base_url()
+    if base is None:
+        return f"Could not reload {', '.join(models)}: no Ollama endpoint is configured."
+    reloaded: list[str] = []
+    for name in models:
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(seconds)) as client:
+                response = await client.post(
+                    f"{base}/api/generate",
+                    json={"model": name, "prompt": "", "keep_alive": RELOAD_KEEP_ALIVE},
+                )
+            ok = response.status_code < 400
+        except (httpx.HTTPError, OSError) as error:
+            return (
+                f"Reloaded {', '.join(reloaded) or 'nothing'} but not {name}: {error}. "
+                f"Ollama reloads it on the next request, so the session still works - it will "
+                "just be slower for one message."
+                if reloaded
+                else f"Could not reload {name}: {error}. Ollama reloads it on the next request anyway."
+            )
+        if not ok:
+            return (
+                f"Ollama refused to reload {name} (HTTP {response.status_code}). Any request for it "
+                "reloads it on demand, so the session still works - it will just be slower."
+            )
+        reloaded.append(name)
+    return f"Reloaded {', '.join(reloaded)} into VRAM for the next request."
+
+
+def _ollama_base_url() -> str | None:
+    """The base URL of the local Ollama server, if one is configured."""
+    base = (os.environ.get("OLLAMA_API_BASE") or os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434").strip()
+    if not base:
+        return None
+    for prefix in ("/v1", "/api"):
+        if base.endswith(prefix):
+            return base[: -len(prefix)].rstrip("/")
+    return base
 
 
 def free_vram_mib() -> int:
@@ -1103,7 +1209,10 @@ def probe_vram(default_total_mib: int, ignore_pids: set[int] | None = None) -> V
         if len(parts) < 3:
             continue
         pid, name = parts[0], parts[1]
-        amount = _MIB.search(parts[2])
+        # ``nounits`` asks for a bare number, so the value is matched without
+        # requiring a "MiB" suffix: requiring one skipped every row and reported
+        # a card that was full as one nothing was using.
+        amount = _MIB_OR_BARE.search(parts[2])
         if not name or amount is None:
             continue
         if pid.isdigit() and int(pid) in skip:

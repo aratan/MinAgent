@@ -19,6 +19,7 @@ from typing import Any
 
 import pytest
 
+import minagent.compute
 from minagent.app import MinAgent
 from minagent.capabilities import build_builtin_capabilities
 from minagent.compute import (
@@ -33,6 +34,7 @@ from minagent.compute import (
     VRAM_HEADROOM_MIB,
     ComputeOrchestrator,
     VramReading,
+    VramRelease,
     create_compute_tools,
     estimate_video_vram,
     parse_result_line,
@@ -405,6 +407,37 @@ def _fake_nvidia_smi(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, table: str
     monkeypatch.setenv("PATH", str(binary.parent))
 
 
+async def test_the_probe_counts_the_processes_holding_the_card(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The unit-suffixed form is the one this box used to fail on.
+
+    The queries ask for ``nounits``, so the table arrives as bare numbers. A
+    pattern that required the "MiB" suffix dropped every row, and the reading
+    said nothing was using the card while llama-server sat on 6.4 GB of it - so
+    a job that could not fit was refused instead of unloading anything, and the
+    refusal blamed free memory that was there.
+    """
+    from minagent.compute import probe_vram
+
+    _fake_nvidia_smi(monkeypatch, tmp_path, "103536, /usr/local/lib/ollama/llama-server, 6392\\n")
+
+    reading = probe_vram(8188)
+
+    assert reading.used_by_others_mib == 6392
+    assert reading.processes == ("llama-server (6392 MiB)",)
+
+
+async def test_the_probe_still_reads_a_table_that_keeps_the_unit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from minagent.compute import probe_vram
+
+    _fake_nvidia_smi(monkeypatch, tmp_path, "103536, /usr/local/lib/ollama/llama-server, 6392 MiB\\n")
+
+    assert probe_vram(8188).used_by_others_mib == 6392
+
+
 async def test_status_reports_the_measurement_not_a_guess(tmp_path: Path) -> None:
     orchestrator = _orchestrator(tmp_path)
     orchestrator._vram_probe = lambda: VramReading(
@@ -663,26 +696,42 @@ async def test_the_ollama_mode_means_the_same_thing_however_it_is_spelled(
     The field was compared against the string ``auto`` directly, so a caller
     who wrote ``on`` - the spelling in the documentation and in .env - silently
     got the behaviour of ``off`` and no model was ever unloaded.
+
+    The unload itself is stubbed. This is about the setting, and asking the
+    real one would make the test pass or fail depending on whether this machine
+    happens to have a model resident - which is what it just did.
     """
-    for spelling in ("on", "auto", "ON", " on "):
-        orchestrator = _orchestrator(tmp_path, ollama_mode=spelling)
-        orchestrator._vram_probe = lambda: VramReading(
-            total_mib=FULL_CARD, free_mib=200, used_by_others_mib=7000,
-            processes=("llama-server (7000 MiB)",),
-        )
-        assert await orchestrator._release_vram(), f"{spelling!r} did not unload"
-    for spelling in ("off", "ask", ""):
-        orchestrator = _orchestrator(tmp_path, ollama_mode=spelling)
-        orchestrator._vram_probe = lambda: VramReading(
-            total_mib=FULL_CARD, free_mib=200, used_by_others_mib=7000,
-        )
-        assert await orchestrator._release_vram() == "", f"{spelling!r} unloaded anyway"
+    attempts: list[str] = []
+
+    async def stub_unload(root_directory: str) -> VramRelease:
+        attempts.append(root_directory)
+        return VramRelease(models=["qwen3.5:9b"], message="Unloaded qwen3.5:9b.")
+
+    monkeypatched = minagent.compute.unload_ollama
+    minagent.compute.unload_ollama = stub_unload
+    try:
+        for spelling in ("on", "auto", "ON", " on "):
+            orchestrator = _orchestrator(tmp_path, ollama_mode=spelling)
+            orchestrator._vram_probe = lambda: VramReading(
+                total_mib=FULL_CARD, free_mib=200, used_by_others_mib=7000,
+                processes=("llama-server (7000 MiB)",),
+            )
+            assert (await orchestrator._release_vram()).models, f"{spelling!r} did not unload"
+        for spelling in ("off", "ask", ""):
+            orchestrator = _orchestrator(tmp_path, ollama_mode=spelling)
+            orchestrator._vram_probe = lambda: VramReading(
+                total_mib=FULL_CARD, free_mib=200, used_by_others_mib=7000,
+            )
+            assert (await orchestrator._release_vram()).models == [], f"{spelling!r} unloaded anyway"
+    finally:
+        minagent.compute.unload_ollama = monkeypatched
+    assert len(attempts) == 4
 
 
 async def test_ollama_is_never_unloaded_unless_asked(tmp_path: Path) -> None:
     """Evicting someone's warm model is their decision, not the agent's."""
     orchestrator = _orchestrator(tmp_path, ollama_mode="off")
-    assert await orchestrator._release_vram() == ""
+    assert (await orchestrator._release_vram()).models == []
 
 
 async def test_a_job_that_cannot_fit_still_names_the_holder(tmp_path: Path) -> None:
@@ -727,10 +776,12 @@ async def test_unload_reports_when_ollama_has_nothing_loaded(tmp_path: Path) -> 
     original = os.environ.get("PATH", "")
     os.environ["PATH"] = f"{tmp_path}:{original}"
     try:
-        message = await unload_ollama(str(tmp_path))
+        release = await unload_ollama(str(tmp_path))
     finally:
         os.environ["PATH"] = original
-    assert "no model loaded" in message
+    assert "no model loaded" in release.message
+    # Nothing was taken, so there is nothing to put back either.
+    assert release.models == []
 
 
 async def test_unload_names_the_model_it_stopped(tmp_path: Path) -> None:
@@ -751,11 +802,125 @@ async def test_unload_names_the_model_it_stopped(tmp_path: Path) -> None:
     original = os.environ.get("PATH", "")
     os.environ["PATH"] = f"{tmp_path}:{original}"
     try:
-        message = await unload_ollama(str(tmp_path), seconds=1.0)
+        release = await unload_ollama(str(tmp_path), seconds=1.0)
     finally:
         os.environ["PATH"] = original
-    assert "llama3:8b" in message
-    assert "reloads" in message
+    assert "llama3:8b" in release.message
+    assert "goes back after the job" in release.message
+    # The name is what makes the model recoverable: without it the job could
+    # only free the card, not put the user's session back the way it found it.
+    assert release.models == ["llama3:8b"]
+
+
+# ------------------------------------------------------------- putting it back
+
+
+class _Cycle:
+    """Records the whole evict-render-restore cycle in the order it happened.
+
+    The card is a small state machine rather than a fixed reading, because what
+    is being tested is the cycle: too tight to start, free once the model is
+    out, and occupied again once it is back. A fixed reading cannot express the
+    last state, which is the one the user is left looking at.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[str] = []
+        self.model_loaded = True
+
+    def probe(self) -> VramReading:
+        used = 5600 if self.model_loaded else 900
+        return VramReading(
+            total_mib=FULL_CARD,
+            free_mib=FULL_CARD - used,
+            used_by_others_mib=used,
+            processes=("llama-server (5600 MiB)",) if self.model_loaded else (),
+        )
+
+    async def unload(self, root_directory: str) -> VramRelease:
+        self.model_loaded = False
+        self.events.append("unload")
+        return VramRelease(models=["qwen3.5:9b"], message="Unloaded qwen3.5:9b; 4700 MiB came back.")
+
+    async def restore(self, release: VramRelease) -> str:
+        if not release.models:
+            return ""
+        self.model_loaded = True
+        self.events.append("restore")
+        return f"Reloaded {', '.join(release.models)} into VRAM for the next request."
+
+
+def _cycling_orchestrator(tmp_path: Path) -> tuple[ComputeOrchestrator, _Cycle]:
+
+    cycle = _Cycle()
+    orchestrator = _orchestrator(tmp_path, ollama_mode="on")
+    orchestrator._vram_probe = cycle.probe
+
+    async def release_vram() -> VramRelease:
+        return await cycle.unload(orchestrator.root_directory)
+
+    orchestrator._release_vram = release_vram  # type: ignore[method-assign]
+    orchestrator._restore_vram = cycle.restore  # type: ignore[method-assign]
+    return orchestrator, cycle
+
+
+async def test_the_model_a_job_evicted_goes_back_when_the_job_is_done(tmp_path: Path) -> None:
+    """The render must not leave the session cold; that cost lands on the next message."""
+    orchestrator, cycle = _cycling_orchestrator(tmp_path)
+
+    record = await orchestrator.generate_video(
+        "a boat", frames=17, steps=12, runner=_recorder('RESULT {"ok": true, "path": "salida/x.mp4"}')
+    )
+
+    assert record.outcome == "done"
+    # The order is the point: the card is freed, the job runs, and the model is
+    # put back afterwards rather than left cold until someone writes a message.
+    assert cycle.events == ["unload", "restore"]
+    assert cycle.model_loaded
+
+
+async def test_a_failed_job_still_puts_the_model_back(tmp_path: Path) -> None:
+    """Leaving it unloaded would make a failure cost the user twice."""
+    orchestrator, cycle = _cycling_orchestrator(tmp_path)
+
+    async def runner(script: Path, argv: list[str], timeout: int) -> str:
+        raise AgentError("the render blew up")
+
+    with pytest.raises(AgentError, match="blew up"):
+        await orchestrator.generate_video("a boat", frames=17, steps=12, runner=runner)
+
+    assert cycle.events == ["unload", "restore"]
+    assert cycle.model_loaded
+
+
+async def test_a_job_that_fits_does_not_disturb_a_warm_model(tmp_path: Path) -> None:
+    """Nothing is taken, so nothing is put back: the card was never a problem."""
+    orchestrator, cycle = _cycling_orchestrator(tmp_path)
+    orchestrator._vram_probe = lambda: VramReading(total_mib=FULL_CARD, free_mib=FULL_CARD - 200, used_by_others_mib=200)
+
+    await orchestrator.generate_video(
+        "a boat", frames=17, steps=12, runner=_recorder('RESULT {"ok": true, "path": "salida/x.mp4"}')
+    )
+
+    assert cycle.events == []
+
+
+async def test_a_reload_that_ollama_refuses_is_reported_not_raised() -> None:
+    from minagent.compute import reload_ollama
+
+    # Nothing answers on the default port in the test environment, which is the
+    # same situation as a server that is down: a model that could not be put
+    # back makes the next message slower, and must not throw away a render that
+    # already worked.
+    message = await reload_ollama(["qwen3.5:9b"], seconds=1.0)
+    assert "qwen3.5:9b" in message
+    assert "on the next request" in message or "on demand" in message
+
+
+async def test_reloading_nothing_says_nothing() -> None:
+    from minagent.compute import reload_ollama
+
+    assert await reload_ollama([]) == ""
 
 
 def test_the_config_exposes_the_new_settings(tmp_path: Path) -> None:

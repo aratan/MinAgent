@@ -381,10 +381,17 @@ wearing a policy's clothes. The VRAM decision is made at the front of the queue,
 reading is the freshest there is.
 
 **Freeing VRAM held by something else.** With `COMPUTE_UNLOAD_OLLAMA=on`, a job that still will
-not fit runs `ollama stop` first, which expires the keep-alive on a resident model. It is off by
-default on purpose: the model reloads on its next request, so that trade belongs to whoever is at
-the keyboard. With it off, a refused job names the process holding the memory and leaves the
-decision alone.
+not fit runs `ollama stop` first, which expires the keep-alive on a resident model, and puts it
+back when the job finishes - in a `finally`, so a failed or cancelled job restores it too. The
+reload happens while the card is still held, so the next queued job cannot start against a model
+that is halfway back, and the model is asked to stay resident for an hour, because the default
+five minutes is shorter than a render. A reload that Ollama refuses is reported and not raised: a
+warm model that could not be put back makes the next message slower, and must not throw away a
+render that already worked.
+
+The unload is off by default on purpose, even though the model comes straight back, because
+evicting someone's warm model is their call. With it off, a refused job names the process holding
+the memory and leaves the decision alone.
 
 The same orchestrator is also exposed as an MCP stdio server in `.agents/mcp/compute/index.py`, so
 any MCP client generates under the same VRAM budget rather than a second, divergent one.
