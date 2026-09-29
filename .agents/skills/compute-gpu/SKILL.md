@@ -1,6 +1,6 @@
 ---
 name: compute-gpu
-description: Genera voz, vídeo y música en la GPU local con una política de VRAM para una tarjeta de 8 GB. Úsalo cuando pidan hablar, transcribir un audio, generar un vídeo o una música, o cuando una generación falle por falta de memoria en VRAM. Install and drive the Kokoro/whisper.cpp/LTX-Video/MusicGen backends.
+description: Genera voz, vídeo y música en la GPU local con una política de VRAM para una tarjeta de 8 GB. Úsalo cuando pidan hablar, transcribir un audio, generar un vídeo o una música, o cuando una generación falle por falta de memoria en VRAM. Install and drive the Kokoro, whisper.cpp, LTX-Video and AudioLDM2 backends.
 allowed-tools:
   - speak_text
   - transcribe_audio
