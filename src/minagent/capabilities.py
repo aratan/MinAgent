@@ -27,7 +27,11 @@ from .compute import (
     TRANSCRIBE_TOOL_NAME,
     VIDEO_TOOL_NAME,
 )
+from .input import INPUT_GUIDANCE
 from .mcp import format_mcp_server_context
+from .ollama_models import OLLAMA_MODELS_GUIDANCE
+from .senses import SENSES_GUIDANCE
+from .subagents import SUBAGENTS_GUIDANCE
 
 DEFAULT_CAPABILITY_IDLE_TURNS = 2
 """Turns a capability survives unused before it is unloaded again.
@@ -251,6 +255,10 @@ def build_builtin_capabilities(
     memory_enabled: bool = False,
     web_search_enabled: bool = False,
     vision_enabled: bool = False,
+    input_enabled: bool = False,
+    senses_enabled: bool = False,
+    ollama_models_enabled: bool = False,
+    subagents_enabled: bool = False,
     images_enabled: bool = False,
     download_enabled: bool = True,
     compute_enabled: bool = False,
@@ -364,6 +372,56 @@ def build_builtin_capabilities(
                     "source: report what it says as its reading, and never repeat a plate, number, or face "
                     "it produces as if confirmed."
                 ),
+            )
+        )
+    if input_enabled:
+        entries.append(
+            Capability(
+                name="input",
+                summary="Move the mouse, click, scroll, and type on the keyboard",
+                tool_names=(
+                    "press_keys",
+                    "type_text",
+                    "move_mouse",
+                    "click_mouse",
+                    "scroll_screen",
+                    "mouse_button_down",
+                    "mouse_button_up",
+                ),
+                guidance=INPUT_GUIDANCE,
+            )
+        )
+    if senses_enabled:
+        entries.append(
+            Capability(
+                name="senses",
+                summary="Take a photo with the webcam or record from the microphone, on request",
+                tool_names=("capture_camera", "record_microphone"),
+                guidance=SENSES_GUIDANCE,
+            )
+        )
+    if ollama_models_enabled:
+        entries.append(
+            Capability(
+                name="models",
+                summary="List, inspect, create and delete the local Ollama models, and check what fits",
+                tool_names=(
+                    "list_models",
+                    "show_model",
+                    "create_model",
+                    "delete_model",
+                    "hardware_report",
+                ),
+                guidance=OLLAMA_MODELS_GUIDANCE,
+            )
+        )
+    if subagents_enabled:
+        entries.append(
+            Capability(
+                name="subagents",
+                summary="Write capability modules for itself, kept on a git branch or thrown away",
+                tool_names=("write_module", "list_modules", "delete_module", "module_template"),
+                guidance=SUBAGENTS_GUIDANCE,
             )
         )
     if compute_enabled:

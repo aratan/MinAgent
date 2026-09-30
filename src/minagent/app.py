@@ -37,10 +37,14 @@ from .compute import (
     TRANSCRIBE_TOOL_NAME,
     VIDEO_TOOL_NAME,
     ComputeOrchestrator,
+    VramRelease,
     create_compute_tools,
     format_heavy_result,
     format_speak_result,
     format_transcribe_result,
+    ollama_resident_models,
+    reload_ollama,
+    unload_ollama,
 )
 from .config import (
     DEFAULT_MAX_TOOL_ROUNDS,
@@ -101,6 +105,7 @@ from .improvement import (
     save_adjustment_log,
 )
 from .init_project import collect_project_essentials
+from .input import InputClient, create_input_tools
 from .jsutil import json_stringify
 from .line_editor import EditorClosed, LineEditor
 from .markdown_terminal import create_terminal_rendering
@@ -134,6 +139,12 @@ from .memory import (
     format_recall,
     format_remember_result,
 )
+from .ollama_models import (
+    OllamaModelsClient,
+    create_ollama_models_tools,
+    format_model_detail,
+    format_models_table,
+)
 from .openai import OpenAiClient
 from .reflection import (
     REFLECTION_MAX_TOKENS,
@@ -146,6 +157,7 @@ from .reflection import (
 )
 from .request_cache import RequestCache
 from .secrets import approval_preview, redact_likely_secrets
+from .senses import SensesClient, create_senses_tools
 from .skills import (
     create_skill_tools,
     discover_skills,
@@ -157,6 +169,7 @@ from .skills import (
 from .skills import (
     write_skill as author_skill,
 )
+from .subagents import BRANCH_PREFIX, SubagentStore, create_subagent_tools, render_template
 from .terminal_command import run_terminal_command as execute_terminal_command
 from .terminal_text import (
     StyledSegment,
@@ -185,6 +198,13 @@ from .web_search import (
     format_search_results,
 )
 from .workspace import WorkspaceAccess
+
+MODULE_APPROVAL_PREVIEW_CHARS = 8000
+"""How much of a module's source the approval shows, matching the MCP server's.
+
+A module longer than this is refused rather than truncated: approving the first
+8000 characters of code that then runs is not approval, it is a guess.
+"""
 
 MAX_TOOL_CALLS_PER_RESPONSE = 16
 MAX_CALIBRATION_SAMPLES = 12
@@ -372,8 +392,25 @@ FILE_TOOL_LABELS = {
     "remember": "Save memory",
     "record_outcome": "Record outcome",
     "web_search": "Web search",
-    "web_fetch": "Fetch page",
-    "describe_image": "Describe image",
+    "web_fetch": "Fetch page",        "describe_image": "Describe image",
+        "press_keys": "Press keys",
+        "type_text": "Type text",
+        "move_mouse": "Move mouse",
+        "click_mouse": "Click mouse",
+        "scroll_screen": "Scroll screen",
+        "mouse_button_down": "Mouse button down",
+        "mouse_button_up": "Mouse button up",
+        "capture_camera": "Capture camera",
+        "record_microphone": "Record microphone",
+        "list_models": "List models",
+        "show_model": "Show model",
+        "create_model": "Create model",
+        "delete_model": "Delete model",
+        "hardware_report": "Hardware report",
+        "write_module": "Write module",
+        "list_modules": "List modules",
+        "delete_module": "Delete module",
+        "module_template": "Module template",
     VIEW_IMAGE_TOOL_NAME: "View image",
     DOWNLOAD_TOOL_NAME: "Download file",
     SPEAK_TOOL_NAME: "Speak text",
@@ -502,9 +539,11 @@ class MinAgent:
         self.memory_direct_answer = True
         self.memory_eureka = True
         self.memory_reflection_interval = 0
+        self.memory_embed_model = ""
         self.improvement_enabled = True
         self.improvement_auto = True
         self.improvement_interval = 0
+        self.improvement_model = ""
         self.memory_store: MemoryStore | None = None
         self.memory_hint_context = ""
         self.web_search_enabled = False
@@ -518,6 +557,14 @@ class MinAgent:
         self.vision_timeout_seconds = 0
         self.on_demand_images = True
         self.vision_client: VisionClient | None = None
+        self.input_enabled = False
+        self.input_client: InputClient | None = None
+        self.senses_enabled = False
+        self.senses_client: SensesClient | None = None
+        self.ollama_models_enabled = False
+        self.ollama_models_client: OllamaModelsClient | None = None
+        self.subagents_enabled = False
+        self.subagent_store: SubagentStore | None = None
         self.compute_enabled = False
         self.orchestrator: ComputeOrchestrator | None = None
         self.available_models: list[str] = []
@@ -671,9 +718,11 @@ class MinAgent:
         self.memory_direct_answer = config.memory_direct_answer
         self.memory_eureka = config.memory_eureka
         self.memory_reflection_interval = config.memory_reflection_interval
+        self.memory_embed_model = config.memory_embed_model
         self.improvement_enabled = config.improvement_enabled
         self.improvement_auto = config.improvement_auto
         self.improvement_interval = config.improvement_interval
+        self.improvement_model = config.improvement_model
         self.web_search_enabled = config.web_search_enabled
         self.ollama_api_key = config.ollama_api_key
         self.web_search_base_url = config.web_search_base_url
@@ -683,6 +732,10 @@ class MinAgent:
         self.vision_base_url = config.vision_base_url
         self.vision_timeout_seconds = config.vision_timeout_seconds
         self.on_demand_images = config.on_demand_images
+        self.input_enabled = config.input_enabled
+        self.senses_enabled = config.senses_enabled
+        self.ollama_models_enabled = config.ollama_models_enabled
+        self.subagents_enabled = config.subagents_enabled
         self.compute_enabled = config.compute_enabled
 
         self._use_color = bool(getattr(self._stdout, "isatty", lambda: False)()) and "NO_COLOR" not in os.environ
@@ -724,6 +777,22 @@ class MinAgent:
             self.vision_client = VisionClient(
                 self.vision_base_url, self.vision_model, self.vision_timeout_seconds
             )
+        if self.input_enabled:
+            self.input_client = InputClient()
+        if self.senses_enabled:
+            self.senses_client = SensesClient(
+                camera_device=config.camera_device,
+                output_directory=str(Path(self.root_directory) / "salida"),
+            )
+        if self.ollama_models_enabled:
+            self.ollama_models_client = OllamaModelsClient(
+                config.ollama_models_base_url, config.ollama_models_timeout_seconds
+            )
+        if self.subagents_enabled:
+            self.subagent_store = SubagentStore(
+                str(Path(self.root_directory) / config.subagents_directory),
+                config.subagents_max_ephemeral,
+            )
         if self.compute_enabled:
             self.orchestrator = ComputeOrchestrator(
                 root_directory=self.root_directory,
@@ -735,6 +804,14 @@ class MinAgent:
             )
         self.ensure_image_tools()
         self.ensure_download_tools()
+        if self.input_enabled:
+            self.ensure_input_tools()
+        if self.senses_enabled:
+            self.ensure_senses_tools()
+        if self.ollama_models_enabled:
+            self.ensure_ollama_models_tools()
+        if self.subagents_enabled:
+            self.ensure_subagent_tools()
         self.ensure_compute_tools()
 
     def build_base_system_prompt(self) -> list[dict[str, str]]:
@@ -799,6 +876,17 @@ class MinAgent:
         if new:
             self.register_tool_schemas(new)
 
+    def _unregister(self, name: str) -> None:
+        """Drop one tool from the catalogue.
+
+        Needed because a subagent module's tools are registered the moment it
+        is written, and a deleted module must not leave its schemas behind: the
+        model would keep seeing a tool that no longer has anything behind it.
+        """
+        if name in self._tool_schemas:
+            del self._tool_schemas[name]
+            self.tools = [tool for tool in self.tools if tool["function"]["name"] != name]
+
     def ensure_skill_tools(self) -> None:
         """Expose the skill tools once, even before any skill exists."""
         self._register_missing(create_skill_tools())
@@ -836,6 +924,27 @@ class MinAgent:
     def ensure_vision_tools(self) -> None:
         """Expose the vision tool once, whenever vision is enabled."""
         self._register_missing(create_vision_tools())
+
+    def ensure_input_tools(self) -> None:
+        """Expose the keyboard and mouse tools once, whenever input is enabled.
+
+        They are registered but not callable until the ``input`` capability is
+        loaded, so a session that never touches the desktop does not carry the
+        schemas on every request.
+        """
+        self._register_missing(create_input_tools())
+
+    def ensure_senses_tools(self) -> None:
+        """Expose the camera and microphone tools once, whenever senses are enabled."""
+        self._register_missing(create_senses_tools())
+
+    def ensure_ollama_models_tools(self) -> None:
+        """Expose the model management tools once, whenever they are enabled."""
+        self._register_missing(create_ollama_models_tools())
+
+    def ensure_subagent_tools(self) -> None:
+        """Expose the module writing tools once, whenever they are enabled."""
+        self._register_missing(create_subagent_tools())
 
     def ensure_compute_tools(self) -> None:
         """Expose the GPU tools once, whenever compute is enabled.
@@ -1025,7 +1134,7 @@ class MinAgent:
 
     async def open_memory_store(self) -> list[str]:
         """Open the SQLite memory database, degrading to a warning instead of failing."""
-        store = MemoryStore(self.memory_db_path)
+        store = MemoryStore(self.memory_db_path, embed_model=self.memory_embed_model)
         try:
             await store.initialize()
         except AgentError as error:
@@ -1193,14 +1302,24 @@ class MinAgent:
         try:
             knowledge = await store.recent(12)
             pending = await store.reviewable()
-            answer = await self._ask_about(build_session_prompt(
+            prompt = build_session_prompt(
                 knowledge=knowledge,
                 log=pending,
                 stats=self._session_counters(),
-            ), max_tokens=REFLECTION_MAX_TOKENS)
+            )
+            answer = await self._ask_with_reflection_model(prompt)
             if answer is None:
                 return ""
             hypotheses = parse_hypotheses(answer)
+            if not hypotheses and answer:
+                # Something came back that is not a list of hypotheses: an object
+                # cut off mid-sentence, or a model that answered in prose.
+                # Concluding that the session taught nothing because of an answer
+                # that was not in the requested shape is the one outcome worth
+                # spending a request to avoid - the session model answers the same
+                # prompt in seconds, and this is how a reflection that would have
+                # been thrown away survives.
+                hypotheses = parse_hypotheses(await self._ask_about(prompt) or "")
             if not hypotheses:
                 return ""
             applied: list[str] = []
@@ -1412,7 +1531,12 @@ class MinAgent:
                 self.ui_print_wrapped((("│ ", "magenta", False), (line, "pale", False)))
         self.ui_print_wrapped((("╰─ ", "magenta", False), ("/mejoras now", "muted", False)))
 
-    async def _ask_about(self, messages: list[dict[str, str]], max_tokens: int = REFLECTION_MAX_TOKENS) -> str | None:
+    async def _ask_about(
+        self,
+        messages: list[dict[str, str]],
+        max_tokens: int = REFLECTION_MAX_TOKENS,
+        model: str | None = None,
+    ) -> str | None:
         """One tool-free completion for a judgement, or ``None`` if it cannot be had.
 
         No tools are offered, so a reflection can never call back into the
@@ -1431,15 +1555,26 @@ class MinAgent:
         request answered in 606. The cap bounds a runaway; it does not squeeze
         the answer out, and an answer that is not there is a memory silently
         not written.
+
+        ``model`` asks the same endpoint for a different model on this one
+        request only; ``None`` is the model answering the conversation.
         """
         client = self.open_ai_client
         if client is None:
             return None
+        options: dict[str, Any] = {"max_tokens": max_tokens}
+        if model:
+            options["model"] = model
+        # Switching thinking off is a trick measured on the session model, where
+        # it cut a review from 58 s to 1.5 s for the same verdict. It is not
+        # sent to a different model, because there it is a guess: the one
+        # alternative measured on the real session prompt ignored the requested
+        # object with the flag on and ignored it with the flag off, so nothing
+        # here says what it would do to another model's own thinking.
+        if not model or model == self.model:
+            options["extra_body"] = {"reasoning_effort": "none"}
         try:
-            result = await client.complete(
-                messages,
-                {"max_tokens": max_tokens, "extra_body": {"reasoning_effort": "none"}},
-            )
+            result = await client.complete(messages, options)
         except (AgentError, httpx.HTTPError, OSError):
             return None
         # The client wraps the completion as {"message": ..., "payload": ...};
@@ -1447,6 +1582,69 @@ class MinAgent:
         message = result.get("message")
         content = message.get("content") if isinstance(message, dict) else None
         return content if isinstance(content, str) and content.strip() else None
+
+    async def _ask_with_reflection_model(
+        self, messages: list[dict[str, str]], *, max_tokens: int = REFLECTION_MAX_TOKENS
+    ) -> str | None:
+        """Run one session reflection on ``IMPROVEMENT_MODEL``, swapping the resident model for it.
+
+        This is not just another name in the request, for two measured reasons.
+        The models do not fit together - 5.5 GB of session model plus 5.7 GB of
+        reflection model is 11.2 GB on an 8 GB card - so the session model is
+        unloaded first and put back afterwards whether the answer arrives or
+        not. And the swap only earns its cost if the reflection model is
+        actually better, which is not a given: measured on the prompt this
+        session really sends - 12 memories and 40 log lines, about 18000
+        characters - the 9B answered with usable hypotheses three times out of
+        three and the 12B not once out of four, spending 5 to 20 seconds against
+        7 to 13. So this is empty on this machine, and the setting exists for
+        the case where a bigger model does answer the shape that is asked for.
+
+        The dedicated model is an improvement, not a dependency. If it is not
+        pulled, or the endpoint does not have that name, or the request times
+        out, the same prompt is asked again on the session model, which answers
+        it more weakly but answers it.
+        """
+        model = (self.improvement_model or "").strip()
+        if not model or model == self.model:
+            return await self._ask_about(messages, max_tokens=max_tokens)
+        if model in await ollama_resident_models():
+            # Already on the card, so there is nothing to make room for. Asking
+            # Ollama instead of unloading first matters: the swap would otherwise
+            # evict the very model it is about to use, load it again for the
+            # request, and evict it a second time to put the other one back.
+            return await self._ask_about(messages, max_tokens=max_tokens, model=model)
+        release = await unload_ollama(self.root_directory)
+        answer: str | None = None
+        try:
+            answer = await self._ask_about(messages, max_tokens=max_tokens, model=model)
+        finally:
+            await self._restore_after_reflection(release)
+        if answer is not None:
+            return answer
+        note = f"{model} no respondió; la reflexión se hace con {self.model}."
+        self.ui_print_wrapped(((f"Reflexión: {note}", "muted", False),))
+        return await self._ask_about(messages, max_tokens=max_tokens)
+
+    async def _restore_after_reflection(self, release: VramRelease) -> None:
+        """Leave the card as the session found it: the reflection model gone, the session model warm.
+
+        The order matters. The reflection model is still resident after it
+        answers and it is the larger of the two, so it has to be unloaded before
+        the session model can be loaded back - otherwise the reload lands on a
+        card with no room for it and the session starts cold, paying to load the
+        model that was answering a moment ago.
+
+        Every step here is best effort and reported rather than raised: the
+        reflection already happened, and turning its aftermath into an error
+        would throw away the answer it produced.
+        """
+        await unload_ollama(self.root_directory)
+        if not release.models:
+            return
+        note = await reload_ollama(release.models)
+        if note:
+            self.ui_print_wrapped(((f"Reflexión: {note}", "muted", False),))
 
     # ------------------------------------------------------------ capabilities
 
@@ -1480,6 +1678,10 @@ class MinAgent:
             memory_enabled=self.memory_enabled,
             web_search_enabled=self.web_search_enabled,
             vision_enabled=self.vision_enabled,
+            input_enabled=self.input_enabled,
+            senses_enabled=self.senses_enabled,
+            ollama_models_enabled=self.ollama_models_enabled,
+            subagents_enabled=self.subagents_enabled,
             images_enabled="image" in self.input_modalities,
             compute_enabled=self.compute_enabled,
         )
@@ -2011,6 +2213,238 @@ class MinAgent:
         if not self.vision_enabled or self.vision_client is None:
             raise AgentError("Image reading is not enabled for this session.")
         return self.vision_client
+
+    def _require_input_client(self) -> InputClient:
+        """The active input controller, or an error the model can see and report."""
+        if not self.input_enabled or self.input_client is None:
+            raise AgentError(
+                "Keyboard and mouse control is not enabled for this session. Set INPUT_ENABLED=on to use it."
+            )
+        return self.input_client
+
+    async def run_press_keys(self, args: dict[str, Any]) -> str:
+        """Press a key combination on the real keyboard."""
+        keys = args.get("keys")
+        if not isinstance(keys, str) or not keys.strip():
+            raise AgentError("press_keys requires a key combination, e.g. ctrl+shift+t.")
+        return await self._require_input_client().key(keys)
+
+    async def run_type_text(self, args: dict[str, Any]) -> str:
+        """Type a string into whatever currently has keyboard focus."""
+        text = args.get("text")
+        if not isinstance(text, str) or not text:
+            raise AgentError("type_text requires some text.")
+        return await self._require_input_client().type_text(text)
+
+    async def run_move_mouse(self, args: dict[str, Any]) -> str:
+        """Move the pointer, absolutely unless the model asked for an offset."""
+        x = args.get("x")
+        y = args.get("y")
+        if not isinstance(x, int) or not isinstance(y, int):
+            raise AgentError("move_mouse requires integer x and y coordinates.")
+        relative = bool(args.get("relative", False))
+        return await self._require_input_client().move_mouse(x, y, relative=relative)
+
+    async def run_click_mouse(self, args: dict[str, Any]) -> str:
+        """Click a mouse button once or twice."""
+        button = str(args.get("button") or "left")
+        count = _as_int(args.get("count", 1), 1, "count")
+        return await self._require_input_client().click(button, count)
+
+    async def run_scroll_screen(self, args: dict[str, Any]) -> str:
+        """Scroll the focused window, which on this desktop means by key."""
+        direction = str(args.get("direction") or "down")
+        amount = _as_int(args.get("amount", 1), 1, "amount")
+        return await self._require_input_client().scroll(direction, amount)
+
+    async def run_mouse_button_down(self, args: dict[str, Any]) -> str:
+        """Hold a mouse button down for a drag."""
+        return await self._require_input_client().mouse_button_down(str(args.get("button") or "left"))
+
+    async def run_mouse_button_up(self, args: dict[str, Any]) -> str:
+        """Release a mouse button held earlier."""
+        return await self._require_input_client().mouse_button_up(str(args.get("button") or "left"))
+
+    def _require_senses_client(self) -> SensesClient:
+        """The active senses client, or an error the model can see and report."""
+        if not self.senses_enabled or self.senses_client is None:
+            raise AgentError("Camera and microphone are not enabled. Set SENSES_ENABLED=on to use them.")
+        return self.senses_client
+
+    async def run_capture_camera(self, args: dict[str, Any]) -> str:
+        """Take one photo with the webcam, on request only."""
+        path, note = await self._require_senses_client().capture_frame(
+            str(args.get("name") or "camara")
+        )
+        return f"Photo saved to {path}.{note} Read it with view_image or describe_image."
+
+    async def run_record_microphone(self, args: dict[str, Any]) -> str:
+        """Record a short clip, on request only, and transcribe it.
+
+        Transcribing here rather than making the model call transcribe_audio
+        afterwards is the point: the recording was made to be read, and handing
+        back a path means the words arrive a turn later, or never. The file is
+        still named, because a transcript the user cannot check against the
+        audio is only a claim.
+        """
+        path = await self._require_senses_client().record_audio(
+            _as_int(args.get("seconds", 30), 30, "seconds"), str(args.get("name") or "micro")
+        )
+        relative = self.relative_to_workspace(str(path))
+        if not args.get("transcribe", True):
+            return f"Recording saved to {relative}. Pass the path to transcribe_audio to get the text."
+        if not self.compute_enabled or self.orchestrator is None:
+            return (
+                f"Recording saved to {relative}, but it was not transcribed: the local speech engine "
+                "is off. Set COMPUTE_ENABLED=on to have record_microphone return the words, or pass "
+                f"the path to transcribe_audio once it is on. The audio is still there: {relative}."
+            )
+        text = await self.orchestrator.transcribe(str(path), str(args.get("language", "")))
+        if not text.strip():
+            return (
+                f"Recording saved to {relative}, but the speech engine found no words in it. It may "
+                "have been silence, or speech too quiet to hear. The audio is still there."
+            )
+        return f"Recording saved to {relative}.\n\nTranscript:\n{text.strip()}"
+
+    def _require_models_client(self) -> OllamaModelsClient:
+        """The active models client, or an error the model can see and report."""
+        if not self.ollama_models_enabled or self.ollama_models_client is None:
+            raise AgentError(
+                "Model management is not enabled. Set OLLAMA_MODELS_ENABLED=on to use it."
+            )
+        return self.ollama_models_client
+
+    async def run_list_models(self, args: dict[str, Any]) -> str:
+        """List the models this machine holds."""
+        return format_models_table(await self._require_models_client().list_models())
+
+    async def run_show_model(self, args: dict[str, Any]) -> str:
+        """Read one model in detail."""
+        name = args.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise AgentError("show_model requires a model name.")
+        return format_model_detail(await self._require_models_client().show_model(name))
+
+    async def run_create_model(self, args: dict[str, Any]) -> str:
+        """Create a derived model with its own system prompt."""
+        client = self._require_models_client()
+        name = str(args.get("name") or "")
+        created = await client.create_model(
+            name,
+            str(args.get("base") or ""),
+            str(args.get("system") or ""),
+            str(args.get("parameters") or ""),
+        )
+        return (
+            f"Created {created}. It holds no weights of its own: it points at "
+            f"{args.get('base')} and carries the prompt, so it costs kilobytes and shares the "
+            "base's memory. Use it with OPENAI_MODEL, or by naming it in a request."
+        )
+
+    async def run_delete_model(self, args: dict[str, Any]) -> str:
+        """Delete a model, permanently."""
+        name = args.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise AgentError("delete_model requires a model name.")
+        removed = await self._require_models_client().delete_model(name)
+        return f"Deleted {removed} and its weights. This cannot be undone."
+
+    async def run_hardware_report(self, args: dict[str, Any]) -> str:
+        """Report what this machine's GPU can actually run."""
+        return await self._require_models_client().report_hardware(self.root_directory)
+
+    def _require_subagent_store(self) -> SubagentStore:
+        """The active module store, or an error the model can see and report."""
+        if not self.subagents_enabled or self.subagent_store is None:
+            raise AgentError("Writing modules is not enabled. Set SUBAGENTS_ENABLED=on to use it.")
+        return self.subagent_store
+
+    async def run_write_module(self, args: dict[str, Any]) -> str:
+        """Write a capability module the agent can load from now on.
+
+        A durable module is always confirmed first, for the same reason an MCP
+        server is: the file it writes runs on this machine with the user's
+        permissions, and a git branch is a place the change can be read, not a
+        barrier that stops it running. An ephemeral one never reaches the
+        repository, so it is not worth interrupting the user for.
+        """
+        store = self._require_subagent_store()
+        name = str(args.get("name") or "")
+        source = args.get("source")
+        if not isinstance(source, str) or not source.strip():
+            raise AgentError("write_module requires the module source.")
+        ephemeral = bool(args.get("ephemeral", False))
+        if not ephemeral:
+            preview = approval_preview(args, MODULE_APPROVAL_PREVIEW_CHARS)
+            if "[preview truncated]" in preview:
+                raise AgentError(
+                    f"The module source exceeds the {MODULE_APPROVAL_PREVIEW_CHARS} character "
+                    "approval preview; nothing was written. Shorten it, or write it as a workspace "
+                    "file and make the module read that file."
+                )
+            if self.editor is None:
+                raise AgentError(
+                    "Cannot ask for approval outside the interactive terminal, so no durable module "
+                    "was written. Use ephemeral=true to keep one in memory for this session instead."
+                )
+            self.print("")
+            self.ui_print_wrapped(
+                (
+                    ("Capability module requested ", "warning", True),
+                    (name or "unnamed", "pale", False),
+                    (f" -> branch {BRANCH_PREFIX}{name}", "muted", False),
+                )
+            )
+            self.ui_print_wrapped(
+                (("Source ", "muted", False), (preview, "pale", False))
+            )
+            self.ui_print_wrapped(
+                (("This is Python the agent wrote. It will run on your machine. ", "muted", False),)
+            )
+            answer = await self.editor.question("Write this module? [y/N] ")
+            if answer.strip().lower() not in ("y", "yes"):
+                return (
+                    f"Module {name} denied by the user; nothing was written and no branch was made. "
+                    "An ephemeral module (ephemeral=true) needs no approval if they want it."
+                )
+        module = store.create(name, source, ephemeral=ephemeral)
+        where = (
+            "memory only, dropped when it stops being used"
+            if ephemeral
+            else f"branch {BRANCH_PREFIX}{name}"
+        )
+        tools = ", ".join(tool["function"]["name"] for tool in module.tools)
+        self._register_missing(module.tools)
+        return (
+            f"Wrote module {name} ({where}). It offers: {tools}. Say this to the user plainly: it is "
+            "Python this agent wrote, running on their machine."
+        )
+
+    async def run_list_modules(self, args: dict[str, Any]) -> str:
+        """List the modules written this session."""
+        return self._require_subagent_store().list_modules()
+
+    async def run_delete_module(self, args: dict[str, Any]) -> str:
+        """Remove a module from the catalogue and unregister its tools."""
+        name = args.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise AgentError("delete_module requires a module name.")
+        store = self._require_subagent_store()
+        module = store.get(name)
+        removed = store.delete(name)
+        for tool in module.tools:
+            self._unregister(tool["function"]["name"])
+        return f"Removed module {removed}."
+
+    async def run_module_template(self, args: dict[str, Any]) -> str:
+        """Hand back a minimal module to copy."""
+        name = str(args.get("name") or "mi_modulo")
+        summary = str(args.get("summary") or "")
+        return render_template(
+            name, summary, f"{name}_run" if not name.endswith("_run") else f"{name}_tool",
+            f"Placeholder tool from the {name} module. Replace it with the real work.",
+        )
 
     async def run_download_file(self, args: dict[str, Any]) -> str:
         """Fetch a URL into salida/, which is the only place a download may land."""
@@ -2589,6 +3023,42 @@ class MinAgent:
             return await self.run_web_fetch(args)
         if name == "describe_image":
             return await self.run_describe_image(args)
+        if name == "press_keys":
+            return await self.run_press_keys(args)
+        if name == "type_text":
+            return await self.run_type_text(args)
+        if name == "move_mouse":
+            return await self.run_move_mouse(args)
+        if name == "click_mouse":
+            return await self.run_click_mouse(args)
+        if name == "scroll_screen":
+            return await self.run_scroll_screen(args)
+        if name == "mouse_button_down":
+            return await self.run_mouse_button_down(args)
+        if name == "mouse_button_up":
+            return await self.run_mouse_button_up(args)
+        if name == "capture_camera":
+            return await self.run_capture_camera(args)
+        if name == "record_microphone":
+            return await self.run_record_microphone(args)
+        if name == "list_models":
+            return await self.run_list_models(args)
+        if name == "show_model":
+            return await self.run_show_model(args)
+        if name == "create_model":
+            return await self.run_create_model(args)
+        if name == "delete_model":
+            return await self.run_delete_model(args)
+        if name == "hardware_report":
+            return await self.run_hardware_report(args)
+        if name == "write_module":
+            return await self.run_write_module(args)
+        if name == "list_modules":
+            return await self.run_list_modules(args)
+        if name == "delete_module":
+            return await self.run_delete_module(args)
+        if name == "module_template":
+            return await self.run_module_template(args)
         if name == SPEAK_TOOL_NAME:
             return await self.run_speak_text(args)
         if name == TRANSCRIBE_TOOL_NAME:

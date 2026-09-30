@@ -278,9 +278,11 @@ class Config:
     memory_direct_answer: bool
     memory_eureka: bool
     memory_reflection_interval: int
+    memory_embed_model: str
     improvement_enabled: bool
     improvement_auto: bool
     improvement_interval: int
+    improvement_model: str
     web_search_enabled: bool
     ollama_api_key: str | None
     web_search_base_url: str
@@ -289,6 +291,18 @@ class Config:
     vision_model: str
     vision_base_url: str
     vision_timeout_seconds: int
+    input_enabled: bool
+    senses_enabled: bool
+    camera_device: str
+    camera_max_frames: int
+    microphone_device: str
+    microphone_max_seconds: int
+    ollama_models_enabled: bool
+    ollama_models_base_url: str
+    ollama_models_timeout_seconds: int
+    subagents_enabled: bool
+    subagents_directory: str
+    subagents_max_ephemeral: int
     on_demand_images: bool
     compute_enabled: bool
     compute_vram_total_mib: int
@@ -419,6 +433,15 @@ def load_configuration(
         memory_reflection_interval=parse_positive_integer(
             environment.get("MEMORY_REFLECTION_INTERVAL"), "MEMORY_REFLECTION_INTERVAL", 10
         ),
+        # Empty by default: the store then compares memories by their words
+        # alone, which is what it did before and needs no model installed.
+        memory_embed_model=(environment.get("MEMORY_EMBED_MODEL") or "").strip(),
+        # Also empty by default, and for a sharper reason: a reflection model
+        # large enough to beat the session one does not fit in VRAM beside it, so
+        # naming one here means the session model is unloaded for every
+        # reflection and loaded back after. That trade is measured, but it is the
+        # user's card and their call - see the README for the numbers.
+        improvement_model=(environment.get("IMPROVEMENT_MODEL") or "").strip(),
         memory_direct_answer=parse_boolean_setting(
             environment.get("MEMORY_DIRECT_ANSWER"), "MEMORY_DIRECT_ANSWER", True
         ),
@@ -436,6 +459,30 @@ def load_configuration(
         .strip()
         .rstrip("/"),
         vision_timeout_seconds=vision_timeout_seconds,
+        input_enabled=parse_boolean_setting(environment.get("INPUT_ENABLED"), "INPUT_ENABLED", False),
+        senses_enabled=parse_boolean_setting(environment.get("SENSES_ENABLED"), "SENSES_ENABLED", False),
+        camera_device=(environment.get("CAMERA_DEVICE") or "/dev/video0").strip(),
+        camera_max_frames=parse_positive_integer(environment.get("CAMERA_MAX_FRAMES"), "CAMERA_MAX_FRAMES", 8),
+        microphone_device=(environment.get("MICROPHONE_DEVICE") or "").strip(),
+        microphone_max_seconds=parse_positive_integer(
+            environment.get("MICROPHONE_MAX_SECONDS"), "MICROPHONE_MAX_SECONDS", 30
+        ),
+        ollama_models_enabled=parse_boolean_setting(
+            environment.get("OLLAMA_MODELS_ENABLED"), "OLLAMA_MODELS_ENABLED", False
+        ),
+        ollama_models_base_url=(
+            environment.get("OLLAMA_MODELS_BASE_URL") or "http://localhost:11434"
+        ).strip().rstrip("/"),
+        ollama_models_timeout_seconds=parse_positive_integer(
+            environment.get("OLLAMA_MODELS_TIMEOUT_SECONDS"), "OLLAMA_MODELS_TIMEOUT_SECONDS", 300
+        ),
+        subagents_enabled=parse_boolean_setting(
+            environment.get("SUBAGENTS_ENABLED"), "SUBAGENTS_ENABLED", False
+        ),
+        subagents_directory=(environment.get("SUBAGENTS_DIRECTORY") or ".minagent/subagents").strip(),
+        subagents_max_ephemeral=parse_positive_integer(
+            environment.get("SUBAGENTS_MAX_EPHEMERAL"), "SUBAGENTS_MAX_EPHEMERAL", 4
+        ),
         on_demand_images=parse_on_demand_images(environment.get("IMAGE_INPUT_MODE")),
         compute_enabled=parse_boolean_setting(
             environment.get("COMPUTE_ENABLED"), "COMPUTE_ENABLED", False

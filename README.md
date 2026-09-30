@@ -59,12 +59,18 @@ WEB_SEARCH_ENABLED=off
 
 `OPENAI_MODEL` is required. `OPENAI_BASE_URL` defaults to `https://api.openai.com/v1` and is normalized to the `/chat/completions` endpoint. `OPENAI_API_KEY` is optional. `OPENAI_TIMEOUT_SECONDS`, `MCP_TIMEOUT_SECONDS`, and `TERMINAL_TIMEOUT_SECONDS` are positive integers in seconds and default to `420` (seven minutes); they bound one endpoint request, one MCP request, and one shell command respectively. `MAX_TOOL_ROUNDS` is a positive integer bounding how many tool-call rounds one turn may run before stopping, and defaults to `64`. `TOOL_PREVIEW_CHARS` is a positive integer bounding the inline preview of an oversized tool result, and defaults to `12000`. `TOOL_RESULT_KEEP` is a positive integer bounding how many recent tool results stay verbatim in the transcript, and defaults to `3`. `CAPABILITY_IDLE_TURNS` is how many turns a loaded capability survives unused before its tools leave the prompt again, and defaults to `2`; `0` keeps everything loaded for the whole conversation. `CONTEXT_HIGH_WATERMARK` and `CONTEXT_LOW_WATERMARK` are the shares of the window at which the context governor starts giving things up and gives them back, and default to `75%` and `55%`; both accept `75%`, `0.75`, or `75`, and the low mark must leave room below the high one.
 
+The last four are grouped because they are the capabilities that reach outside the workspace: the desktop, the camera and microphone, the model server, and the agent's own code. All four are off unless a `.env` turns them on, and each is gated again at the point of use, so a session that did not enable one refuses the call rather than working quietly.
+
 Boolean settings use only `on` and `off`:
 
 - `OPENAI_SHOW_REASONING=on` displays the reasoning channel as muted gray text while it streams. `off` keeps the regular `Processing...` indicator. The endpoint may send that channel as `choices[0].delta.reasoning_content` (llama.cpp), `choices[0].delta.reasoning_summary` (some gateways) or `choices[0].delta.reasoning` (Ollama's OpenAI-compatible surface); all three are read. This is not cosmetic: a thinking model that answers only in that channel would otherwise look like an endpoint that returned nothing.
+- `INPUT_ENABLED=on` lets the agent move the pointer, click, scroll, and type. See [Desktop control](#desktop-control-keyboard-and-mouse). Off by default.
+- `SENSES_ENABLED=on` lets the agent use the webcam and microphone, on request only. See [Camera and microphone](#camera-and-microphone). Off by default.
+- `OLLAMA_MODELS_ENABLED=on` lets the agent manage the local Ollama models. See [Managing local models](#managing-local-models). Off by default.
+- `SUBAGENTS_ENABLED=on` lets the agent write its own capability modules. Durable ones need terminal approval. See [Writing its own capabilities](#writing-its-own-capabilities). Off by default.
 - `SKILLS_ENABLED=on` loads local skills. The default is `off`.
 - `MCP_ENABLED=on` loads configured MCP servers. The default is `off`.
-- `MEMORY_ENABLED=on` loads MinAgent's persistent SQLite memory, which recalls what already worked and records what works. The default is `off`. `MEMORY_DB_PATH` overrides the database location; the default is `.agents/memory/memoria.db` in the MinAgent project directory. `MEMORY_DIRECT_ANSWER=off` stops MinAgent from answering a known request straight from memory; the default is `on`.
+- `MEMORY_ENABLED=on` loads MinAgent's persistent SQLite memory, which recalls what already worked and records what works. The default is `off`. `MEMORY_DB_PATH` overrides the database location; the default is `.agents/memory/memoria.db` in the MinAgent project directory. `MEMORY_DIRECT_ANSWER=off` stops MinAgent from answering a known request straight from memory; the default is `on`. `MEMORY_EMBED_MODEL=nomic-embed-text` also compares stored memories by meaning, not only by shared words, and is `off` when empty.
 - `WEB_SEARCH_ENABLED=on` lets the model search the web and fetch pages through Ollama's hosted API. The default is `off`. It requires `OLLAMA_API_KEY` (an Ollama account key). `WEB_SEARCH_BASE_URL` defaults to `https://ollama.com/api` and `WEB_SEARCH_TIMEOUT_SECONDS` to `120`.
 
 For llama.cpp, use `--reasoning-format deepseek` when the model template does not automatically emit a separate `reasoning_content` channel. MinAgent displays that channel as progress text and keeps the final answer in its normal response presentation.
@@ -269,6 +275,16 @@ That automatic capture is a faithful log and a poor memory: most turns are a que
 
 None of the three can fail a turn. The reply is already on screen by the time they run, so a reflection that fails costs a memory that was not written and never an error the user has to see.
 
+### One memory said twice
+
+Two memories that say the same thing are one memory said twice, and storing it twice fills the hint block with one answer in two voices and makes both look weaker than they are. The store merges on the content, not the title - the model invents its own title each time - and only for the knowledge kinds; the log of what was done is never merged, because two turns can look alike and still be two things that happened.
+
+By default the comparison is lexical: whole words, technical identifiers counted once rather than as their parts, and a floor on how many distinctive words two memories must share before the ratios mean anything. That catches a paraphrase and leaves a near neighbour on the same subject alone, which is the whole job.
+
+`MEMORY_EMBED_MODEL=nomic-embed-text` adds a second opinion from an embedding model on your Ollama, for the paraphrase that shares almost no words with what is stored. It is asked only about stored memories that share at least one distinctive word with the new one, and only about texts it has not embedded yet this session, so a save costs one fast request at worst. On a Spanish store the numbers are: a restatement of a stored memory scores 0.89 to 0.96, two different memories on the same subject 0.52, two on adjacent subjects 0.65, and the closest pair of genuinely different memories in the store 0.79 - so the bar sits at 0.80, above the worst real pair and below every measured duplicate.
+
+The check can only ever *add* a merge. Below the bar the words decide, so a model that is not pulled, not running, or unsure costs one duplicate memory and nothing else; the store falls back to comparing words and stops asking. Two limits are worth knowing: it stays quiet on memories too short to tell apart (a one-line restatement scores the same 0.69 as a different fact on a different subject, and it declines to guess), and it does not fix the case the lexical rules miss either - the same fact in two languages, which an English-trained model reads as a near neighbour at 0.66.
+
 ### Improving itself
 
 Knowing things is not the same as acting on them. `IMPROVEMENT_ENABLED=on` adds a reflection that asks what the session *implies*: a session where the same job was refused four times is not four facts, it is a hypothesis about a setting that is too tight. It runs when a session ends with `/new` - the one moment the whole arc is available, and the last one - and every `IMPROVEMENT_INTERVAL` reviews (10 by default) so a trend is caught before it costs a whole session.
@@ -284,6 +300,10 @@ Five rules decide whether a proposal becomes a change, and each exists because r
 - **Bounded and nudged.** A value outside its range is refused, and so is a move of more than half the allowed span, which is a different setting wearing the same name.
 - **One move per setting per day.** Without it, a hypothesis that is wrong in one direction gets corrected by the next one in the other, forever, with both looking supported.
 - **An observation moves nothing.** Measured against this model: asked to reflect on a session where a render hit the time limit, it noticed that "renders take longer than the timeout" - an insight - and proposed a *shorter* timeout, the opposite of its own evidence. The bounds would have contained that damage, not prevented it.
+
+`IMPROVEMENT_MODEL` runs the reflection on a different model of the same endpoint. It is empty by default, and that is a measurement rather than an omission: against the prompt a real session sends - 12 memories and 40 log lines, about 18000 characters - the 9B answered with hypotheses that could be parsed three times out of three, and `gemma4:12b-q3km`, which had looked better on a short curated prompt, answered in prose zero times out of four. A comparison on 900 characters of material does not transfer to 18000, which is why the number is worth having.
+
+Naming a model is also not free on a card where the two do not fit together: the session model is unloaded for the pass and loaded back afterwards, whether the answer arrives or not, and an already-resident reflection model is left alone rather than cycled. An answer that is not in the requested shape is asked again on the session model before the pass is given up on, and a model that cannot answer at all is not an error - the session model answers the same prompt more weakly but answers it.
 
 What the guards cannot do is check that a number moves in the right direction. Every value in range is survivable, which is what the bounds are for, but the reason a change is defensible is the evidence in the document, not the number in the file. Source code is deliberately not in the set: an agent that rewrites itself has no way to notice that it made things worse.
 
@@ -315,10 +335,59 @@ When `WEB_SEARCH_ENABLED=on` and `OLLAMA_API_KEY` is set, the model can reach th
 
 Web results are untrusted data: the tool descriptions and the prompt say so, and fetched content is bounded to 24 KiB per call. Requests go to `WEB_SEARCH_BASE_URL` (default `https://ollama.com/api`) with your `OLLAMA_API_KEY` and time out after `WEB_SEARCH_TIMEOUT_SECONDS` (default 120).
 
+## Desktop control: keyboard and mouse
+
+When `INPUT_ENABLED=on` the agent can drive the desktop: move the pointer, click, double-click, hold a button for a drag, turn the wheel, press key combinations, and type.
+
+It goes through `ydotool`, writing to `/dev/uinput`, and **not** through `pyautogui`. That is not a preference. A KDE session here is Wayland, `pyautogui` speaks Xlib and sees an empty display, and `xdotool` can only reach XWayland clients, which on a modern desktop means not the native windows at all. `ydotool` events come from a kernel device, so the compositor cannot tell which client sent them and every window receives them. Install it once:
+
+```bash
+sudo pacman -S ydotool
+systemctl --user enable --now ydotoold   # or the unit this project installs
+```
+
+Without `ydotoold` running, every command fails with `failed to connect socket`; that daemon is not optional.
+
+Two things about this desktop are worth knowing. Nothing can ask a window what is under a coordinate — the pointer position is the only address there is — so the pattern is: take a screenshot, move the pointer, click, screenshot again. And the wheel is a relative count, so a scroll down sends a negative number behind a `--` separator, without which it is read as an unknown flag and scrolls nothing.
+
+`INPUT_ENABLED` is off by default, because this is the one capability that moves the real pointer and presses real keys.
+
+## Camera and microphone
+
+When `SENSES_ENABLED=on` the agent can take a photo with the webcam (`capture_camera`) and record from the microphone (`record_microphone`). `CAMERA_DEVICE` selects the device (default `/dev/video0`) and `MICROPHONE_MAX_SECONDS` bounds a recording.
+
+Both are read **only when a tool is called**, and both write an ordinary file into `salida/`, so a frame is something to look at with `view_image` and a recording is something `transcribe_audio` can read. A camera that runs while the session is idle would turn a local tool into a surveillance device; this one does not.
+
+`record_microphone` returns the transcript as well as the path, because the recording was made to be read. That needs the local speech engine, so it also needs `COMPUTE_ENABLED=on`; without it the tool says so plainly and hands back the audio rather than pretending to have heard anything. An empty transcript is reported as silence, not as a failure.
+
+Both devices can be held by another program, usually a video call, and on Wayland that is exclusive. `ffmpeg` says so rather than returning a blank frame. A frame that comes out nearly black is called out too: more exposure time does not fix a dark room, and handing a model a black JPEG just produces a confident description of darkness.
+
+## Managing local models
+
+When `OLLAMA_MODELS_ENABLED=on` the agent can list what the local Ollama server holds (`list_models`), read one in detail (`show_model`), create a derived model with its own system prompt (`create_model`), delete one (`delete_model`), and report what the machine can run (`hardware_report`).
+
+`create_model` is Ollama's `/api/create`: a derived model points at a base that is already installed and carries a prompt, parameters, and template of its own. **No weights are copied.** That is what makes role-specific models cheap - a dozen of them cost kilobytes between them, share one base's memory, and only one is ever resident on the card at a time. It is the curl from the Ollama docs, with the base and the name validated first, because a model name becomes a directory and a derived model whose base is missing fails at the first request rather than at creation.
+
+`hardware_report` answers "can this machine run it" from `nvidia-smi` and from the server's own view of what is resident. It deliberately prefers the measured VRAM footprint over the size on disk: on an 8 GB card this project's 6.14 GB model holds 5.11 GB resident, so a check built on the file size would refuse a model that is running. For a model that is not resident, the disk figure is reported as an upper bound rather than as an answer, because the card footprint is smaller and a definite "does not fit" would be wrong.
+
+`delete_model` is permanent. The server has no undo.
+
+## Writing its own capabilities
+
+When `SUBAGENTS_ENABLED=on` the agent can write a module for itself: a Python file defining `create_tools()`, the same shape the built-in capabilities use. It is loaded like any built-in, and its tools are called the same way.
+
+**A durable module is confirmed in the terminal before anything is written**, and that is not ceremony. The file is Python the model wrote, and it runs on this machine with the user's permissions. This is the same reasoning that already gates authoring an MCP server. A git branch per module is where the change can be read before it matters - it is a review point, not a barrier, and nothing about a branch stops code from running. The module source is shown in the approval, and a module too long to show is refused rather than truncated, because approving the first 8000 characters of code that then runs is a guess, not an approval.
+
+`ephemeral=true` writes nothing to the repository and needs no approval, which makes it the right choice for a helper needed this turn. Ephemeral modules are capped at `SUBAGENTS_MAX_EPHEMERAL` and dropped, so a store that only grows never ends up taxing the context window. `module_template` hands back a minimal working module so the first one is a copy rather than a guess.
+
 ## Project layout
 
 - `src/minagent/app.py`: TUI, conversation loop, tool dispatch, and commands.
 - `src/minagent/attachments.py` and `src/minagent/image.py`: file attachments and image handling.
+- `src/minagent/input.py`: keyboard and mouse control through ydotool on Wayland.
+- `src/minagent/senses.py`: on-demand camera capture and microphone recording.
+- `src/minagent/ollama_models.py`: listing, inspecting, creating, and deleting local models.
+- `src/minagent/subagents.py`: agent-written capability modules, durable or ephemeral.
 - `src/minagent/images.py`: the `view_image` tool, which turns a path into pixels on request.
 - `src/minagent/download.py`: the `download_file` tool and the `salida/` destination rule.
 - `src/minagent/markdown_terminal.py` and `src/minagent/terminal_text.py`: streaming Markdown and terminal text layout.
