@@ -116,7 +116,10 @@ def test_a_music_refusal_does_not_suggest_changing_video_settings(tmp_path: Path
     with pytest.raises(AgentError) as failure:
         orchestrator.require_headroom("Music generation", 3200)
     message = str(failure.value)
-    assert "'music' model" in message
+    # "shorter duration" and not merely "music": advice has to be something the
+    # caller can actually act on. Naming a model that is not on offer would send
+    # them to a choice that does not exist.
+    assert "shorter duration" in message
     assert "frames" not in message
 
 
@@ -248,7 +251,7 @@ def test_only_the_lightest_music_model_fits_alongside_voice(tmp_path: Path) -> N
     """The default has to be the one that runs, not the one that sounds best."""
     from minagent.compute import MUSIC_VRAM_ESTIMATE_MIB
 
-    assert min(MUSIC_VRAM_ESTIMATE_MIB, key=lambda name: MUSIC_VRAM_ESTIMATE_MIB[name]) == "music"
+    assert min(MUSIC_VRAM_ESTIMATE_MIB, key=lambda name: MUSIC_VRAM_ESTIMATE_MIB[name]) == "small"
     assert estimate_video_vram(49, "sequential") < estimate_video_vram(49, "group")
 
 

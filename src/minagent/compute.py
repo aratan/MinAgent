@@ -131,12 +131,13 @@ under-counts does not fail the check - it fails later, as an OOM in the middle
 of a multi-minute render, which costs far more than a refused call.
 """
 
-MUSIC_VRAM_ESTIMATE_MIB = {"music": 3200, "base": 4600, "full": 6200}
-"""VRAM an AudioLDM2 job needs per model size, in MiB.
+MUSIC_VRAM_ESTIMATE_MIB = {"small": 2200}
+"""VRAM a music job needs per model, in MiB.
 
-``music`` is the default because it is the one that coexists with the resident
-voice engines; the others carry a Miscellaneous vocoder and are here so the
-refusal can say by how much the card is short rather than just "no".
+``small`` (``facebook/musicgen-small``) is the only entry because it is the only
+one measured here: 1303 MiB peaked on a 5 s clip, rounded up with margin. The
+estimate is checked before the weights load, and a short estimate does not fail
+the check - it fails later as an OOM mid-generation.
 """
 
 DEFAULT_VIDEO_FRAMES = 49
@@ -148,11 +149,11 @@ MAX_MUSIC_SECONDS = 30
 # minutes, which is short enough that a slow render would let the model time out
 # again on its own; an hour is long enough to cover the rest of the session.
 RELOAD_KEEP_ALIVE = "1h"
-"""The measured ceiling on one music job.
+"""The ceiling on one music job.
 
-The duration is the input, not a decode budget: AudioLDM2 denoises the whole
-latent at once, so a 120 s request is not 4x the work of a 30 s one, it is a
-latent that does not fit. Chain clips instead.
+The duration is the input, not a decode budget: MusicGen generates audio tokens
+autoregressively, so a 30 s clip is 1500 tokens against the 250 of a 5 s one.
+Chain clips instead of asking for one long one.
 """
 
 DEFAULT_QUEUE_LIMIT = 8
@@ -449,15 +450,15 @@ class ComputeOrchestrator:
         prompt: str,
         *,
         seconds: int = 10,
-        model: str = "music",
+        model: str = "small",
         name: str = "",
         runner: Any = None,
     ) -> JobRecord:
-        """Generate music with AudioLDM2, alone, after checking it fits.
+        """Generate music with MusicGen, alone, after checking it fits.
 
-        ``music`` is the only size that coexists with the resident voice
-        engines on an 8 GB card, so it is both the default and the reason the
-        larger models are refused with a number rather than attempted.
+        ``small`` is the only size listed because it is the only one measured:
+        1303 MiB peaked on a 5 s clip, so it coexists with the resident voice
+        engines on an 8 GB card.
         """
         text = _require_text(prompt, MUSIC_TOOL_NAME, MAX_PROMPT_CHARS)
         if model not in MUSIC_VRAM_ESTIMATE_MIB:
@@ -521,11 +522,14 @@ class ComputeOrchestrator:
             holders = ", ".join(reading.processes[:3]) or "another process"
             detail += f" {holders} is holding {reading.used_by_others_mib} MiB."
         # The advice has to match the job: telling someone who asked for music
-        # to reduce the frame count sends them off to fix the wrong thing.
+        # to reduce the frame count sends them off to fix the wrong thing. The
+        # model named here is the only one offered, so the advice is to shorten
+        # the clip - naming a second model would send them to a choice that no
+        # longer exists.
         if kind.lower().startswith("music"):
             detail += (
-                " Free it before retrying, or use the 'music' model and a shorter duration; the other "
-                "sizes need more VRAM than this card has free with voice resident."
+                " Free it before retrying, or ask for a shorter duration; the only music model "
+                "needs more VRAM than this card has free with voice resident."
             )
         else:
             detail += (
@@ -610,7 +614,7 @@ class ComputeOrchestrator:
         prompt: str,
         *,
         seconds: int = 10,
-        model: str = "music",
+        model: str = "small",
         name: str = "",
     ) -> str:
         """Queue a music generation and return its job id without waiting."""
@@ -1398,9 +1402,9 @@ def create_compute_tools() -> list[dict[str, Any]]:
             "function": {
                 "name": MUSIC_TOOL_NAME,
                 "description": (
-                    "Generate music or ambience from a text prompt with AudioLDM2 and save a wav in "
-                    "salida/. Heavy, like video: it runs alone, the voice engines stay resident, and it "
-                    "is refused up front when free VRAM is too low."
+                    "Generate music or ambience from a text prompt with MusicGen (facebook/musicgen-small) "
+                    "and save a wav in salida/. Heavy, like video: it runs alone, the voice engines stay "
+                    "resident, and it is refused up front when free VRAM is too low."
                 ),
                 "parameters": {
                     "type": "object",
