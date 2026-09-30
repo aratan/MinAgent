@@ -21,6 +21,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any
 
+from .embeddings import Embedder, cosine
 from .errors import AgentError
 from .reflection import ReviewAction
 
@@ -83,6 +84,45 @@ MIN_SHARED_TOKENS = 2
 # The log of what was done is never merged. Two turns can run the same tools
 # and still be two separate things that happened.
 DEDUPED_KINDS = ("procedure", "solution", "fact", "preference")
+# The vector check catches the restatement that shares no distinctive word with
+# what is already stored, which is exactly the case the rules above miss: two
+# memories about the same fact, phrased from scratch. Calibrated with
+# nomic-embed-text on this project's own store, in Spanish:
+#
+# * a paraphrase of a stored memory scores 0.89, two short ones 0.91, and a
+#   restatement about the same subsystem 0.96;
+# * two different memories on the same subject score 0.52, two on adjacent
+#   subjects 0.65;
+# * and the closest pair of genuinely different memories in the store - a
+#   Himalaya command reference next to a Himalaya read-mail procedure - scores
+#   0.79.
+#
+# 0.80 therefore sits above the worst real pair and below every measured
+# duplicate, and a little below it is where the merging starts eating real
+# memories. It is a narrow gap: it is one number and it is load-bearing, so
+# raising the embedding model's own similarity is the way to widen it, not
+# lowering this.
+#
+# It only ever adds a merge; it never removes one. A cosine below the threshold
+# leaves the decision to the token rules, so a model that is unsure costs one
+# duplicate memory and nothing else. That is also what happens on memories too
+# short to tell apart: a one-line restatement of a one-line memory scores 0.69,
+# the same 0.69 as a different fact about a different subject, and the check
+# stays quiet rather than guessing between them. It pays off on memories with
+# real content, which is what this store holds.
+#
+# The other known limit is the one the token rules have too: the same fact
+# written in two languages. This model was trained on English text and reads a
+# Spanish restatement of an English memory as a near neighbour only at 0.66, so
+# that duplicate survives rather than being wrongly merged.
+DUPLICATE_COSINE = 0.80
+# The gate that decides which stored memories are worth one embedding request.
+# Comparing every row on every save would be a request per memory in the store,
+# so anything sharing no distinctive word with the new text is dropped before any
+# request is made - and that costs nothing, because the measured negatives score
+# zero shared tokens anyway. It is a filter, not a decision: the cosine above
+# still has the final word.
+MIN_CANDIDATE_TOKENS = 1
 
 _QUERY_TOKEN = re.compile(r"[0-9A-Za-z_]{2,}")
 _WORD = re.compile(r"[^a-z0-9]+")
@@ -286,9 +326,12 @@ def _clean_tags(value: Any) -> str:
 class MemoryStore:
     """A local SQLite store of learned procedures, facts, and experiences."""
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, *, embed_model: str = "") -> None:
         self.path = path
         self.fts_enabled = False
+        # Empty model name means no embedding model is configured, and the store
+        # compares words only - the behaviour that works with nothing installed.
+        self.embedder: Embedder | None = Embedder(embed_model) if embed_model.strip() else None
 
     # ---------------------------------------------------------- connections
 
@@ -455,6 +498,12 @@ class MemoryStore:
         cleaned_content = _clean_text(content, MAX_CONTENT_CHARS, "content")
         cleaned_tags = _clean_tags(tags)
         cleaned_source = _compact_whitespace(source)[:MAX_SOURCE_CHARS] if isinstance(source, str) else ""
+        # Asked before the write, not inside it: the comparison is a request to
+        # another model and the database work runs in a thread that has no
+        # business waiting on one.
+        by_meaning = await self._duplicate_by_meaning(
+            cleaned_kind, cleaned_title, cleaned_content, cleaned_tags
+        )
         return await asyncio.to_thread(
             self._remember_sync,
             cleaned_kind,
@@ -462,10 +511,58 @@ class MemoryStore:
             cleaned_content,
             cleaned_tags,
             cleaned_source,
+            by_meaning,
         )
 
+    async def _duplicate_by_meaning(
+        self, kind: str, title: str, content: str, tags: str
+    ) -> int | None:
+        """The id of a memory this one repeats by meaning rather than by wording.
+
+        Two passes, because the request cannot be made from inside the database
+        thread: the cheap lexical scan runs first and only what it leaves
+        standing is sent to the embedding model. Every way this can fail - no
+        model configured, no server, a timeout, a vector of the wrong size -
+        returns ``None``, and the caller then merges on the token rules alone.
+        A comparison that cannot be had costs the store a duplicate memory, and
+        nothing worse.
+        """
+        if self.embedder is None or kind not in DEDUPED_KINDS:
+            return None
+        text = f"{title}\n{content}\n{tags}"
+        candidates = await asyncio.to_thread(self._candidates_sync, kind, text)
+        if not candidates:
+            return None
+        vectors = await self.embedder.embed([text, *(other for _, other in candidates)])
+        if vectors is None or len(vectors) != len(candidates) + 1:
+            return None
+        best: tuple[float, int] | None = None
+        for vector, (identifier, _) in zip(vectors[1:], candidates, strict=True):
+            score = cosine(vectors[0], vector)
+            if score >= DUPLICATE_COSINE and (best is None or score > best[0]):
+                best = (score, identifier)
+        return best[1] if best is not None else None
+
+    def _candidates_sync(self, kind: str, text: str) -> list[tuple[int, str]]:
+        """Stored memories worth one embedding request to compare against."""
+        own = content_tokens(text)
+        if not own:
+            return []
+        placeholders = ",".join("?" for _ in DEDUPED_KINDS)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT id, title, content, tags FROM memories WHERE kind IN ({placeholders})",
+                DEDUPED_KINDS,
+            ).fetchall()
+        candidates: list[tuple[int, str]] = []
+        for row in rows:
+            other = f"{row['title']}\n{row['content']}\n{row['tags']}"
+            if content_tokens(other) & own:
+                candidates.append((row["id"], other))
+        return candidates
+
     def _remember_sync(
-        self, kind: str, title: str, content: str, tags: str, source: str
+        self, kind: str, title: str, content: str, tags: str, source: str, by_meaning: int | None = None
     ) -> dict[str, Any]:
         now = _now()
         key = _title_key(title)
@@ -494,6 +591,16 @@ class MemoryStore:
                     "success_count": existing["success_count"] + 1,
                 }
             duplicate = self._find_duplicate_sync(connection, kind, title, content, tags)
+            if duplicate is None and by_meaning is not None:
+                # The lexical scan is the one that decides when both of them can
+                # answer, so it goes first. This is what a restatement with no
+                # shared word falls through to, and it is re-checked here because
+                # the memory it named may have been culled between the two passes.
+                row = connection.execute(
+                    "SELECT * FROM memories WHERE id = ?", (by_meaning,)
+                ).fetchone()
+                if row is not None and row["kind"] in DEDUPED_KINDS:
+                    duplicate = dict(row)
             if duplicate is not None:
                 # The title is not the identity, the content is. The same lesson
                 # learned twice arrives worded differently - the model invents

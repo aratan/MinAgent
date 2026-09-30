@@ -348,3 +348,147 @@ def test_the_remember_tool_says_when_it_merged_instead_of_saving():
     # Telling the model is the point: it should learn the store already had it.
     assert "already said this" in said
     assert "merged into that one" in said
+
+
+# ------------------------------------------------------- de-duplicar por sentido
+
+# One memory said twice, in words that share a single distinctive token - below
+# the floor the lexical rules need - so only an embedding can see it.
+RESTATED = "Instalar dependencias\nEl agente instala con uv desde pyproject.toml."
+RESTATEMENT = "Puesta al día de librerías\nSe usa uv reading del manifiesto de dependencias."
+# A different fact about a different subject.
+UNRELATED = "Ocupación de la GPU\nllama-server ocupa 5.5 GB de los 8188 MiB de la tarjeta."
+
+
+class _FakeEmbedder:
+    """A stand-in for the embedding model, with a fixed opinion about each text.
+
+    It records what it was asked for, because how many requests a memory write
+    makes is half of whether this feature is worth having at all.
+    """
+
+    def __init__(self, vectors: dict[str, tuple[float, ...]]) -> None:
+        self.vectors = vectors
+        self.calls: list[list[str]] = []
+        self.unavailable = False
+
+    async def embed(self, texts):
+        self.calls.append(list(texts))
+        answered = []
+        for text in texts:
+            # Keyed on the content, which is what the store wraps with a title
+            # and tags before asking.
+            match = next((vector for known, vector in self.vectors.items() if known in text), None)
+            if match is None:
+                return None
+            answered.append(match)
+        return answered
+
+
+# Points 0.95 apart in a two-dimensional space: the same sentence twice.
+SAME_MEANING = {
+    "El agente instala con uv desde pyproject.toml.": (1.0, 0.0),
+    "Se usa uv reading del manifiesto de dependencias.": (0.95, 0.31),
+    "llama-server ocupa 5.5 GB de los 8188 MiB de la tarjeta.": (0.0, 1.0),
+}
+
+
+async def _embedded_store(tmp_path) -> MemoryStore:
+    store = MemoryStore(str(tmp_path / "memory.db"), embed_model="nomic-embed-text")
+    await store.initialize()
+    store.embedder = _FakeEmbedder(SAME_MEANING)
+    return store
+
+
+async def test_a_restatement_the_words_miss_is_merged_by_the_embedding(tmp_path):
+    store = await _embedded_store(tmp_path)
+    first = await store.remember("fact", "Instalar dependencias", RESTATED)
+    # The premise, pinned: the lexical rules alone would have kept these apart.
+    assert not says_the_same_thing(RESTATED, RESTATEMENT)
+
+    again = await store.remember("fact", "Puesta al día de librerías", RESTATEMENT)
+
+    assert again["status"] == "duplicate"
+    assert again["id"] == first["id"]
+    assert len(await store.recent()) == 1
+
+
+async def test_a_different_memory_on_another_subject_is_left_alone(tmp_path):
+    store = await _embedded_store(tmp_path)
+    await store.remember("fact", "Instalar dependencias", RESTATED)
+
+    other = await store.remember("fact", "Ocupación de la GPU", UNRELATED)
+
+    assert other["status"] == "created"
+    assert len(await store.recent()) == 2
+
+
+async def test_the_embedding_model_is_not_asked_about_memories_with_nothing_in_common(tmp_path):
+    store = await _embedded_store(tmp_path)
+    await store.remember("fact", "Instalar dependencias", RESTATED)
+
+    await store.remember("fact", "Ocupación de la GPU", UNRELATED)
+
+    # A request per stored memory on every save is what this gate exists to
+    # avoid: the two texts share no distinctive word, so no request is made.
+    assert store.embedder.calls == []
+
+
+async def test_a_store_with_no_embedding_model_falls_back_to_the_words(tmp_path):
+    store = await _store(tmp_path)
+    first = await store.remember("fact", "Instalar dependencias", RESTATED)
+
+    again = await store.remember("fact", "Puesta al día de librerías", RESTATEMENT)
+
+    assert again["status"] == "created"
+    assert again["id"] != first["id"]
+    assert len(await store.recent()) == 2
+
+
+async def test_an_embedding_model_that_cannot_answer_loses_no_memory(tmp_path):
+    store = await _embedded_store(tmp_path)
+    store.embedder = _FakeEmbedder({})  # a model that is not pulled answers nothing
+    first = await store.remember(
+        "procedure",
+        "Instalar y ejecutar el proyecto",
+        "Las dependencias se instalan con uv pip install y los tests se lanzan con "
+        "uv run pytest -q desde la raíz del repositorio.",
+    )
+
+    # The save succeeds, and the duplicates the words already caught still are.
+    again = await store.remember(
+        "procedure",
+        "Cómo correr la suite",
+        "Usar uv: instalar dependencias con uv pip install y correr la suite con "
+        "uv run pytest -q en la raíz.",
+    )
+    assert again["status"] == "duplicate"
+    assert again["id"] == first["id"]
+    assert len(await store.recent()) == 1
+
+
+async def test_the_log_of_turns_is_never_merged_by_the_embedding_either(tmp_path):
+    store = await _embedded_store(tmp_path)
+    # Two near-identical turns, which is what the raw log is full of.
+    content = "Request: renderizar el vídeo\nTools used: generate_video\nSteps: generate_video(prompt=ciberpunk)"
+    await store.remember("experience", "renderizar el vídeo", content, None, AUTO_CAPTURE_SOURCE)
+    await store.remember("experience", "renderizar el vídeo otra vez", content, None, AUTO_CAPTURE_SOURCE)
+
+    assert len(await store.recent()) == 2
+    assert store.embedder.calls == []
+
+
+def test_the_embedding_model_is_configurable_and_optional(tmp_path):
+    off = load_configuration(str(tmp_path), cwd=str(tmp_path), env={"OPENAI_MODEL": "m"})
+    assert off.memory_embed_model == "" and off.improvement_model == ""
+    on = load_configuration(
+        str(tmp_path),
+        cwd=str(tmp_path),
+        env={
+            "OPENAI_MODEL": "m",
+            "MEMORY_EMBED_MODEL": "nomic-embed-text",
+            "IMPROVEMENT_MODEL": "gemma4:12b-q3km",
+        },
+    )
+    assert on.memory_embed_model == "nomic-embed-text"
+    assert on.improvement_model == "gemma4:12b-q3km"

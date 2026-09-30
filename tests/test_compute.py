@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 import minagent.compute
@@ -908,13 +909,72 @@ async def test_a_job_that_fits_does_not_disturb_a_warm_model(tmp_path: Path) -> 
 async def test_a_reload_that_ollama_refuses_is_reported_not_raised() -> None:
     from minagent.compute import reload_ollama
 
-    # Nothing answers on the default port in the test environment, which is the
-    # same situation as a server that is down: a model that could not be put
-    # back makes the next message slower, and must not throw away a render that
-    # already worked.
-    message = await reload_ollama(["qwen3.5:9b"], seconds=1.0)
+    # A refused reload is the same situation as a server that is down: a model
+    # that could not be put back makes the next message slower, and must not
+    # throw away a render that already worked. The server is stood in for, so
+    # the test cannot reach the real one - on a machine that has the model, a
+    # live call would load it into VRAM to prove a point.
+    message = await reload_ollama(
+        ["qwen3.5:9b"], seconds=1.0, transport=httpx.MockTransport(lambda request: httpx.Response(500))
+    )
     assert "qwen3.5:9b" in message
     assert "on the next request" in message or "on demand" in message
+
+
+async def test_an_embedding_model_is_left_cold_instead_of_reported_as_a_failure() -> None:
+    from minagent.compute import reload_ollama
+
+    # The memory de-duplication loads nomic-embed-text for a few hundred
+    # milliseconds and Ollama keeps it for minutes. Putting it "back" is not a
+    # thing: Ollama answers 400 to a generate request for a model that cannot
+    # generate, and the restore would report a failure nobody can act on.
+    asked: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        asked.append(request.url.path)
+        if request.url.path == "/api/show":
+            return httpx.Response(200, json={"capabilities": ["embedding"]})
+        return httpx.Response(400, json={"error": "does not support generate"})
+
+    message = await reload_ollama(
+        ["nomic-embed-text:latest"], seconds=1.0, transport=httpx.MockTransport(handler)
+    )
+
+    assert message == ""
+    assert asked == ["/api/show"], "it asked Ollama to generate with a model that cannot generate"
+
+
+async def test_a_model_that_generates_is_still_reloaded_after_being_asked_what_it_can_do() -> None:
+    from minagent.compute import reload_ollama
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/show":
+            return httpx.Response(200, json={"capabilities": ["completion", "tools"]})
+        return httpx.Response(200, json={"response": ""})
+
+    message = await reload_ollama(
+        ["qwen3.5:9b-q4_K_M"], seconds=1.0, transport=httpx.MockTransport(handler)
+    )
+
+    assert "qwen3.5:9b-q4_K_M" in message
+
+
+async def test_which_models_ollama_is_holding() -> None:
+    from minagent.compute import ollama_resident_models
+
+    listing = httpx.MockTransport(
+        lambda request: httpx.Response(200, json={"models": [{"name": "gemma4:12b-q3km"}, {"name": "x"}]})
+    )
+    assert await ollama_resident_models(transport=listing) == ["gemma4:12b-q3km", "x"]
+
+    # A server that is not there and a server holding nothing are the same thing
+    # to the caller: nobody is in the way.
+    for broken in (
+        httpx.MockTransport(lambda request: httpx.Response(500)),
+        httpx.MockTransport(lambda request: (_ for _ in ()).throw(httpx.ConnectError("down"))),
+        httpx.MockTransport(lambda request: httpx.Response(200, content=b"not json")),
+    ):
+        assert await ollama_resident_models(seconds=1.0, transport=broken) == []
 
 
 async def test_reloading_nothing_says_nothing() -> None:

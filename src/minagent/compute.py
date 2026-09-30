@@ -1116,7 +1116,63 @@ async def unload_ollama(root_directory: str, seconds: float = 20.0) -> VramRelea
     )
 
 
-async def reload_ollama(models: Sequence[str], seconds: float = 120.0) -> str:
+async def ollama_resident_models(
+    seconds: float = 10.0, transport: httpx.AsyncBaseTransport | None = None
+) -> list[str]:
+    """The names Ollama currently holds in VRAM, or an empty list if it cannot say.
+
+    ``/api/ps`` over the ``ollama ps`` output because this runs inside a live
+    turn, where shelling out is both slower and one more thing that can fail.
+    A server that is not there and a server holding nothing look the same here,
+    and both mean the same thing to the caller: nobody is in the way.
+    """
+    base = ollama_base_url()
+    if base is None:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(seconds), transport=transport) as client:
+            response = await client.get(f"{base}/api/ps")
+        if response.status_code >= 400:
+            return []
+        payload: Any = response.json()
+    except (httpx.HTTPError, OSError, ValueError):
+        return []
+    models = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(models, list):
+        return []
+    return [str(entry.get("name")) for entry in models if isinstance(entry, dict) and entry.get("name")]
+
+
+async def _generates_text(
+    base: str, name: str, seconds: float, transport: httpx.AsyncBaseTransport | None = None
+) -> bool:
+    """Whether a model can be warmed with an empty generation, or ``True`` if unknown.
+
+    An embedding model cannot: Ollama answers HTTP 400 to a generate request for
+    one, and the restore would then report a failure for a model nobody was
+    waiting for - the memory de-duplication loads ``nomic-embed-text`` for a few
+    hundred milliseconds and Ollama keeps it around for minutes. ``/api/show``
+    lists what each model can do, so it is asked before the attempt rather than
+    after the refusal. An answer that cannot be had is treated as yes: the
+    attempt costs one request and reports honestly if it fails.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(seconds), transport=transport) as client:
+            response = await client.post(f"{base}/api/show", json={"model": name})
+        if response.status_code >= 400:
+            return True
+        payload: Any = response.json()
+    except (httpx.HTTPError, OSError, ValueError):
+        return True
+    capabilities = payload.get("capabilities") if isinstance(payload, dict) else None
+    if not isinstance(capabilities, list) or not capabilities:
+        return True
+    return "completion" in capabilities
+
+
+async def reload_ollama(
+    models: Sequence[str], seconds: float = 120.0, transport: httpx.AsyncBaseTransport | None = None
+) -> str:
     """Put back the models a job evicted, so the next request is not the one that pays.
 
     A minimal generation with an empty prompt and a long keep-alive is the
@@ -1130,13 +1186,18 @@ async def reload_ollama(models: Sequence[str], seconds: float = 120.0) -> str:
     """
     if not models:
         return ""
-    base = _ollama_base_url()
+    base = ollama_base_url()
     if base is None:
         return f"Could not reload {', '.join(models)}: no Ollama endpoint is configured."
     reloaded: list[str] = []
     for name in models:
+        if not await _generates_text(base, name, min(seconds, 30.0), transport):
+            # It was a cache, not something the session was using. Leaving it
+            # cold is the correct outcome, and saying so beats reporting a
+            # refusal the user cannot act on.
+            continue
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(seconds)) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(seconds), transport=transport) as client:
                 response = await client.post(
                     f"{base}/api/generate",
                     json={"model": name, "prompt": "", "keep_alive": RELOAD_KEEP_ALIVE},
@@ -1156,10 +1217,14 @@ async def reload_ollama(models: Sequence[str], seconds: float = 120.0) -> str:
                 "reloads it on demand, so the session still works - it will just be slower."
             )
         reloaded.append(name)
+    if not reloaded:
+        # Everything named was a cache rather than a model: nothing to report,
+        # and nothing went wrong.
+        return ""
     return f"Reloaded {', '.join(reloaded)} into VRAM for the next request."
 
 
-def _ollama_base_url() -> str | None:
+def ollama_base_url() -> str | None:
     """The base URL of the local Ollama server, if one is configured."""
     base = (os.environ.get("OLLAMA_API_BASE") or os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434").strip()
     if not base:
