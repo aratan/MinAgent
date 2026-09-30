@@ -141,6 +141,7 @@ from .memory import (
 )
 from .ollama_models import (
     OllamaModelsClient,
+    advise_derivation,
     create_ollama_models_tools,
     format_model_detail,
     format_models_table,
@@ -407,6 +408,8 @@ FILE_TOOL_LABELS = {
         "create_model": "Create model",
         "delete_model": "Delete model",
         "hardware_report": "Hardware report",
+        "should_derive_model": "Should derive model",
+        "push_model": "Push model",
         "write_module": "Write module",
         "list_modules": "List modules",
         "delete_module": "Delete module",
@@ -562,6 +565,7 @@ class MinAgent:
         self.senses_enabled = False
         self.senses_client: SensesClient | None = None
         self.ollama_models_enabled = False
+        self.ollama_push_enabled = False
         self.ollama_models_client: OllamaModelsClient | None = None
         self.subagents_enabled = False
         self.subagent_store: SubagentStore | None = None
@@ -735,6 +739,7 @@ class MinAgent:
         self.input_enabled = config.input_enabled
         self.senses_enabled = config.senses_enabled
         self.ollama_models_enabled = config.ollama_models_enabled
+        self.ollama_push_enabled = config.ollama_push_enabled
         self.subagents_enabled = config.subagents_enabled
         self.compute_enabled = config.compute_enabled
 
@@ -2354,6 +2359,84 @@ class MinAgent:
         """Report what this machine's GPU can actually run."""
         return await self._require_models_client().report_hardware(self.root_directory)
 
+    async def run_should_derive_model(self, args: dict[str, Any]) -> str:
+        """Ask whether a role deserves its own derived model."""
+        client = self._require_models_client()
+        system = args.get("system")
+        if not isinstance(system, str) or not system.strip():
+            raise AgentError("should_derive_model requires the system prompt you would repeat.")
+        return await advise_derivation(
+            client,
+            str(args.get("base") or self.model),
+            system,
+            _as_int(args.get("reuses_per_session", 1), 1, "reuses_per_session"),
+            _as_int(args.get("context_window", self.context_window), self.context_window, "context_window"),
+            str(args.get("needs") or ""),
+        )
+
+    async def run_push_model(self, args: dict[str, Any]) -> str:
+        """Publish a model, after the user confirms where it goes.
+
+        A public push needs the user to type the model's full name, not just
+        "y": publishing to ollama.com is the one thing here that cannot be
+        undone, and a confirmation that costs one extra line of typing is
+        proportionate to that. A private registry host needs only "y".
+        """
+        if not self.ollama_push_enabled:
+            raise AgentError(
+                "Publishing models is off. Set OLLAMA_PUSH_ENABLED=on to allow it."
+            )
+        client = self._require_models_client()
+        name = args.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise AgentError("push_model requires a destination and model name.")
+        destination = client.push_destination(name)
+        is_public = "PUBLIC" in destination
+        total = await client.push_size_estimate(name)
+        self.print("")
+        self.ui_print_wrapped(
+            (
+                ("Publish model requested ", "warning", True),
+                (name, "pale", False),
+            )
+        )
+        self.ui_print_wrapped((("Destination ", "muted", False), (destination, "pale", False)))
+        self.ui_print_wrapped(
+            (
+                ("At most ", "muted", False),
+                (f"{total / (1024**3):.2f} GiB", "pale", False),
+                (
+                    " travels; a derived model shares its base's weights by digest, so if the base is "
+                    "already on the destination this is kilobytes.",
+                    "muted",
+                    False,
+                ),
+            )
+        )
+        if is_public:
+            self.ui_print_wrapped(
+                ((
+                    "This PUBLISHES the model for anyone to pull. It cannot be undone. ", "warning", False
+                ),)
+            )
+            if self.editor is None:
+                raise AgentError(
+                    "Cannot ask for a publishing confirmation outside the interactive terminal. "
+                    "Nothing was sent."
+                )
+            answer = await self.editor.question(f"Type the full name to publish it publicly [{name}]: ")
+            if answer.strip() != name.strip():
+                return "Publish cancelled by the user; nothing was sent."
+        else:
+            if self.editor is None:
+                raise AgentError(
+                    "Cannot ask for approval outside the interactive terminal. Nothing was sent."
+                )
+            answer = await self.editor.question("Push to this private registry? [y/N] ")
+            if answer.strip().lower() not in ("y", "yes"):
+                return "Push cancelled by the user; nothing was sent."
+        return await client.push_model(name)
+
     def _require_subagent_store(self) -> SubagentStore:
         """The active module store, or an error the model can see and report."""
         if not self.subagents_enabled or self.subagent_store is None:
@@ -3051,6 +3134,10 @@ class MinAgent:
             return await self.run_delete_model(args)
         if name == "hardware_report":
             return await self.run_hardware_report(args)
+        if name == "should_derive_model":
+            return await self.run_should_derive_model(args)
+        if name == "push_model":
+            return await self.run_push_model(args)
         if name == "write_module":
             return await self.run_write_module(args)
         if name == "list_modules":

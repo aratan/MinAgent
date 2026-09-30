@@ -67,6 +67,7 @@ Boolean settings use only `on` and `off`:
 - `INPUT_ENABLED=on` lets the agent move the pointer, click, scroll, and type. See [Desktop control](#desktop-control-keyboard-and-mouse). Off by default.
 - `SENSES_ENABLED=on` lets the agent use the webcam and microphone, on request only. See [Camera and microphone](#camera-and-microphone). Off by default.
 - `OLLAMA_MODELS_ENABLED=on` lets the agent manage the local Ollama models. See [Managing local models](#managing-local-models). Off by default.
+- `OLLAMA_PUSH_ENABLED=on` additionally lets the agent publish a model to a registry. The default is `off`, and even on, the client refuses public ollama.com names and every push is confirmed in the terminal. Off by default.
 - `SUBAGENTS_ENABLED=on` lets the agent write its own capability modules. Durable ones need terminal approval. See [Writing its own capabilities](#writing-its-own-capabilities). Off by default.
 - `SKILLS_ENABLED=on` loads local skills. The default is `off`.
 - `MCP_ENABLED=on` loads configured MCP servers. The default is `off`.
@@ -372,6 +373,14 @@ When `OLLAMA_MODELS_ENABLED=on` the agent can list what the local Ollama server 
 
 `delete_model` is permanent. The server has no undo.
 
+`should_derive_model` answers the question that comes before `create_model`: is a derived model worth it, or is restating the prompt each turn cheaper? The deciding cost is the context window. A system prompt repeated in every request occupies the window on every turn - a 600-token role prompt is a real slice of an 8192-token window - while a derived model holds the same prompt in its own config and costs nothing per request. It does that arithmetic in tokens against the window and multiplies by how often the role comes up, and a long prompt used once does not clear the bar. Ask for a `needs` capability and it also checks the base can actually do the thing, because a prompt cannot add a capability: deriving "vision" from a text-only base would produce a model that looks right and fails identically every time, and a base that cannot even be read fails at the first request rather than at creation. When the base is unusable it says so and stops, instead of returning a shrug.
+
+`push_model` publishes a model to a registry, and it is the only tool in this project that sends anything off the machine. It is off unless `OLLAMA_PUSH_ENABLED=on`, and a name with no host - `team/model` - goes to **public ollama.com**, which cannot be undone; `registry.example.com/team/model` is a private registry. The client refuses a public name outright, so the tool is not the way to publish by accident, and what it can do is push to a private registry the user already runs.
+
+Which one you are about to do is stated in plain words before anything is sent: the destination, and at most how many GiB travel. A derived model shares its base's weights by digest, so if the base is already on the destination this is kilobytes rather than gigabytes - the 6.59 GB figure in `/api/tags` is what the model occupies locally, not what a push transfers.
+
+Confirmation is heavier for the irreversible case on purpose. A private registry asks `y`; a public one requires typing the model's full name, because one extra line of typing is proportionate to publishing something nobody can take back. Outside the interactive terminal there is nobody to ask, so the call fails and says that nothing was sent - it never falls back to publishing quietly.
+
 ## Writing its own capabilities
 
 When `SUBAGENTS_ENABLED=on` the agent can write a module for itself: a Python file defining `create_tools()`, the same shape the built-in capabilities use. It is loaded like any built-in, and its tools are called the same way.
@@ -386,7 +395,7 @@ When `SUBAGENTS_ENABLED=on` the agent can write a module for itself: a Python fi
 - `src/minagent/attachments.py` and `src/minagent/image.py`: file attachments and image handling.
 - `src/minagent/input.py`: keyboard and mouse control through ydotool on Wayland.
 - `src/minagent/senses.py`: on-demand camera capture and microphone recording.
-- `src/minagent/ollama_models.py`: listing, inspecting, creating, and deleting local models.
+- `src/minagent/ollama_models.py`: listing, inspecting, creating, deleting, and publishing local models.
 - `src/minagent/subagents.py`: agent-written capability modules, durable or ephemeral.
 - `src/minagent/images.py`: the `view_image` tool, which turns a path into pixels on request.
 - `src/minagent/download.py`: the `download_file` tool and the `salida/` destination rule.

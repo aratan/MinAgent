@@ -1,5 +1,6 @@
 """Ollama model management tests: the requests sent, and what is refused."""
 
+import asyncio
 import json
 
 import httpx
@@ -8,7 +9,9 @@ import pytest
 from minagent.errors import AgentError
 from minagent.ollama_models import (
     OllamaModelsClient,
+    advise_derivation,
     check_model_name,
+    describe_push_destination,
     format_models_table,
     gpu_vram_bytes,
 )
@@ -50,6 +53,123 @@ async def test_listing_reports_size_and_quantisation():
     assert models[0]["quantization"] == "Q4_K_M"
     assert models[0]["vram_bytes"] == 5490081790
     assert models[0]["vram_bytes"] < models[0]["size_bytes"]
+
+
+def test_a_bare_namespace_is_public_and_a_host_is_not():
+    """The two forms are the same words with opposite consequences, and the whole
+    risk of a push is knowing which one the model is about to do."""
+    assert "PUBLIC" in describe_push_destination("aratan/mi-model")
+    assert "PUBLIC" in describe_push_destination("mi-model")
+    assert "PUBLIC" not in describe_push_destination("registry.aratan.dev/mi-model")
+    assert "PUBLIC" not in describe_push_destination("registry.example.com:5000/team/m")
+
+
+def test_a_registry_with_a_port_is_still_a_registry():
+    assert describe_push_destination("registry.example.com:5000/team/m").startswith("private")
+
+
+async def test_pushing_to_a_public_name_is_refused_outright():
+    """A publish the user did not mean to make cannot be undone by deleting the
+    public model afterwards: it is already public by then."""
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("nothing may be sent")
+
+    with pytest.raises(AgentError, match="publishes the model"):
+        await _client(handler).push_model("aratan/mi-model")
+
+
+async def test_pushing_to_a_private_registry_goes_through():
+    sent: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.update(json.loads(request.content))
+        return httpx.Response(200, json={"status": "success"})
+
+    result = await _client(handler).push_model("registry.aratan.dev/mi-model")
+    assert sent["model"] == "registry.aratan.dev/mi-model"
+    assert "private registry" in result
+
+
+# -- when a derived model is worth it ------------------------------------
+
+
+def test_a_prompt_used_once_is_not_worth_a_derived_model():
+    """The deciding cost is context window, and one short prompt barely uses any."""
+    advice = asyncio.run(
+        advise_derivation(
+            _client(lambda r: httpx.Response(200, json={})),
+            "qwen3.5:9b-q4_K_M",
+            "Responde en español.",
+            reuses_per_session=1,
+        )
+    )
+    assert "do not derive" in advice
+
+
+def test_a_long_repeated_prompt_is_worth_deriving_because_of_the_window():
+    prompt = "x" * 2400  # ~600 tokens, 7% of an 8k window
+    advice = asyncio.run(
+        advise_derivation(
+            _client(lambda r: httpx.Response(200, json={})),
+            "qwen3.5:9b-q4_K_M",
+            prompt,
+            reuses_per_session=4,
+        )
+    )
+    assert "derive it" in advice
+    assert "tokens" in advice
+
+
+def test_a_base_missing_a_needed_capability_is_called_out_first():
+    """A prompt cannot give a model a capability it lacks; deriving from the
+    wrong base produces something that looks right and fails the same way."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"capabilities": ["completion"]})
+
+    advice = asyncio.run(
+        advise_derivation(
+            _client(handler),
+            "qwen3.5:9b-q4_K_M",
+            "Describe what you see in this photo. " * 200,
+            reuses_per_session=5,
+            needs="vision",
+        )
+    )
+    assert "does NOT have 'vision'" in advice
+    assert "do not derive yet" in advice
+
+
+def test_a_base_that_cannot_be_read_is_not_recommended_anyway():
+    """create_model does not verify the base exists, and the failure lands at the
+    first request rather than at creation, so an unreadable base stops the advice."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"error": "model 'gemma3:4b' not found"})
+
+    advice = asyncio.run(
+        advise_derivation(
+            _client(handler),
+            "gemma3:4b",
+            "Eres un experto. " * 300,
+            reuses_per_session=6,
+            needs="vision",
+        )
+    )
+    assert "could not read the base" in advice
+    assert "do not derive yet" in advice
+
+
+def test_a_base_that_has_the_capability_says_so():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"capabilities": ["completion", "vision"]})
+
+    advice = asyncio.run(
+        advise_derivation(
+            _client(handler), "q", "Look at this. " * 400, reuses_per_session=3, needs="vision"
+        )
+    )
+    assert "has 'vision'" in advice
 
 
 async def test_a_model_that_is_not_resident_is_reported_as_an_upper_bound():

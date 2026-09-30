@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from minagent.app import MODULE_APPROVAL_PREVIEW_CHARS, MinAgent  # noqa: E402
 from minagent.errors import AgentError  # noqa: E402
+from minagent.ollama_models import describe_push_destination  # noqa: E402
 
 MODULE_SOURCE = '''from typing import Any
 
@@ -213,3 +214,80 @@ async def test_an_oversized_module_is_refused_rather_than_shown_partially(tmp_pa
     with pytest.raises(AgentError, match="approval preview"):
         await app.run_write_module({"name": "saludo", "source": source})
     assert app.editor.asked == []
+
+
+# -- publishing, the one thing that leaves the machine --------------------
+
+
+class _Models:
+    """A models client that records what it was asked to push."""
+
+    def __init__(self, name: str = "aratan/mi-model") -> None:
+        self.name = name
+        self.pushed: list[str] = []
+
+    def push_destination(self, name: str) -> str:
+        return describe_push_destination(name)
+
+    async def push_size_estimate(self, name: str) -> int:
+        return 6 * 1024**3
+
+    async def push_model(self, name: str) -> str:
+        self.pushed.append(name)
+        return f"Pushed {name}."
+
+
+def _models_app(tmp_path, name: str = "aratan/mi-model", answer: str = "y") -> tuple:
+    app = _app(
+        tmp_path, ollama_models_enabled=True, ollama_push_enabled=True, editor=_Recorder(answer)
+    )
+    client = _Models(name)
+    app.ollama_models_client = client
+    return app, client
+
+
+async def test_publishing_is_off_unless_its_own_switch_is_on(tmp_path):
+    """It gets a switch of its own so it never travels attached to creating."""
+    app, client = _models_app(tmp_path)
+    app.ollama_push_enabled = False
+    with pytest.raises(AgentError, match="OLLAMA_PUSH_ENABLED=on"):
+        await app.run_push_model({"name": "aratan/mi-model"})
+    assert client.pushed == []
+
+
+async def test_a_public_push_needs_the_user_to_type_the_full_name(tmp_path):
+    """Publishing to ollama.com is the one irreversible thing here, so 'y' is
+    not enough: a mistyped model is published to the wrong name forever."""
+    app, client = _models_app(tmp_path, answer="y")
+    result = await app.run_push_model({"name": "aratan/mi-model"})
+    assert "cancelled" in result
+    assert client.pushed == []
+
+
+async def test_a_public_push_proceeds_only_with_the_exact_name(tmp_path):
+    app, client = _models_app(tmp_path, answer="aratan/mi-model")
+    result = await app.run_push_model({"name": "aratan/mi-model"})
+    assert client.pushed == ["aratan/mi-model"]
+    assert "Pushed" in result
+
+
+async def test_a_private_push_needs_only_yes(tmp_path):
+    """Friction is proportional: a private registry is reversible by deleting it."""
+    app, client = _models_app(tmp_path, name="registry.aratan.dev/m", answer="y")
+    await app.run_push_model({"name": "registry.aratan.dev/m"})
+    assert client.pushed == ["registry.aratan.dev/m"]
+
+
+async def test_a_declined_private_push_sends_nothing(tmp_path):
+    app, client = _models_app(tmp_path, name="registry.aratan.dev/m", answer="n")
+    result = await app.run_push_model({"name": "registry.aratan.dev/m"})
+    assert "cancelled" in result
+    assert client.pushed == []
+
+
+async def test_a_push_outside_a_terminal_is_refused_not_guessed(tmp_path):
+    app, client = _models_app(tmp_path, name="registry.aratan.dev/m")
+    app.editor = None
+    with pytest.raises(AgentError, match="Nothing was sent"):
+        await app.run_push_model({"name": "registry.aratan.dev/m"})
+    assert client.pushed == []

@@ -33,6 +33,22 @@ DEFAULT_TIMEOUT_SECONDS = 300
 MAX_SYSTEM_PROMPT_CHARS = 8_000
 MAX_NAME_CHARS = 64
 
+PUBLIC_REGISTRY = "registry.ollama.ai"
+"""Where a name with a bare namespace goes. Pushing there publishes the model."""
+
+REGISTRY_HOST = re.compile(r"^[^/]+\.[^/]+(:\d+)?/")
+"""A leading host with a dot or a port, as in ``registry.example.com/team/model``.
+
+Distinguishes a private registry from a bare username. A name like
+``aratan/mi-model`` has no host, so it is an ollama.com namespace and the push
+is a publication; ``registry.aratan.dev/mi-model`` is somebody's own registry.
+This is the single distinction that decides whether a push is private.
+"""
+
+#: Rough tokens per character for a mixed-language system prompt, from the
+#: rule of thumb that English averages about four characters per token.
+CHARS_PER_TOKEN = 4
+
 MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}$")
 """Ollama's own naming rules, minus a leading dash and the spaces some clients allow."""
 
@@ -208,6 +224,48 @@ class OllamaModelsClient:
         overhead = KV_CACHE_ALLOWANCE * vram_total_bytes
         return size_bytes + overhead <= vram_total_bytes
 
+    def push_destination(self, name: str) -> str:
+        """Where a push of ``name`` would actually land, and whether that is public."""
+        return describe_push_destination(name)
+
+    async def push_model(self, name: str) -> str:
+        """Publish a model to a registry. Only ever called after the user confirms.
+
+        The public case is refused outright rather than pushed: a name with no
+        host is an ollama.com namespace, and a publish the user did not mean to
+        make is not something to undo afterwards by deleting a public model.
+        The app confirms a public push by name first, and only then calls this.
+        """
+        checked = check_model_name(name)
+        destination = describe_push_destination(checked)
+        if "PUBLIC" in destination:
+            raise AgentError(
+                f"Refusing to push {checked}: a name with no host is an ollama.com namespace, which "
+                f"publishes the model for anyone to pull. To push privately, give a registry host: "
+                f"registry.example.com/{checked}."
+            )
+        await self._request("POST", "/api/push", json={"model": checked, "stream": False})
+        return f"Pushed {checked} to {destination}."
+
+    async def push_size_estimate(self, name: str) -> int:
+        """The most bytes a push of this model could send, as an upper bound.
+
+        Only layers the destination lacks are uploaded, so a derived model
+        shares its base's weight layer by digest and, if that base is already
+        on the destination, only the prompt's kilobytes travel. The full total
+        is still what has to be shown before publishing, because it is the
+        honest worst case.
+        """
+        checked = check_model_name(name)
+        payload = await self._request("POST", "/api/show", json={"model": checked})
+        if not isinstance(payload, dict):
+            return 0
+        return sum(
+            int(layer.get("size", 0) or 0)
+            for layer in payload.get("layers", []) or []
+            if isinstance(layer, dict)
+        )
+
     async def report_hardware(self, root_directory: str = ".") -> str:
         """What this machine can run, from what the card actually reports."""
         vram = gpu_vram_bytes()
@@ -252,6 +310,22 @@ KV_CACHE_ALLOWANCE = 0.25
 Measured, not guessed: the resident qwen3.5:9b holds 5.11 GiB with an 8k
 window on an 8 GiB card, so a 2 GiB allowance is what this one actually needs.
 """
+
+
+def describe_push_destination(name: str) -> str:
+    """Where a push of ``name`` would land, and whether that is public.
+
+    The whole risk of a push is in this one string: ``team/model`` and
+    ``registry.example.com/team/model`` are the same words with completely
+    different consequences, and only one of them publishes.
+    """
+    checked = check_model_name(name)
+    if REGISTRY_HOST.match(checked):
+        return "private registry: " + checked.split("/", 1)[0]
+    return (
+        f"PUBLIC ollama.com namespace ({PUBLIC_REGISTRY}): the model would be published for "
+        "anyone to pull, and publishing is not undoable"
+    )
 
 
 def _summarise(entry: dict[str, Any], loaded: dict[str, int] | None = None) -> dict[str, Any]:
@@ -332,6 +406,85 @@ def gpu_vram_bytes(root_directory: str = ".") -> int:
     return 0
 
 
+async def advise_derivation(
+    client: OllamaModelsClient,
+    base: str,
+    system: str,
+    reuses_per_session: int = 1,
+    context_window: int = 8192,
+    needs: str = "",
+) -> str:
+    """Whether a role deserves a derived model, or whether repeating the prompt is cheaper.
+
+    The deciding cost is not tidiness. A system prompt repeated in every request
+    occupies the context window on every turn, and on an 8k window a 600-token
+    role prompt is a real slice of what the conversation has left. A derived
+    model holds the prompt in its own config, so it costs nothing per request.
+
+    A long prompt used once does not clear that bar: the model is already
+    loaded, creating one is a file, and the honest answer is to restate it.
+    """
+    prompt = (system or "").strip()
+    lines: list[str] = []
+    lines.append("Would a derived model be worth it for this role?")
+
+    tokens = len(prompt) // CHARS_PER_TOKEN
+    share = (100.0 * tokens / context_window) if context_window else 0.0
+    lines.append(f"- prompt: ~{tokens} tokens, about {share:.1f}% of a {context_window}-token window")
+    lines.append(f"- reused: {reuses_per_session}x in this session")
+
+    capability_note = ""
+    base_ok = True
+    if needs.strip():
+        try:
+            detail = await client.show_model(base)
+        except AgentError as error:
+            # A base that cannot be read cannot be relied on: create_model does
+            # not check that a base exists, and the failure lands at the first
+            # request, long after the model was named and filed.
+            base_ok = False
+            capability_note = (
+                f"- could not read the base {base!r}: {error} Install it with "
+                f"`ollama pull {base}` before deriving from it."
+            )
+        else:
+            capabilities = [c.lower() for c in detail["capabilities"]]
+            if needs.strip().lower() in capabilities:
+                capability_note = f"- the base has '{needs}', so it can do this"
+            else:
+                base_ok = False
+                capability_note = (
+                    f"- the base does NOT have '{needs}' (it has: {', '.join(capabilities) or 'none'}). "
+                    "A prompt cannot add a capability. Find a different base first; deriving from this "
+                    "one would produce a model that looks right and fails the same way every time."
+                )
+    if capability_note:
+        lines.append(capability_note)
+
+    wasted = tokens * max(int(reuses_per_session) - 1, 0)
+    if not base_ok:
+        verdict = "do not derive yet: the base is not usable as it stands, for the reason above"
+    elif not prompt:
+        verdict = "do not derive: there is no prompt to move"
+    elif tokens < 80:
+        verdict = (
+            "do not derive: the prompt is small enough that repeating it costs less than "
+            "managing a second model name"
+        )
+    elif int(reuses_per_session) < 2:
+        verdict = (
+            f"do not derive: ~{tokens} tokens used once is not worth a second model to keep track of. "
+            f"It would cost {tokens} tokens once; a derived model saves nothing yet."
+        )
+    else:
+        verdict = (
+            f"derive it: ~{tokens} tokens repeated {reuses_per_session} times is ~{wasted} tokens "
+            f"spent restating, and a derived model takes all of it out of the window"
+        )
+    lines.append(f"\nverdict: {verdict}")
+    return "\n".join(lines)
+
+
 def create_ollama_models_tools() -> list[dict[str, Any]]:
     """The tool schemas for managing local models."""
     return [
@@ -389,6 +542,71 @@ def create_ollama_models_tools() -> list[dict[str, Any]]:
         {
             "type": "function",
             "function": {
+                "name": "should_derive_model",
+                "description": (
+                    "Decide whether a role deserves its own derived model, or whether restating the "
+                    "prompt each turn is cheaper. Takes the intended role, the system prompt you would "
+                    "repeat, and how often that role comes up, and says which, and why. Use it before "
+                    "create_model rather than guessing."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "base": {"type": "string", "description": "The model it would derive from"},
+                        "system": {
+                            "type": "string",
+                            "description": "The system prompt you would otherwise repeat each turn",
+                        },
+                        "reuses_per_session": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "default": 1,
+                            "description": "How many times this role comes up in one session",
+                        },
+                        "context_window": {
+                            "type": "integer",
+                            "description": "The window it competes for; defaults to the session's",
+                        },
+                        "needs": {
+                            "type": "string",
+                            "default": "",
+                            "description": "A capability it requires, e.g. 'vision'. Checked against the base.",
+                        },
+                    },
+                    "required": ["base", "system"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "push_model",
+                "description": (
+                    "Publish a model to a registry. This is the only tool here that sends anything off "
+                    "this machine, and publishing to ollama.com is not undoable. A name with no host, "
+                    "like 'team/model', goes to PUBLIC ollama.com; use 'registry.example.com/team/model' "
+                    "for a private one. The user confirms in the terminal and must type the full name to "
+                    "confirm a public push. Only layers the destination lacks are uploaded, so a derived "
+                    "model based on a public one usually sends kilobytes."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": (
+                                "Destination and model. 'team/model' publishes to ollama.com; "
+                                "'registry.example.com/team/model' pushes to that registry."
+                            ),
+                        },
+                    },
+                    "required": ["name"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "delete_model",
                 "description": (
                     "Delete a model and its weights. This is permanent: the server has no undo, so "
@@ -421,6 +639,12 @@ OLLAMA_MODELS_GUIDANCE = (
     "it does not copy weights, so a dozen role-specific models cost kilobytes between them and only "
     "one is ever in VRAM at a time. Check list_models before promising a model can run, and "
     "hardware_report before promising one fits: two models do not fit at once on an 8 GB card. "
-    "delete_model is permanent."
+    "delete_model is permanent. Run should_derive_model before create_model: the usual reason to "
+    "derive is not tidiness but that a prompt repeated every turn costs a slice of a small context "
+    "window, and a derived model moves it out of the window entirely. Do not derive when the base is "
+    "the wrong model for the task, because a prompt cannot make a model capable of something it is "
+    "not. push_model is the one tool here that leaves this machine: it is for a model that exists "
+    "nowhere else, not for a derived model whose base is already public, and you must tell the user "
+    "that publishing to ollama.com cannot be undone before asking for it."
 )
 """Sits with the tools, because the cost model behind them is the surprise."""

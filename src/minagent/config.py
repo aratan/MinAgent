@@ -298,6 +298,7 @@ class Config:
     microphone_device: str
     microphone_max_seconds: int
     ollama_models_enabled: bool
+    ollama_push_enabled: bool
     ollama_models_base_url: str
     ollama_models_timeout_seconds: int
     subagents_enabled: bool
@@ -469,6 +470,9 @@ def load_configuration(
         ),
         ollama_models_enabled=parse_boolean_setting(
             environment.get("OLLAMA_MODELS_ENABLED"), "OLLAMA_MODELS_ENABLED", False
+        ),
+        ollama_push_enabled=parse_boolean_setting(
+            environment.get("OLLAMA_PUSH_ENABLED"), "OLLAMA_PUSH_ENABLED", False
         ),
         ollama_models_base_url=(
             environment.get("OLLAMA_MODELS_BASE_URL") or "http://localhost:11434"
