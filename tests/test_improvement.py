@@ -22,6 +22,7 @@ from minagent.improvement import (
     append_document,
     apply_adjustments,
     build_session_prompt,
+    can_promote,
     format_adjustment_report,
     format_document_section,
     load_adjustment_log,
@@ -40,6 +41,8 @@ A_HYPOTHESIS = {
     "evidence": "3 trabajos rechazados por VRAM y 2 en cola en la última hora",
     "expected": "Menos trabajos de golpe",
     "verify": "Que la cola no supere 2 en espera tras el próximo render",
+    "falsifier": "Que la cola siga superada por 2 sin rejections en dos horas",
+    "trigger": "Cuando dos o más renders consecutivos se rechazan por VRAM",
     "setting": "COMPUTE_QUEUE_LIMIT",
     "value": "2",
     "reason": "La cola baja a dos y el rechazo desaparece",
@@ -345,8 +348,16 @@ async def test_the_app_reflects_and_writes_both_destinations(monkeypatch, tmp_pa
     _set_env(monkeypatch, {"COMPUTE_QUEUE_LIMIT": "8", "MEMORY_REFLECTION_INTERVAL": "10"})
 
     class _Stub:
+        # The gate asks one question of its own, in a different shape. Answering
+        # the hypothesis prompt to both is a stub that hides the gate rather
+        # than exercising it.
         async def complete(self, messages, options=None):
-            return {"message": {"role": "assistant", "content": _answer(A_HYPOTHESIS)}}
+            asked = " ".join(str(item.get("content", "")) for item in messages)
+            if "verdict" in asked:
+                body = json.dumps({"verdict": "valid", "reason": "no contradice nada"})
+            else:
+                body = _answer(A_HYPOTHESIS)
+            return {"message": {"role": "assistant", "content": body}}
 
     app.open_ai_client = _Stub()
     (tmp_path / ".env").write_text("COMPUTE_QUEUE_LIMIT=8\n")
@@ -354,7 +365,11 @@ async def test_the_app_reflects_and_writes_both_destinations(monkeypatch, tmp_pa
     report = await app.reflect_on_session("test")
 
     assert "COMPUTE_QUEUE_LIMIT: 8 -> 2" in report
-    assert "COMPUTE_QUEUE_LIMIT=2" in (tmp_path / ".env").read_text()
+    # Still 8. The trial opens on the baseline arm, so the value stays where the
+    # user put it until the crossover says the candidate is live. A proposal that
+    # moved the setting on arrival would be measuring the first window with the
+    # change already in it.
+    assert "COMPUTE_QUEUE_LIMIT=8" in (tmp_path / ".env").read_text()
     assert (tmp_path / "MEJORAS.md").exists()
     stored = await app.memory_store.recent()
     # The hypothesis lands in the store too, under its own kind, not filed as a
@@ -613,3 +628,74 @@ async def test_a_session_that_learned_nothing_says_so(tmp_path):
 
     await app.handle_improvement_command("now")
     assert "No salió nada aplicable" in app._stdout.text
+
+
+# --- Falsifiers and triggers -------------------------------------------------
+#
+# These pin the contract added after the reflection prompt was found to accept
+# hypotheses that could not be refuted and carried no condition for use. The
+# behaviour is the point; the tests exist so that removing it is a visible
+# change rather than a quiet one.
+
+
+def test_a_hypothesis_keeps_its_falsifier_and_trigger():
+    found = parse_hypotheses(_answer(A_HYPOTHESIS))
+
+    assert found[0].falsifier == "Que la cola siga superada por 2 sin rejections en dos horas"
+    assert found[0].trigger == "Cuando dos o más renders consecutivos se rechazan por VRAM"
+
+
+def test_a_setting_without_a_falsifier_is_tried_but_never_kept():
+    """A value nobody can check may be tried - the trial reverts it - but it
+    can never be promoted. Dropping it outright would disable the very revert
+    path that makes trying it safe."""
+    blind = {key: value for key, value in A_HYPOTHESIS.items() if key != "falsifier"}
+
+    found = parse_hypotheses(_answer(blind))
+
+    # Tried: the setting survives so a measured trial can still record it.
+    assert found[0].setting == "COMPUTE_QUEUE_LIMIT"
+    assert found[0].value == "2"
+    # Kept: never. There is no observation that could have refuted it.
+    assert not can_promote(found[0])
+
+
+def test_a_hypothesis_with_a_falsifier_may_be_promoted():
+    found = parse_hypotheses(_answer(A_HYPOTHESIS))
+
+    assert can_promote(found[0])
+
+
+def test_a_whitespace_falsifier_is_not_a_falsifier():
+    blank = parse_hypotheses(_answer({**A_HYPOTHESIS, "falsifier": "   "}))[0]
+
+    assert not can_promote(blank)
+
+
+def test_a_lesson_without_a_trigger_is_kept_but_never_triggers():
+    """Not fatal: the hypothesis is still true. It just cannot be applied."""
+    unconditional = {key: value for key, value in A_HYPOTHESIS.items() if key != "trigger"}
+
+    found = parse_hypotheses(_answer(unconditional))
+
+    assert found[0].trigger == ""
+    assert found[0].statement == A_HYPOTHESIS["statement"]
+
+
+def test_the_prompt_asks_for_a_falsifier_and_a_trigger():
+    """The prompt is the only place the model learns these fields exist."""
+    system = build_session_prompt(knowledge=[], log=[], stats={})[0]["content"]
+
+    assert "falsifier" in system
+    assert "trigger" in system
+    # The distinction the whole field rests on, spelled out rather than implied.
+    assert "unfalsifiable" in system
+    assert "same field" in system
+
+
+def test_the_prompt_explains_what_a_missing_falsifier_costs():
+    """The prompt must not promise a drop the code no longer performs."""
+    system = build_session_prompt(knowledge=[], log=[], stats={})[0]["content"]
+
+    assert "can never be kept" in system
+    assert "proposing work, not a change" in system
