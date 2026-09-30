@@ -13,6 +13,8 @@ import asyncio
 import inspect
 import json
 import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -496,6 +498,32 @@ def test_a_missing_backend_says_where_it_was_looked_for(tmp_path: Path) -> None:
     message = str(failure.value)
     assert "scripts" in message
     assert "COMPUTE_SCRIPTS_DIR" in message
+
+
+def test_a_missing_whisper_says_how_to_install_it() -> None:
+    """The one diagnosis the user cannot work out alone.
+
+    whisper.cpp is a separate install from a separate project, and the failure
+    mode that actually happens is a symlink pointing at a build directory that
+    a reboot or a /tmp cleanup removed. That reads as a missing binary, so the
+    message has to carry the install command and the name the binary is built
+    under, or the user is left with a model on disk and no words.
+    """
+    script = Path(__file__).resolve().parent.parent / "scripts" / "compute" / "voz.py"
+    environment = {**os.environ, "PATH": "", "WHISPER_MODEL_DIR": ""}
+    completed = subprocess.run(
+        [sys.executable, str(script), "--audio", "lo-que-sea.wav"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=environment,
+    )
+    payload = completed.stdout.split("RESULT ", 1)[-1]
+    answer = json.loads(payload)
+    assert answer["ok"] is False
+    assert "whisper.cpp" in answer["error"]
+    assert "pacman -S whisper.cpp" in answer["error"]
+    assert "whisper-cli" in answer["error"]
 
 
 def test_compute_scripts_dir_overrides_where_backends_are_looked_for(tmp_path: Path) -> None:

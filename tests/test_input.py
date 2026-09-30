@@ -6,11 +6,15 @@ a key name it cannot read, it emits a delay and carries on, so a wrong code
 here would look like a working click that never landed.
 """
 
+import re
+from pathlib import Path
+
 import pytest
 
 from minagent.errors import AgentError
 from minagent.input import (
     BUTTON_CLICK_CODES,
+    KEYCODES,
     InputClient,
     create_input_tools,
     keycode,
@@ -49,6 +53,42 @@ async def test_a_single_key_needs_no_sequence_padding(client, calls):
 def test_letters_and_digits_use_the_kernel_numbering(name, expected):
     """The three letter rows are 16, 30 and 44, not one run from KEY_A."""
     assert keycode(name) == expected
+
+
+def test_letters_are_not_one_run_from_a():
+    """The arithmetic that looks right is wrong, and q is the witness.
+
+    Filling the table as KEY_A plus the letter's offset is the obvious way to
+    write it and it types the wrong key: q is 16, not 46. Found against a real
+    desktop, where every other letter happened to land somewhere plausible.
+    """
+    assert keycode("q") == 16
+    assert keycode("q") != 30 + (ord("q") - ord("a"))
+
+
+def test_the_whole_table_agrees_with_the_kernel_it_runs_on():
+    """Every letter and digit, checked against the header the kernel itself uses.
+
+    The spot checks above cover the rows this project has typed by hand before.
+    The rest of the alphabet had never been checked against anything, and a
+    wrong code is silent: ydotool accepts a number and presses whatever is at
+    that number. The kernel header is the authority, so it is the oracle.
+    """
+    header = Path("/usr/include/linux/input-event-codes.h")
+    if not header.is_file():
+        pytest.skip("the kernel input header is not installed")
+    definitions = {
+        name: int(value)
+        for name, value in re.findall(r"^#define\s+(KEY_[A-Z0-9]+)\s+(\d+)", header.read_text(), re.M)
+    }
+    characters = [key for key in KEYCODES if len(key) == 1 and key.isalnum()]
+    assert len(characters) == 36, "the table should carry all 26 letters and 10 digits"
+    wrong = {
+        key: (KEYCODES[key], definitions.get(f"KEY_{key.upper()}"))
+        for key in characters
+        if KEYCODES[key] != definitions.get(f"KEY_{key.upper()}")
+    }
+    assert wrong == {}
 
 
 async def test_an_unknown_key_is_refused_rather_than_silently_delayed(client, calls):

@@ -90,6 +90,45 @@ async def test_pushing_to_a_private_registry_goes_through():
     assert "private registry" in result
 
 
+async def test_the_size_shown_before_a_push_is_the_honest_worst_case():
+    """The one number a user gets to decide an irreversible publish on.
+
+    It is the sum of the model's layers, which is what could travel if the
+    destination had none of them. A derived model reports 6.59 GB locally but
+    shares its base's weight layer by digest, so the truth is usually
+    kilobytes - and the number shown is the upper bound, with that said
+    underneath it. What must never happen is the opposite error: a figure
+    smaller than a layer that really would be sent.
+    """
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(request.url.path)
+        return httpx.Response(
+            200,
+            json={
+                "layers": [
+                    {"digest": "sha256:pesos", "size": 6_590_000_000},
+                    {"digest": "sha256:plantilla", "size": 1_024},
+                ]
+            },
+        )
+
+    estimate = await _client(handler).push_size_estimate("registry.aratan.dev/mi-model")
+    assert requested == ["/api/show"], "the estimate comes from the manifest, not from the listing"
+    assert estimate == 6_590_001_024
+    assert estimate >= 6_590_000_000
+
+
+async def test_an_estimate_of_nothing_is_zero_rather_than_an_error():
+    """A server that omits the layers must not stop the user from pushing."""
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        return httpx.Response(200, json={})
+
+    assert await _client(handler).push_size_estimate("registry.aratan.dev/mi-model") == 0
+
+
 # -- when a derived model is worth it ------------------------------------
 
 
