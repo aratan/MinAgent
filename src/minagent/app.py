@@ -681,7 +681,12 @@ class MinAgent:
         self.last_usage_message_count = 0
         self.last_usage_system_tokens = 0
         self._active_token: CancellationToken | None = None
-        self._active_request_in_flight = False
+        # A depth, not a flag. A turn that calls two tools, or that nests a tool
+        # inside a tool, clears a boolean the moment the first one returns while
+        # the second is still holding the machine. The resident worker reads
+        # this to decide the machine is free, and a flag that clears early lets
+        # it start a cycle on top of a running job.
+        self._operation_depth = 0
         self.resident_worker: ResidentWorker | None = None
         # `ResidentWorker.run` returns why it finished, so the task carries a str.
         # Annotating this as Task[None] would only hide the real contract.
@@ -3411,6 +3416,38 @@ class MinAgent:
                 )
         return prepared["message"]
 
+    @property
+    def _active_request_in_flight(self) -> bool:
+        """The resident uses this as a free/busy test.
+
+        Nested or batched tools run with the depth > 0 for the entire interval,
+        and only drop to 0 after every tool in that batch is finished. The old
+        boolean cleared at the first return and created a window where a new
+        resident cycle could start while another job was still running.
+        """
+        return self._operation_depth > 0
+
+    @_active_request_in_flight.setter
+    def _active_request_in_flight(self, value: bool) -> None:
+        # The boolean is kept for compatibility with any code that still sets
+        # it directly. Setting to False is the common "clear" path, and its
+        # semantics are preserved: it returns depth to 0. Setting to True is a
+        # legacy start; increasing by 1 is closer to the depth model than
+        # forcing to >=1, but tests expect the flag to become True. In practice
+        # the flag is read only by the resident; new code should not set it.
+        if value:
+            self._operation_depth = max(self._operation_depth, 1)
+            return
+        self._operation_depth = 0
+
+    @contextlib.asynccontextmanager
+    async def _operation_in_flight(self) -> Any:
+        self._operation_depth += 1
+        try:
+            yield
+        finally:
+            self._operation_depth = max(0, self._operation_depth - 1)
+
     async def _run_read_tool(self, name: str, args: dict[str, Any]) -> Any:
         """Run one read for the parallel batch, turning failures into text.
 
@@ -3450,7 +3487,11 @@ class MinAgent:
             if outcome is not None:
                 return outcome
             auto_loaded = self._last_auto_loaded
-        result = await self._dispatch_tool(name, args)
+        # The whole dispatch, including any await inside the tool, counts as one
+        # operation for the resident's free/busy test. _run_read_tool routes here
+        # too, so the parallel batch is covered by the same depth.
+        async with self._operation_in_flight():
+            result = await self._dispatch_tool(name, args)
         # Reaching here means the tool returned rather than raised, and these
         # tools raise on every failure path, so the workspace really changed.
         if name in _MUTATING_TOOLS:
@@ -4131,11 +4172,8 @@ class MinAgent:
         options = dict(options or {})
         if options.get("signal") is None and self._active_token is not None:
             options["signal"] = self._active_token
-        self._active_request_in_flight = True
-        try:
+        async with self._operation_in_flight():
             return await self.open_ai_client.complete(request_messages, options)
-        finally:
-            self._active_request_in_flight = False
 
     async def generate_compaction_summary(
         self,
