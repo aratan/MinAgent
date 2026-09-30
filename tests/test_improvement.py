@@ -8,10 +8,12 @@ down rather than trust.
 
 from __future__ import annotations
 
+import inspect
 import json
 
 import pytest
 
+from minagent.compute import VramRelease
 from minagent.improvement import (
     ADJUSTMENT_COOLDOWN_SECONDS,
     SAFE_SETTINGS,
@@ -393,6 +395,181 @@ async def test_a_reflection_that_fails_does_not_raise(tmp_path):
     app.open_ai_client = _Broken()
 
     assert await app.reflect_on_session("test") == ""
+
+
+# ------------------------------------------------------- el modelo de reflexión
+
+SESSION_MODEL = "qwen3.5:9b-q4_K_M"
+REFLECTION_MODEL = "gemma4:12b-q3km"
+
+
+def _fake_vram(monkeypatch: pytest.MonkeyPatch, resident: tuple[str, ...] = ()) -> list[tuple]:
+    """Record what the reflection does to the card, without touching it.
+
+    The two models do not fit in 8 GB together, so this is the part of the
+    feature with a real cost, and a test that could not see it would pass
+    whatever the code did to the user's VRAM.
+    """
+    events: list[tuple] = []
+
+    async def unload(root_directory):
+        events.append(("unload",))
+        return VramRelease(models=[SESSION_MODEL])
+
+    async def reload(models):
+        events.append(("reload", *models))
+        return ""
+
+    async def resident_models():
+        return list(resident)
+
+    monkeypatch.setattr("minagent.app.unload_ollama", unload)
+    monkeypatch.setattr("minagent.app.reload_ollama", reload)
+    monkeypatch.setattr("minagent.app.ollama_resident_models", resident_models)
+    return events
+
+
+async def _reflecting_app(monkeypatch, tmp_path, complete, resident: tuple[str, ...] = ()) -> tuple:
+    app = _memory_app(tmp_path)
+    await app.initialize_optional_features()
+    app.improvement_enabled = True
+    app.improvement_auto = False
+    app.application_root = str(tmp_path)
+    app.model = SESSION_MODEL
+    app.improvement_model = REFLECTION_MODEL
+    _set_env(monkeypatch, {"COMPUTE_QUEUE_LIMIT": "8", "MEMORY_REFLECTION_INTERVAL": "10"})
+    app.open_ai_client = _Stub(complete)
+    return app, _fake_vram(monkeypatch, resident)
+
+
+class _Stub:
+    """A model stand-in that records which model each request asked for."""
+
+    def __init__(self, reply) -> None:
+        self.reply = reply
+        self.asked: list[str | None] = []
+
+    async def complete(self, messages, options=None):
+        self.asked.append((options or {}).get("model"))
+        answer = self.reply((options or {}).get("model"))
+        if inspect.isawaitable(answer):
+            answer = await answer
+        return {"message": {"role": "assistant", "content": answer}}
+
+
+async def test_the_reflection_runs_on_its_own_model_and_gives_the_card_back(monkeypatch, tmp_path):
+    app, events = await _reflecting_app(monkeypatch, tmp_path, lambda model: _answer(A_HYPOTHESIS))
+
+    report = await app.reflect_on_session("test")
+
+    assert app.open_ai_client.asked == [REFLECTION_MODEL]
+    assert "COMPUTE_QUEUE_LIMIT" in report
+    # 5.5 GB of session model and 5.7 GB of reflection model do not fit on an
+    # 8 GB card, so the session one is unloaded first - and the reflection model
+    # is unloaded before it comes back, or the reload lands on a full card.
+    assert events == [("unload",), ("unload",), ("reload", SESSION_MODEL)]
+
+
+async def test_a_reflection_model_that_cannot_answer_falls_back_to_the_session_one(monkeypatch, tmp_path):
+    async def answer(model):
+        if model == REFLECTION_MODEL:
+            raise OSError("no such model on this endpoint")
+        return _answer(A_HYPOTHESIS)
+
+    app, events = await _reflecting_app(monkeypatch, tmp_path, answer)
+
+    report = await app.reflect_on_session("test")
+
+    # The bigger model is an improvement, not a dependency: a weaker answer from
+    # the model that was already loaded beats no reflection at all.
+    assert app.open_ai_client.asked == [REFLECTION_MODEL, None]
+    assert "COMPUTE_QUEUE_LIMIT" in report
+    assert events[-1] == ("reload", SESSION_MODEL)
+
+
+async def test_the_session_model_comes_back_even_when_the_reflection_model_explodes(monkeypatch, tmp_path):
+    # An error type the request helper does not know: the reflection gives up,
+    # and the card must not keep the user's model off it because of that.
+    def answer(model):
+        raise ValueError("something nobody planned for")
+
+    app, events = await _reflecting_app(monkeypatch, tmp_path, answer)
+
+    assert await app.reflect_on_session("test") == ""
+    assert events == [("unload",), ("unload",), ("reload", SESSION_MODEL)]
+
+
+async def test_without_a_reflection_model_nothing_is_unloaded(monkeypatch, tmp_path):
+    app, events = await _reflecting_app(monkeypatch, tmp_path, lambda model: _answer(A_HYPOTHESIS))
+    app.improvement_model = ""
+
+    await app.reflect_on_session("test")
+
+    assert app.open_ai_client.asked == [None]
+    assert events == []
+
+
+async def test_naming_the_session_model_as_its_own_reflector_changes_nothing(monkeypatch, tmp_path):
+    app, events = await _reflecting_app(monkeypatch, tmp_path, lambda model: _answer(A_HYPOTHESIS))
+    app.improvement_model = SESSION_MODEL
+
+    await app.reflect_on_session("test")
+
+    # Unloading a model to ask that same model would cost a load for nothing.
+    assert events == []
+
+
+async def test_a_reflection_model_that_is_already_loaded_is_not_cycled(monkeypatch, tmp_path):
+    app, events = await _reflecting_app(
+        monkeypatch, tmp_path, lambda model: _answer(A_HYPOTHESIS), resident=(REFLECTION_MODEL,)
+    )
+
+    await app.reflect_on_session("test")
+
+    # Something else on this machine already had it warm. The swap would evict
+    # the model it is about to use, load it again for the request, and evict it
+    # a second time to put the other one back.
+    assert app.open_ai_client.asked == [REFLECTION_MODEL]
+    assert events == []
+
+
+async def test_thinking_is_only_switched_off_for_the_model_it_was_measured_on(monkeypatch, tmp_path):
+    sent: list[dict] = []
+
+    class _Recorder:
+        async def complete(self, messages, options=None):
+            seen = dict(options or {})
+            sent.append(seen)
+            return {"message": {"role": "assistant", "content": _answer(A_HYPOTHESIS) if seen.get("model") else "{}"}}
+
+    app, _ = await _reflecting_app(monkeypatch, tmp_path, lambda model: "")
+    app.open_ai_client = _Recorder()
+
+    await app._ask_with_reflection_model([{"role": "user", "content": "x"}])
+    await app._ask_about([{"role": "user", "content": "x"}])
+
+    # The no-thinking flag is what cut a review on the 9B from 58 s to 1.5 s.
+    # It is not a property of the request: it is a measurement of one model, so
+    # it stops there rather than being imposed on whatever a user names.
+    assert "extra_body" not in sent[0]
+    assert sent[1]["extra_body"] == {"reasoning_effort": "none"}
+
+
+async def test_an_answer_that_is_not_a_hypothesis_list_is_asked_again(monkeypatch, tmp_path):
+    # Measured against the real reflection model: it sometimes answers with the
+    # object cut off mid-sentence, and the parser cannot read half a hypothesis.
+    app, _ = await _reflecting_app(
+        monkeypatch,
+        tmp_path,
+        lambda model: '{"hypotheses": [{"title": "T", "kind": "improvement", "state'
+        if model == REFLECTION_MODEL
+        else _answer(A_HYPOTHESIS),
+    )
+
+    report = await app.reflect_on_session("test")
+
+    assert app.open_ai_client.asked == [REFLECTION_MODEL, None]
+    assert "COMPUTE_QUEUE_LIMIT" in report
 
 
 async def test_the_periodic_reflection_counts_turns_not_reviews(monkeypatch, tmp_path):

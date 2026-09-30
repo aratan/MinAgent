@@ -451,7 +451,11 @@ class OpenAiClient:
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         request_body: dict[str, Any] = {
-            "model": self.model,
+            # A caller may ask for a different model on the same endpoint. The
+            # session reflection does: it runs on a larger model than the one
+            # answering the conversation, and the two do not fit in VRAM at the
+            # same time, so it is asked for only for that one request.
+            "model": options.get("model") or self.model,
             "messages": list(request_messages),
             "stream": True,
         }
