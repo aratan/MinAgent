@@ -10,6 +10,17 @@ dependencies = [
     "regex>=2024.5.15",
 ]
 
+[project.optional-dependencies]
+# Kokoro is pinned, not ranged. 0.7.x dropped `repo_id` from KPipeline, which is
+# what voz.py passes, and its model returns a fixed 0.25 s clip whatever the text
+# is. `repo_id` came back in 0.8, and 0.9.4 synthesises correctly again.
+voice = [
+    "kokoro==0.9.4",
+    "soundfile>=0.12",
+]
+# whisper.cpp is a compiled binary, not a wheel: see the compute-gpu skill.
+transcribe = []
+
 [project.scripts]
 minagent = "minagent.__main__:main"
 

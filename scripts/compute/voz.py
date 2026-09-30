@@ -112,8 +112,10 @@ usable sin comerse la reserva.
 # El script no los baja por su cuenta: es deliberado, para que la descarga
 # larga sea algo que alguien lanzó a knowingly, no una sorpresa al hablar.
 _KOKORO_HINT = (
-    "Kokoro no está instalado. Instálalo con: uv pip install kokoro soundfile numpy\n"
-    "Los pesos (~300 MB) se descargan de HuggingFace la primera vez."
+    'Kokoro no está instalado. Instálalo con la versión fijada: '
+    'uv pip install "kokoro==0.9.4" soundfile numpy\n'
+    "Sin esa versión no funciona: 0.7.x quitó `repo_id` a KPipeline y devuelve un "
+    "clip fijo de 0,25 s. Los pesos (~300 MB) se descargan de HuggingFace la primera vez."
 )
 
 
