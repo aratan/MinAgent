@@ -29,8 +29,18 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from typing import Any
+
+from .evidence import (
+    Arm,
+    EvidenceLedger,
+    Holdout,
+    compare_arms,
+    read_holdout,
+    split_holdout,
+)
 
 # A window shorter than this cannot tell a real change from a quiet afternoon.
 # Below it the trial is left open rather than judged: reverting on thin evidence
@@ -95,11 +105,28 @@ class Trial:
     after: Scorecard = field(default_factory=Scorecard)
     # The orchestrator counts its whole life, so the window is a difference
     # against where those counters stood when the change was made.
-    baseline_refusals: int = 0
-    baseline_failures: int = 0
     judged: bool = False
     kept: bool = False
     verdict: str = ""
+    # --- evidence state ---
+    # Set once the arms have enough runs to be compared. Until then the trial
+    # is collecting, and ``verdict`` stays empty on purpose.
+    decided: bool = False
+    # Which value is live right now. Alternates window by window.
+    live: str = "baseline"
+    # Turns accumulated into the window currently being measured.
+    window_turns: int = 0
+    # Index of the current run. Shared by both arms, so the run numbers interleave
+    # and each arm still counts its own distinct runs.
+    run: int = 0
+    # The frozen case split, kept as text so the trial file stays JSON.
+    holdout_json: str = ""
+    # What the reserved cases said, reported and never gated on.
+    surprise: str = ""
+
+    def holdout(self) -> Holdout:
+        """The reserved cases, rebuilt. Empty before the trial set one."""
+        return Holdout.from_json(self.holdout_json) if self.holdout_json else Holdout()
 
     def to_json(self) -> str:
         return json.dumps(
@@ -111,11 +138,15 @@ class Trial:
                 "started_at": self.started_at,
                 "before": json.loads(self.before.to_json()),
                 "after": json.loads(self.after.to_json()),
-                "baseline_refusals": self.baseline_refusals,
-                "baseline_failures": self.baseline_failures,
                 "judged": self.judged,
                 "kept": self.kept,
                 "verdict": self.verdict,
+                "decided": self.decided,
+                "live": self.live,
+                "window_turns": self.window_turns,
+                "run": self.run,
+                "holdout": self.holdout_json,
+                "surprise": self.surprise,
             },
             indent=2,
         )
@@ -138,11 +169,15 @@ class Trial:
             started_at=str(payload.get("started_at", "")),
             before=Scorecard.from_json(json.dumps(before) if isinstance(before, dict) else ""),
             after=Scorecard.from_json(json.dumps(after) if isinstance(after, dict) else ""),
-            baseline_refusals=_as_int(payload.get("baseline_refusals")),
-            baseline_failures=_as_int(payload.get("baseline_failures")),
             judged=bool(payload.get("judged")),
             kept=bool(payload.get("kept")),
             verdict=str(payload.get("verdict", "")),
+            decided=bool(payload.get("decided")),
+            live=str(payload.get("live") or "baseline"),
+            window_turns=_as_int(payload.get("window_turns")),
+            run=_as_int(payload.get("run")),
+            holdout_json=str(payload.get("holdout", "")),
+            surprise=str(payload.get("surprise", "")),
         )
 
 
@@ -250,3 +285,260 @@ def trial_to_memory(trial: Trial) -> dict[str, Any]:
     """The trial as a memory-shaped record, for the log and for tests."""
     return {"setting": trial.setting, "previous": trial.previous, "proposed": trial.proposed,
             "verdict": trial.verdict, "kept": trial.kept, "turns": trial.after.turns}
+
+# --- Evidence-backed trials -------------------------------------------------
+# What a single window is judged on. Each case can independently be fine or
+# broken, so a change that fixes one and breaks another shows up as two
+# different facts instead of averaging into a wash.
+TRIAL_CASES = ("tool_errors", "job_refusals", "job_failures", "tool_tokens")
+EVIDENCE_NAME = os.path.join(".minagent", "evidencia.json")
+
+
+def load_ledger(application_root: str) -> EvidenceLedger:
+    """The outcome history every trial is compared against.
+
+    Read as empty rather than raised when the file is missing or damaged: a
+    corrupt ledger should cost the loop its memory, not its ability to start.
+    """
+    if not application_root:
+        return EvidenceLedger()
+    try:
+        with open(os.path.join(application_root, EVIDENCE_NAME), encoding="utf-8") as handle:
+            return EvidenceLedger.from_json(handle.read())
+    except (OSError, ValueError):
+        return EvidenceLedger()
+
+
+def save_ledger(application_root: str, ledger: EvidenceLedger) -> None:
+    if not application_root:
+        return
+    target = os.path.join(application_root, EVIDENCE_NAME)
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write(ledger.to_json())
+    except OSError:
+        # An unwritable ledger is a degraded loop, not a failed turn. The next
+        # turn will try again, and the cost is that a decision restarts its runs.
+        pass
+
+
+def cases_from_card(card: Scorecard, cases: Sequence[str], *, cost_bar: float) -> dict[str, bool]:
+    """How each case fared in one window, from what that window observed.
+
+    The error cases pass only on zero, because a window with a single tool
+    error is a window where a tool was misused, and a rate would let one
+    mistake hide inside an average of seven good turns. The cost case passes
+    against a bar the caller supplies, because an absolute token limit would
+    be either trivially satisfied by a quiet session or impossible for a busy
+    one.
+    """
+    results: dict[str, bool] = {}
+    for case in cases:
+        if case == "tool_errors":
+            results[case] = card.tool_errors == 0
+        elif case == "job_refusals":
+            results[case] = card.job_refusals == 0
+        elif case == "job_failures":
+            results[case] = card.job_failures == 0
+        elif case == "tool_tokens":
+            results[case] = card.cost_rate() <= cost_bar
+    return results
+
+
+def _arm_over(ledger: EvidenceLedger, setting: str, value: str, cases: Sequence[str]) -> Arm:
+    """One arm restricted to exactly these cases.
+
+    Needed because ``compare_arms`` takes its mean from the whole arm but its
+    flips from the case list. Handing it an arm that also contains the reserved
+    cases would quietly pull the holdout into the mean that decides the change,
+    which is the leak the holdout exists to prevent - and invisible, because
+    every value it reads is real.
+    """
+    wanted = set(cases)
+    full = ledger.arm(setting, value=value)
+    return Arm(
+        name=full.name,
+        outcomes=tuple(outcome for outcome in full.outcomes if outcome.case in wanted),
+    )
+
+
+@dataclass
+class TrialStep:
+    """What one turn of a trial did, said in the caller's language."""
+
+    message: str = ""
+    # The value the setting should be moved to now, or "" to leave it alone.
+    apply: str = ""
+    decided: bool = False
+    kept: bool = False
+    surprise: str = ""
+
+
+def start_trial(
+    *,
+    setting: str,
+    previous: str,
+    proposed: str,
+    reason: str,
+    started_at: str,
+    holdout_fraction: float,
+) -> Trial:
+    """A trial with its reserved cases frozen before the first window.
+
+    The split is made here, once, and never recomputed. A holdout chosen again
+    per run is a different holdout every run, and the reservation protects
+    nothing.
+    """
+    holdout = split_holdout(TRIAL_CASES, holdout_fraction)
+    return Trial(
+        setting=setting,
+        previous=previous,
+        proposed=proposed,
+        reason=reason,
+        started_at=started_at,
+        holdout_json=holdout.to_json(),
+        live="baseline",
+    )
+
+
+def advance_trial(
+    trial: Trial,
+    ledger: EvidenceLedger,
+    card: Scorecard,
+    *,
+    min_runs: int,
+    max_regressions: int,
+    cost_bar: float,
+) -> TrialStep:
+    """Fold one turn into the trial, and decide when the evidence is in.
+
+    The arms alternate window by window rather than running in blocks. Measuring
+    the baseline for fifty turns and the candidate for the next fifty confounds
+    the change with everything that happened in between - the hour of day, the
+    kind of work, whether the network was up. Alternating keeps both arms
+    exposed to the same conditions, which is the only reason their numbers can
+    be subtracted at all.
+
+    The reserved cases are recorded in the same windows but never passed to the
+    gate, and are read exactly once at the end. That is sound here and would not
+    be in general: it holds because the candidate value is written into the trial
+    before the first window and cannot be retuned while the numbers are visible,
+    so there is no fitting to the visible cases to catch. A system that changed
+    its proposal mid-trial would need a separate collection phase.
+    """
+    if trial.decided:
+        return TrialStep()
+
+    trial.window_turns += 1
+    trial.after = card
+    if trial.window_turns < MIN_TURNS_PER_TRIAL:
+        return TrialStep()
+
+    holdout = trial.holdout()
+    gating = holdout.gating_cases(TRIAL_CASES)
+    # Every case is recorded, reserved ones included. The gate below only ever
+    # sees the gating cases; the reserved ones are collected in the same windows
+    # so that a surprise stays a surprise instead of becoming extra data that
+    # happened to arrive after the decision.
+    outcomes = cases_from_card(card, TRIAL_CASES, cost_bar=cost_bar)
+    arm_value = trial.previous if trial.live == "baseline" else trial.proposed
+    for case, passed in outcomes.items():
+        ledger.record(trial.setting, case=case, passed=passed, run=trial.run, value=arm_value)
+
+    trial.run += 1
+    trial.window_turns = 0
+    next_live = "candidate" if trial.live == "baseline" else "baseline"
+    next_value = trial.proposed if next_live == "candidate" else trial.previous
+    # Ask the caller to move the setting only when the next arm is a different
+    # value. Compared against the value that just ran, not against the
+    # environment: a caller can hold a setting in a file, a session attribute and
+    # an environment variable, and only the trial knows which one it last changed.
+    switch = next_value if next_value != arm_value else ""
+
+    baseline = _arm_over(ledger, trial.setting, trial.previous, gating)
+    candidate = _arm_over(ledger, trial.setting, trial.proposed, gating)
+    if baseline.runs() < min_runs or candidate.runs() < min_runs:
+        trial.live = next_live
+        return TrialStep(apply=switch)
+
+    verdict = compare_arms(
+        baseline,
+        candidate,
+        cases=gating,
+        min_runs=min_runs,
+        max_regressions=max_regressions,
+    )
+    trial.decided = True
+    trial.judged = True
+    trial.kept = verdict.promote
+    trial.verdict = verdict.reason
+    trial.live = next_live
+
+    decided_value = trial.proposed if verdict.promote else trial.previous
+    surprise = ""
+    if verdict.promote:
+        # Only worth reading when the change is about to be kept. A reverted
+        # change has nothing left to validate, and spending the reserve on it
+        # would burn the only unbiased sample the next attempt could have used.
+        reading = read_holdout(
+            holdout,
+            _arm_over(ledger, trial.setting, trial.previous, holdout.cases),
+            _arm_over(ledger, trial.setting, trial.proposed, holdout.cases),
+        )
+        surprise = reading.surprise
+        trial.surprise = surprise
+        # read_holdout spent the reserve in memory. Persist that, or a restart
+        # before the next trial reads the same cases a second time.
+        trial.holdout_json = holdout.to_json()
+    return TrialStep(
+        message=f"Medición: {verdict.reason}",
+        apply=decided_value if decided_value != arm_value else "",
+        decided=True,
+        kept=verdict.promote,
+        surprise=surprise,
+    )
+
+
+def describe_progress(trial: Trial, ledger: EvidenceLedger, min_runs: int = 9) -> str:
+    """Where the trial is, in a form a person can decide to keep waiting for.
+
+    Reports both arms' measured rate, not just which one is live. A progress line
+    that only says "measuring, 3/8 turns" tells a person nothing about whether
+    the change is heading anywhere, which is the only reason they would be
+    reading it. When an arm has nothing observed yet its rate is left out rather
+    than shown as 0%, because a mean over nothing is not a result.
+
+    ``min_runs`` is the target the caller is holding this trial to. It is a
+    parameter and not a constant so the progress line cannot claim a target the
+    run will not actually enforce.
+    """
+    if trial is None:
+        return ""
+    if trial.decided:
+        return f"{trial.setting} {trial.previous} -> {trial.proposed}: {trial.verdict}"
+
+    holdout = trial.holdout()
+    gating = holdout.gating_cases(TRIAL_CASES)
+    baseline = _arm_over(ledger, trial.setting, trial.previous, gating)
+    candidate = _arm_over(ledger, trial.setting, trial.proposed, gating)
+
+    def side(arm: Arm) -> str:
+        rate = arm.rate()
+        measured = "sin datos aún" if rate is None else f"{rate:.0f}% de acierto"
+        return f"{arm.name}: {arm.runs()}/{min_runs} corridas, {measured}"
+
+    live = "midiendo la anterior" if trial.live == "baseline" else "midiendo la propuesta"
+    # Named by value, not by arm. The arm names are internal ("baseline",
+    # "candidate") and would reach the reader verbatim, and a line saying
+    # "changes applied to candidate" is both untranslated and less useful than the
+    # value the reader actually recognises.
+    live_value = trial.previous if trial.live == "baseline" else trial.proposed
+    reserve = "reservada" if not holdout.spent else "ya leída"
+    return (
+        f"{trial.setting} {trial.previous} -> {trial.proposed}\n"
+        f"  {live} · turnos {trial.window_turns}/{MIN_TURNS_PER_TRIAL} de esta ventana, "
+        f"cambios aplicados a {live_value}\n"
+        f"  {side(baseline)} | {side(candidate)}\n"
+        f"  holdout: {len(holdout.cases)} casos, {reserve}"
+    )

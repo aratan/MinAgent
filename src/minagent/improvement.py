@@ -38,6 +38,11 @@ from .reflection import first_json_object
 MAX_HYPOTHESES = 12
 MAX_PROMPT_ENTRIES = 24
 MAX_EXCERPT_CHARS = 500
+# A trigger is a retrieval condition, not an essay. Long enough for a real
+# precondition ("the user has corrected me twice in one turn"), short enough that
+# someone scanning the prompt for when to apply a lesson can actually find the
+# condition instead of inferring it.
+MAX_TRIGGER_CHARS = 160
 # One nudge per setting per cooldown. Without it a hypothesis that is wrong in
 # one direction gets corrected by the next one in the other, and the setting
 # oscillates forever while both hypotheses look supported.
@@ -97,7 +102,26 @@ SAFE_SETTINGS: dict[str, SettingRule] = {
 
 @dataclass(frozen=True)
 class Hypothesis:
-    """One extrapolation, with the evidence that produced it."""
+    """One extrapolation, with the evidence that produced it.
+
+    ``falsifier`` and ``trigger`` are the two fields that make this a
+    scientific claim rather than a hunch, and both were missing when this
+    dataclass was written. A hypothesis that cannot say what would prove it
+    wrong is not weaker for admitting it - it is unfalsifiable, which means
+    nothing can ever count as refuting it and so nothing ever will. A hypothesis
+    with no trigger condition is worse: it cannot be retrieved at the moment it
+    applies, so it is either always on and therefore ignored, or never on and
+    therefore dead weight in every prompt that carries it.
+
+    The literature is blunt about why these are not optional. The single most
+    transferable recommendation in a recent critique of agentic AI-scientist
+    systems was a centralised preregistration record: write the hypothesis down
+    *with* its falsifier before the experiment, because a claim written after
+    the result is a claim that can accommodate any outcome. And work on
+    experience-derived heuristics found that the useful shape is a cause plus a
+    guideline with an explicit condition attached - not a trajectory, not a
+    summary, and not a paragraph.
+    """
 
     title: str
     statement: str
@@ -109,6 +133,8 @@ class Hypothesis:
     setting: str = ""
     value: str = ""
     reason: str = ""
+    falsifier: str = ""
+    trigger: str = ""
 
 
 @dataclass(frozen=True)
@@ -214,21 +240,37 @@ def build_session_prompt(
                 '{"hypotheses": [{"title": "short name", "kind": "insight|improvement", "target": '
                 '"agent|project", "statement": "what this session shows", "evidence": "the specific items '
                 'that support it", "expected": "what would be better next time", "verify": "how to check '
-                'it was right", "setting": "a setting name or empty", "value": "a proposed value or '
+                'it was right", "falsifier": "what would show this is wrong", "trigger": "when this '
+                'applies", "setting": "a setting name or empty", "value": "a proposed value or '
                 'empty", "reason": "why that value"}]}\n'
                 "The target decides who acts on it. Use \"agent\" for anything about how the agent itself "
                 "paces, schedules, retries, refuses or loads things - the GPU budget, the job queue, the "
                 "timeouts, the voice, the memory it keeps - and \"project\" only for facts about the code, "
                 "the models or the data the user is working with.\n"
+                "Two fields decide whether a hypothesis is worth keeping.\n"
+                "Falsifier: name the observation that would prove you wrong. A hypothesis you cannot refute "
+                "is not a cautious hypothesis, it is an unfalsifiable one, and an unfalsifiable hypothesis "
+                "can never be retired - it will sit in the prompt forever being agreed with. Write the "
+                "falsifier before the evidence, not after: a claim written once the result is known can "
+                "absorb any outcome, and that is the difference between a prediction and a rationalisation. "
+                "\"Verify\" asks how to confirm it; \"falsifier\" asks how to kill it. They are not the same "
+                "field and a hypothesis that only fills in the first one has not been tested.\n"
+                "Trigger: name the condition under which this applies, in terms someone could notice in the "
+                "moment. \"When the user corrects the agent twice in one turn\" is a trigger. \"When it is "
+                "useful\" and \"in difficult situations\" are not - they describe no moment, so the lesson "
+                "can never be applied on purpose and only gets applied by accident.\n"
                 "A setting may only be proposed for target \"agent\", and only from this list, each with the "
-                "evidence that would justify changing it:\n"
+                "evidence that would justify changing it. A setting proposed without a falsifier will still "
+                "be tried and measured, and will be reverted if it makes things worse, but it can never be "
+                "kept afterwards - so without a falsifier you are proposing work, not a change:\n"
                 + "\n".join(
                     f"- {rule.name}: {rule.why} Allowed range {_current_display(rule)}."
                     for rule in sorted(SAFE_SETTINGS.values(), key=lambda item: item.name)
                 )
                 + "\nLeave setting and value empty unless the material names a specific number that should "
                 "change, and never propose a value at either end of a range. An empty list is a correct "
-                "answer when nothing generalises."
+                "answer when nothing generalises. Refusing to write a falsifier is also a correct answer: a "
+                "hypothesis you cannot falsify is not ready to be proposed."
             ),
         },
         {
@@ -283,9 +325,29 @@ def parse_hypotheses(text: str) -> list[Hypothesis]:
                 setting=setting,
                 value=value,
                 reason=_text(entry.get("reason")),
+                falsifier=_text(entry.get("falsifier")),
+                trigger=_text(entry.get("trigger"))[:MAX_TRIGGER_CHARS],
             )
         )
     return hypotheses
+
+
+def can_promote(hypothesis: Hypothesis) -> bool:
+    """Whether a hypothesis is allowed to become a lasting change.
+
+    A setting may be *tried* without a falsifier, because trying it is safe: the
+    trial in :mod:`minagent.measure` watches a window and reverts anything that
+    makes things worse. What is not safe is *keeping* a change nobody can refute,
+    because then there is no statement that could ever have come back wrong, and
+    the only way out is someone editing the file by hand.
+
+    So the falsifier gates promotion, not application. The first version of this
+    rule dropped the setting outright, which read as the safer choice and was not:
+    it quietly disabled the revert path, because no trial was ever recorded for
+    a change that had been discarded. A guard that removes the thing it guards is
+    not a guard.
+    """
+    return bool(hypothesis.falsifier.strip())
 
 
 def plan_adjustments(
