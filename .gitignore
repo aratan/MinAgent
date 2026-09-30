@@ -39,6 +39,9 @@ node_modules/
 /None
 /config.json
 /mcp_server.md
+# A generated status report, named after the workspace. Listed by its exact name
+# rather than as /README_*.md, which would also swallow a translated readme.
+/README_workspace.md
 .atl/
 
 # Screen captures written by the captura-pantalla skill, not part of the project.
