@@ -165,6 +165,7 @@ from .ollama_models import (
     format_models_table,
 )
 from .openai import OpenAiClient
+from .persona import persona_sections
 from .reflection import (
     REFLECTION_MAX_TOKENS,
     build_review_prompt,
@@ -927,7 +928,12 @@ class MinAgent:
             )
         # Memory, web and shell instructions are not repeated here: each one is
         # stated once, by the capability that carries those tools.
-        return [{"name": "Core", "content": " ".join(core)}]
+        sections = [{"name": "Core", "content": " ".join(core)}]
+        # Ara's own account of itself comes after the rules, never before them:
+        # a persona is a description, and a description that overwrote the rules
+        # would be able to talk the agent out of them.
+        sections.extend(persona_sections(self.application_root))
+        return sections
 
     def _register_missing(self, definitions: Sequence[dict[str, Any]]) -> None:
         """Add only the schemas the catalogue does not have yet."""
