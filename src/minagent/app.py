@@ -8,6 +8,7 @@ gates, and compacts history when the context window fills.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -19,6 +20,20 @@ from typing import Any
 
 import httpx
 
+from .admission import (
+    CONSISTENCY,
+    REDUNDANT,
+    REJECTED,
+    VALID,
+    Admission,
+    Criticism,
+    Lesson,
+    admit,
+    build_consistency_prompt,
+    compose_admission,
+    load_admission_log,
+    save_admission_log,
+)
 from .attachments import prepare_user_message as prepare_attachments
 from .capabilities import (
     DEFAULT_CAPABILITY_IDLE_TURNS,
@@ -120,11 +135,14 @@ from .mcp import (
 )
 from .measure import (
     Scorecard,
-    Trial,
+    advance_trial,
+    describe_progress,
     describe_trial,
-    judge,
+    load_ledger,
     load_trial,
+    save_ledger,
     save_trial,
+    start_trial,
 )
 from .memory import (
     AUTO_CAPTURE_SOURCE,
@@ -152,11 +170,13 @@ from .reflection import (
     build_review_prompt,
     build_verdict_prompt,
     detect_eureka,
+    first_json_object,
     format_review_result,
     parse_review,
     parse_verdict,
 )
 from .request_cache import RequestCache
+from .resident import ResidentWorker, build_worker
 from .secrets import approval_preview, redact_likely_secrets
 from .senses import SensesClient, create_senses_tools
 from .skills import (
@@ -452,6 +472,22 @@ SLASH_COMMANDS = [
 ]
 
 
+def _as_duration(seconds: float) -> str:
+    """A wait long enough to be worth naming, spelled the way a person would.
+
+    A raw "900.0s" in a status line reads like a bug; "15m" reads like a
+    decision someone made.
+    """
+    value = int(round(seconds))
+    if value < 60:
+        return f"{value}s"
+    if value < 3600:
+        return f"{value // 60}m"
+    if value % 3600 == 0:
+        return f"{value // 3600}h"
+    return f"{value // 3600}h{value % 3600 // 60:02d}m"
+
+
 def model_context_hint(model: str) -> int | None:
     """The window a model name states, such as ``8k`` or ``32k``, or ``None``."""
     match = _MODEL_CONTEXT_HINT.search(model or "")
@@ -472,6 +508,15 @@ def assistant_text(content: Any) -> str:
         for item in content
         if isinstance(item, dict) and item.get("type") == "text"
     )
+
+
+# The reviewer's words on the way in, the gate's words on the way out.
+_VERDICT_WORDS = {
+    "valid": VALID,
+    "invalid": REJECTED,
+    "rejected": REJECTED,
+    "redundant": REDUNDANT,
+}
 
 
 class MinAgent:
@@ -613,6 +658,10 @@ class MinAgent:
         # they mostly track how long the conversation is.
         self._window_tool_tokens = 0
         self._window_turns = 0
+        # Refusals and failures live on the orchestrator and are never reset by a
+        # session, so a window records where they stood when it opened.
+        self._window_origin_refusals = max(0, self.orchestrator.refusals) if self.orchestrator else 0
+        self._window_origin_failures = max(0, self.orchestrator.failures) if self.orchestrator else 0
         # Token telemetry: what each tool actually costs the context window.
         self._turn_tool_tokens: dict[str, int] = {}
         self._turn_tool_calls: dict[str, int] = {}
@@ -633,6 +682,10 @@ class MinAgent:
         self.last_usage_system_tokens = 0
         self._active_token: CancellationToken | None = None
         self._active_request_in_flight = False
+        self.resident_worker: ResidentWorker | None = None
+        # `ResidentWorker.run` returns why it finished, so the task carries a str.
+        # Annotating this as Task[None] would only hide the real contract.
+        self._resident_task: asyncio.Task[str] | None = None
 
         self._base_system_prompt_sections: list[dict[str, str]] = []
         self._current_system_prompt_sections: list[dict[str, str]] = []
@@ -1312,7 +1365,13 @@ class MinAgent:
                 log=pending,
                 stats=self._session_counters(),
             )
-            answer = await self._ask_with_reflection_model(prompt)
+            reserved = self._reserve_resident_call()
+            if not reserved:
+                return ""
+            try:
+                answer = await self._ask_with_reflection_model(prompt)
+            finally:
+                self._commit_resident_call(reserved)
             if answer is None:
                 return ""
             hypotheses = parse_hypotheses(answer)
@@ -1324,17 +1383,39 @@ class MinAgent:
                 # spending a request to avoid - the session model answers the same
                 # prompt in seconds, and this is how a reflection that would have
                 # been thrown away survives.
-                hypotheses = parse_hypotheses(await self._ask_about(prompt) or "")
+                # A re-ask is still a request, so it is still charged. A cycle
+                # that cannot afford it keeps the answer it could not use and
+                # gives up, rather than spending its last call on a second try.
+                reask = self._reserve_resident_call()
+                if not reask:
+                    return ""
+                try:
+                    hypotheses = parse_hypotheses(await self._ask_about(prompt) or "")
+                finally:
+                    self._commit_resident_call(reask)
             if not hypotheses:
                 return ""
+            # Admit first, and act only on what came through. The order is the
+            # whole point: a trial opened from a hypothesis the gate turned away
+            # measures a change whose own premise was refused, and the setting it
+            # moves is a number the agent then reasons with for the next eight
+            # turns. Gating the *store* is not enough when the store is not the
+            # only door - this used to plan the trial first and screen
+            # afterwards, which made the screen decorative.
+            admitted: list[Any] = []
+            for hypothesis in hypotheses:
+                if await self._store_hypothesis(store, hypothesis):
+                    admitted.append(hypothesis)
             applied: list[str] = []
             proposed: list[str] = []
             if self.improvement_auto:
-                applied = self._apply_self_adjustments(hypotheses)
+                applied = self._apply_self_adjustments(admitted)
             else:
-                proposed = [f"{item.setting}={item.value}" for item in hypotheses if item.setting]
-            for hypothesis in hypotheses:
-                await self._store_hypothesis(store, hypothesis)
+                proposed = [f"{item.setting}={item.value}" for item in admitted if item.setting]
+            # The document still shows everything the model proposed, refused ones
+            # included: that it guessed twelve things and the gate kept one is the
+            # user's business, and the refusals carry their reasons in the
+            # admission log.
             append_document(
                 self.application_root,
                 format_document_section(hypotheses, applied),
@@ -1392,30 +1473,46 @@ class MinAgent:
         if not planned:
             return []
         adjustment = planned[0]
-        _, applied = apply_adjustments(self.application_root, [adjustment])
-        if not applied:
-            return []
+        # The value does not move here. The trial opens on the baseline arm, so
+        # the live setting has to stay at `previous` for the whole of the first
+        # window; writing the proposed value at this point meant the window
+        # labelled "baseline" ran the candidate, and `advance_trial` recorded
+        # arm=previous for turns that never ran it. The whole crossover rests on
+        # each arm being what its ledger entry says it was, and a measurement
+        # that is quietly the other arm is not a measurement - it is a coin toss
+        # that looks like evidence.
+        #
+        # So this function decides only that a trial opens. Every write of the
+        # value, in either direction, belongs to `advance_trial` - including the
+        # revert, which is why a change that loses is still written back
+        # explicitly instead of being left as a leftover.
         log.record(adjustment.name, now)
         save_adjustment_log(self.application_root, log)
-        self._set_setting(adjustment.name, adjustment.proposed)
-        before = self._window_scorecard(window=False)
-        trial = Trial(
+        trial = start_trial(
             setting=adjustment.name,
             previous=adjustment.previous,
             proposed=adjustment.proposed,
             reason=adjustment.reason,
             started_at=datetime.now().astimezone().strftime("%Y-%m-%d %H:%M"),
-            before=before,
-            baseline_refusals=self.orchestrator.refusals if self.orchestrator else 0,
-            baseline_failures=self.orchestrator.failures if self.orchestrator else 0,
+            holdout_fraction=self._improvement_setting("holdout_fraction", 0.2),
         )
+        trial.before = self._window_scorecard(window=False)
         save_trial(self.application_root, trial)
+        # Stated, not assumed. The live value equalling the arm under
+        # measurement is the entire invariant this module rests on, so it is
+        # written down here rather than inherited from whatever the last trial
+        # happened to leave behind.
+        self._set_setting(adjustment.name, adjustment.previous)
         # The window starts clean at the change. A baseline that still carried
         # the turns the change was meant to fix would be measuring the fix
         # against the problem it was supposed to remove.
         self._session_tool_errors = 0
         self._window_tool_tokens = 0
         self._window_turns = 0
+        # Refusals and failures live on the orchestrator and are never reset by a
+        # session, so a window records where they stood when it opened.
+        self._window_origin_refusals = max(0, self.orchestrator.refusals) if self.orchestrator else 0
+        self._window_origin_failures = max(0, self.orchestrator.failures) if self.orchestrator else 0
         return [f"{adjustment.name}: {adjustment.previous} -> {adjustment.proposed} (en medición)"]
 
     def _window_scorecard(self, *, window: bool = True) -> Scorecard:
@@ -1426,54 +1523,105 @@ class MinAgent:
         empty measurement and the verdict is always "nothing improved".
         """
         orchestrator = self.orchestrator
+        refusals = max(0, orchestrator.refusals) if orchestrator else 0
+        failures = max(0, orchestrator.failures) if orchestrator else 0
+        if window:
+            # Measured from where this window opened. Refusals and failures are
+            # never reset by a session, so a session-wide total would make an arm
+            # measured late in a trial look worse purely for having been later.
+            refusals = max(0, refusals - self._window_origin_refusals)
+            failures = max(0, failures - self._window_origin_failures)
         return Scorecard(
             turns=self._window_turns if window else self._session_turns,
             tool_errors=self._session_tool_errors,
-            job_refusals=max(0, orchestrator.refusals) if orchestrator else 0,
-            job_failures=max(0, orchestrator.failures) if orchestrator else 0,
+            job_refusals=refusals,
+            job_failures=failures,
             tool_tokens=self._window_tool_tokens,
         )
 
     def _advance_trial(self) -> str:
-        """Add this turn to the open trial and judge it once the window is full.
+        """Fold this turn into the open trial, and act when the evidence is in.
 
-        A change that is reverted is written back to ``.env`` so the next start
-        is right, and said out loud: silently disagreeing with what is on screen
-        would be worse than the change itself.
+        A single window is one run, and one run cannot tell a change from which
+        run you happened to keep. The trial alternates between the old value and
+        the new one window by window until both arms have enough runs, and only
+        then asks ``compare_arms``. A change that is turned down is written back
+        to ``.env`` and said out loud: silently disagreeing with what is on
+        screen would be worse than the change itself.
         """
         trial = load_trial(self.application_root)
-        if trial is None or trial.judged:
+        if trial is None or trial.decided:
             return ""
         self._window_turns += 1
         card = self._window_scorecard()
         card.turns = self._window_turns
-        card.job_refusals = max(0, card.job_refusals - trial.baseline_refusals)
-        card.job_failures = max(0, card.job_failures - trial.baseline_failures)
-        trial.after = card
+        # No subtraction of the session baseline here. _window_scorecard already
+        # measured the window from where the window opened, and subtracting the
+        # whole-session baseline on top of that would clamp refusals and failures
+        # back to zero and quietly turn both cases into automatic passes.
+
+        ledger = load_ledger(self.application_root)
+        step = advance_trial(
+            trial,
+            ledger,
+            card,
+            min_runs=self._improvement_count("min_runs", 9),
+            max_regressions=self._improvement_count("max_regressions", 1),
+            # The session's own cost per turn, so "expensive" is relative to the
+            # work this session is actually doing rather than a fixed number.
+            cost_bar=self._window_scorecard(window=False).cost_rate(),
+        )
+        save_ledger(self.application_root, ledger)
         save_trial(self.application_root, trial)
-        verdict = judge(trial)
-        if verdict.startswith("undecided"):
-            return ""
-        trial.judged = True
-        trial.kept = verdict.startswith("keep")
-        trial.verdict = verdict
-        save_trial(self.application_root, trial)
-        if trial.kept:
-            self._window_turns = 0
-            self._session_tool_errors = 0
-            self._window_tool_tokens = 0
-            return f"Medición: {verdict}"
+        # Only when the trial moved. Resetting every turn would cap the window
+        # at one turn, and a run of one turn is not a run.
+        if step.apply:
+            self._reset_measurement_window()
+            self._apply_trial_value(trial.setting, step.apply)
+        return step.message
+
+    def _improvement_setting(self, name: str, fallback: float) -> float:
+        """A configured evidence parameter, or the documented default."""
+        return float(getattr(self.config, f"improvement_{name}", fallback) or fallback)
+
+    def _improvement_count(self, name: str, fallback: int) -> int:
+        """A configured evidence parameter that counts things and must be whole.
+
+        Distinct from `_improvement_setting` because coercing here is not
+        cosmetic: a configured 9.5 would otherwise reach `runs() < 9.5` as 9.5 and
+        quietly behave like 9, and a count that is not a whole number is a
+        configuration mistake worth truncating visibly rather than passing
+        through as a float.
+        """
+        return int(self._improvement_setting(name, fallback))
+
+    def _reset_measurement_window(self) -> None:
+        """The window starts clean at every switch.
+
+        A window that carried turns from the previous arm would be measuring the
+        new value against a baseline it did not run under.
+        """
+        self._window_turns = 0
+        self._session_tool_errors = 0
+        self._window_tool_tokens = 0
+        # Refusals and failures live on the orchestrator and are never reset by a
+        # session, so a window records where they stood when it opened.
+        self._window_origin_refusals = max(0, self.orchestrator.refusals) if self.orchestrator else 0
+        self._window_origin_failures = max(0, self.orchestrator.failures) if self.orchestrator else 0
+
+    def _apply_trial_value(self, name: str, value: str) -> None:
+        """Move a trial's setting to whichever arm is live now.
+
+        Written unconditionally when the trial asks for it. The trial knows which
+        value it last set; the environment does not, because applying a change
+        updates the file and the session and leaves the process environment
+        holding whatever the user started with.
+        """
         apply_adjustments(
             self.application_root,
-            [Adjustment(
-                name=trial.setting,
-                previous=trial.proposed,
-                proposed=trial.previous,
-                reason="reverted by measurement",
-            )],
+            [Adjustment(name=name, previous="", proposed=value, reason="trial crossover")],
         )
-        self._set_setting(trial.setting, trial.previous)
-        return f"Medición: {verdict}. {trial.setting} vuelve a {trial.previous}."
+        self._set_setting(name, value)
 
     def _set_setting(self, name: str, value: str) -> None:
         """Apply a setting to the running session, not only to the file."""
@@ -1492,13 +1640,151 @@ class MinAgent:
             self.orchestrator.voice_timeout_seconds = number
 
 
-    async def _store_hypothesis(self, store: MemoryStore, hypothesis: Any) -> None:
-        """Keep a hypothesis in memory as well as in the document.
+    @staticmethod
+    def _lesson_from(hypothesis: Any) -> Lesson:
+        """The hypothesis in the shape the critics judge.
+
+        ``guideline`` is the statement, not the title: a title is a label and a
+        label cannot be obeyed, while the statement is the thing the agent would
+        actually do differently. ``trigger`` carries the condition, because a
+        guideline with no condition is either always on and ignored or never on
+        and dead weight.
+        """
+        return Lesson(
+            title=hypothesis.title[:120],
+            guideline=hypothesis.statement,
+            trigger=hypothesis.trigger or hypothesis.verify,
+            cause=hypothesis.evidence,
+            evidence=hypothesis.evidence,
+            kind=hypothesis.kind,
+        )
+
+    async def _known_lessons(self, store: MemoryStore) -> list[Lesson]:
+        """What is already in context, which is what consistency is judged against."""
+        try:
+            rows = await store.recent(limit=24)
+        except AgentError:
+            return []
+        known: list[Lesson] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            content = str(row.get("content") or "")
+            if not content.strip():
+                continue
+            known.append(
+                Lesson(
+                    title=str(row.get("title") or "previous lesson")[:120],
+                    guideline=content,
+                    trigger=str(row.get("source") or "recorded earlier"),
+                )
+            )
+        return known
+
+    async def _ask_consistency(self, lesson: Lesson, known: list[Lesson]) -> Criticism | None:
+        """One question to the model: does this contradict or merely restate?
+
+        ``None`` means the reviewer could not be reached, and the caller treats
+        that as a refusal rather than a pass. A screen that fails open is not a
+        screen - this gate is the only thing standing between a wrong lesson and
+        every decision that follows it.
+        """
+        if not known:
+            # Nothing in context to contradict or restate, so the answer is
+            # known without asking. Not a shortcut around the check: the check
+            # has no question to ask.
+            return Criticism(CONSISTENCY, VALID, "nothing in context to contradict")
+        reserved = self._reserve_resident_call()
+        if not reserved:
+            # Out of budget, which is not the same as out of luck. The reviewer
+            # is not consulted, and `None` is what an unreachable reviewer
+            # returns, so the lesson is refused and never enters the store.
+            #
+            # `None` is honest here and wrong in the log. `compose_admission`
+            # records it as "the reviewer could not be reached", which for a
+            # budget decision is a lie about the reason: the reviewer was
+            # perfectly reachable and we chose not to pay. The cycle's own
+            # `Cycle.detail` is where that is said, because a night that ran out
+            # of money is an operational fact, not a judgement on a lesson.
+            return None
+        try:
+            answer = await self._ask_about(
+                build_consistency_prompt(lesson, known), max_tokens=400
+            )
+        finally:
+            self._commit_resident_call(reserved)
+        if not answer:
+            return None
+        payload = first_json_object(answer)
+        if not isinstance(payload, dict):
+            return Criticism(CONSISTENCY, REJECTED, "the reviewer did not answer in the shape asked for")
+        # The prompt asks for "valid|invalid|redundant" and the module records
+        # "rejected", so the two vocabularies are mapped here rather than
+        # compared directly. Every non-valid answer is a rejection - the gate
+        # treats an unrecognised verdict as a refusal, never as a pass - but it
+        # is recorded under the word the reviewer actually used, because a
+        # refusal logged as "unrecognised verdict" throws away the reason it was
+        # worth keeping.
+        verdict = str(payload.get("verdict") or "").strip().lower()
+        mapped = _VERDICT_WORDS.get(verdict)
+        if mapped is None:
+            return Criticism(CONSISTENCY, REJECTED, f"unrecognised verdict '{verdict}'")
+        return Criticism(CONSISTENCY, mapped, str(payload.get("reason") or "")[:300])
+
+    def _record_admission(self, lesson: Lesson, admission: Admission) -> None:
+        """Keep the decision, both sides of it, in a file a person can read."""
+        log = load_admission_log(self.application_root)
+        log.add(lesson, admission)
+        save_admission_log(self.application_root, log)
+
+    async def _store_hypothesis(self, store: MemoryStore, hypothesis: Any) -> bool:
+        """Admit a hypothesis, then keep it in memory as well as in the document.
 
         In the document it is something the user reads once. In the store it is
         something that can resurface at the moment it is relevant, which is the
         whole reason to keep it twice.
+
+        Admission happens first, and a refusal stops the write. Nothing
+        downstream ever sees a lesson that did not pass, because once a lesson is
+        in context it is not inert: it shapes the next decision, that decision
+        produces work, and the work is itself later distilled. Deleting the
+        culprit afterwards recovers only part of the loss, so the screen is
+        before the write and not after it.
+
+        Returns whether the hypothesis was admitted *and* kept, which is the one
+        thing the caller needs: a hypothesis this answers ``False`` for must
+        neither be acted on nor proposed, or the gate stops being a gate and
+        becomes a note in a log. A write that failed counts as not kept - a
+        lesson the agent cannot recall is not one it can honestly be said to
+        have learned, and measuring against it would attribute the effect of a
+        setting to a lesson the agent never had.
         """
+        lesson = self._lesson_from(hypothesis)
+        known = await self._known_lessons(store)
+
+        screen = admit(lesson, known)
+        # Any refusal from the screen is final, and that includes the duplicate
+        # and contradiction checks. Those two are deterministic - an exact
+        # restatement of a lesson already in context is knowable without asking
+        # anyone - so treating them as "consistency still undecided" and then
+        # asking the model was how a real finding, "already known as 'Regla
+        # previa'", got overwritten with "the reviewer could not be reached".
+        # The refusal was still the right outcome, but the recorded reason was
+        # a different one, and a log that cannot say why a lesson was turned
+        # away is a gate nobody can audit.
+        admission = (
+            screen
+            if screen.rejections
+            else compose_admission(
+                lesson,
+                consistency=await self._ask_consistency(lesson, known),
+                known=known,
+            )
+        )
+        self._record_admission(lesson, admission)
+        if not admission.promote:
+            return False
+
         content = hypothesis.statement
         if hypothesis.evidence:
             content += f"\nEvidencia: {hypothesis.evidence}"
@@ -1513,13 +1799,137 @@ class MinAgent:
                 f"reflexión: {hypothesis.verify or 'sin criterio de comprobación'}",
             )
         except AgentError:
+            return False
+        return True
+
+    def _reserve_resident_call(self) -> bool:
+        """Hold one model call against the resident cycle's ceiling.
+
+        ``True`` when there was nothing to hold against. An interactive
+        reflection is not a resident cycle and is bounded by the user's own turn
+        and attention, not by the autonomous budget - the budget exists to stop
+        a loop nobody is watching, and taxing a person who is watching would be
+        the wrong cap entirely.
+
+        The caller must pass the answer to :meth:`_commit_resident_call` and
+        must not make the call when it is ``False``. That is the reservation
+        pattern: the cap is enforced by refusing the request, so a call that was
+        never sent can never be one the cap had to be told about afterwards.
+        """
+        worker = self.resident_worker
+        if worker is None:
+            return True
+        return worker.budget.reserve_call()
+
+    def _commit_resident_call(self, reserved: bool) -> None:
+        """Settle a hold. In a ``finally``, because the call was still made.
+
+        A dispatched request is charged whatever came back: an answer that was
+        empty, malformed, or an exception all billed the provider the same. The
+        alternative - charging only on success - is a cap that a flaky endpoint
+        walks straight through.
+        """
+        if not reserved:
             return
+        worker = self.resident_worker
+        if worker is not None:
+            worker.budget.commit_call()
+
+    def _start_resident_worker(self) -> ResidentWorker:
+        """Start the loop that works while the machine is free.
+
+        Off unless IMPROVEMENT_AUTONOMOUS is on, which is not the default: a
+        loop nobody asked for is a loop nobody can account for, and this one
+        spends provider credits while it runs.
+
+        Started as a task rather than awaited, because the whole point is that
+        the prompt stays answerable while it does. The worker stands aside on
+        its own when a turn of yours is in flight; that check is the reason this
+        can share a process with the editor.
+
+        Returns the worker so a caller that is not the session - the `resident`
+        entrypoint - can tell whether anything is actually going to run. A
+        starter that reports nothing leaves "did it start?" unanswerable, and a
+        loop that did not start is exactly the failure worth being loud about.
+        """
+        if self.resident_worker is not None:
+            return self.resident_worker
+        worker = build_worker(self, self.config)
+        self.resident_worker = worker
+        if not worker.enabled:
+            return worker
+        self._resident_task = asyncio.ensure_future(worker.run())
+        return worker
+
+    async def _stop_resident_worker(self) -> None:
+        """Stop the loop and wait for it, so a cycle is never cut mid-flight.
+
+        The budget is already a hard cap, so a cancelled cycle loses at most one
+        reflection. The wait is what keeps a half-written document from being
+        left behind for the next session to find.
+        """
+        worker, task = self.resident_worker, self._resident_task
+        self.resident_worker, self._resident_task = None, None
+        if worker is not None:
+            worker.stop()
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    def _resident_status(self) -> list[tuple[str, str, bool]]:
+        """What /mejoras shows about the loop, so its absence is never silent.
+
+        A background loop that is quietly not running is worse than one that is
+        not running, because the user is left believing their agent is looking
+        after things. Every state gets a line, including 'off' and 'budget
+        spent'.
+        """
+        worker = self.resident_worker
+        if worker is None:
+            return [("resident loop", "not started", False)]
+        rows: list[tuple[str, str, bool]] = [
+            (
+                "resident loop",
+                "on" if worker.enabled else "off (set IMPROVEMENT_AUTONOMOUS=on)",
+                False,
+            ),
+            ("cycle", f"every {_as_duration(worker.cycle_seconds)} while free", False),
+            (
+                "budget",
+                f"{worker.budget.cycles}/{worker.budget.max_cycles} cycles, "
+                f"{worker.budget.model_calls}/{worker.budget.max_model_calls} model calls",
+                False,
+            ),
+        ]
+        if not worker.enabled:
+            return rows
+        gate = worker.last_gate
+        rows.append(("last gate", gate.detail if gate else "not read yet", False))
+        if worker.skipped_in_flight:
+            rows.append(("stood aside", f"{worker.skipped_in_flight}x for a turn of yours", False))
+        if worker.skipped_idle:
+            rows.append(("waited", f"{worker.skipped_idle}x, machine not free", False))
+        if worker.cycles:
+            last = worker.cycles[-1]
+            rows.append(
+                (
+                    "last cycle",
+                    f"{last.outcome}{': ' + last.detail if last.detail else ''}",
+                    last.outcome == "error",
+                )
+            )
+        return rows
 
     async def handle_improvement_command(self, argument: str) -> None:
         """Run ``/mejoras``: read what past reflections said, or reflect now."""
         if not self.memory_enabled or self.memory_store is None:
             raise AgentError("Memory is disabled. Set MEMORY_ENABLED=on to use it.")
         self.print("")
+        for label, value, warn in self._resident_status():
+            self.ui_print_wrapped(
+                (("│ ", "magenta", False), (f"{label}: ", "muted", False), (value, "warning" if warn else "cyan", False))
+            )
         if argument.strip().lower().startswith("now"):
             self.ui_print_wrapped((("Reflexionando sobre esta sesión…", "muted", False),))
             report = await self.reflect_on_session("asked for")
@@ -1527,7 +1937,27 @@ class MinAgent:
                 self.ui_print_wrapped((("No salió nada aplicable de esta sesión.", "muted", False),))
         else:
             text = read_document(self.application_root)
-            self.ui_print_wrapped((("│ ", "magenta", False), (describe_trial(load_trial(self.application_root)), "cyan", False)))
+            trial = load_trial(self.application_root)
+            # Two different lines for two different moments. Once a change has
+            # been judged there is nothing left to wait for, so the verdict
+            # reads best on its own. While it is still running, the number that
+            # matters is how the arms are doing - "3 of 8 turns" alone cannot
+            # tell someone whether to keep waiting, because it looks identical
+            # whether the change is winning or losing.
+            self.ui_print_wrapped(
+                (
+                    ("│ ", "magenta", False),
+                    (
+                        describe_progress(
+                            trial, load_ledger(self.application_root), self._improvement_count("min_runs", 9)
+                        )
+                        if trial is not None and not trial.decided
+                        else describe_trial(trial),
+                        "cyan",
+                        False,
+                    ),
+                )
+            )
             if not text:
                 self.ui_print_wrapped(
                     (("Todavía no hay reflexiones. Usa /mejoras now para forzar una.", "muted", False),)
@@ -3826,6 +4256,10 @@ class MinAgent:
         self._session_job_failures = 0
         self._window_tool_tokens = 0
         self._window_turns = 0
+        # Refusals and failures live on the orchestrator and are never reset by a
+        # session, so a window records where they stood when it opened.
+        self._window_origin_refusals = max(0, self.orchestrator.refusals) if self.orchestrator else 0
+        self._window_origin_failures = max(0, self.orchestrator.failures) if self.orchestrator else 0
         # A new conversation has no task left over from the last one, so every
         # capability that was loaded only for that task goes back to the index.
         self.reset_capabilities()
@@ -4991,6 +5425,7 @@ class MinAgent:
             editor.prepend_keypress(self._make_keypress_capture(editor, state, paste_state))
             editor.on_keypress(self._make_keypress_listener(state))
             editor.start()
+            self._start_resident_worker()
 
             try:
                 while True:
@@ -5174,6 +5609,7 @@ class MinAgent:
                 self._stdout.write(BRACKETED_PASTE_DISABLE)
                 editor.close()
         finally:
+            await self._stop_resident_worker()
             await self.mcp_connections.get("close", _noop)()
 
     def _request_exit(self) -> None:

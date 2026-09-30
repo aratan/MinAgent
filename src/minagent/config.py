@@ -46,6 +46,10 @@ _ASSIGNMENT = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
 _POSITIVE_INTEGER = re.compile(r"^\d+$")
 _DIRECTORY_ENTRY_LIMIT = re.compile(r"^-?\d+$")
 _RATIO = re.compile(r"^\d*\.?\d+$")
+# Anchored at both ends so "0.5 seconds" or a trailing comment is refused rather
+# than silently parsed as 0.5 - a settings file edited by hand fails loudly or it
+# is not worth editing by hand.
+_UNIT_INTERVAL = re.compile(r"^(?:0|1|0?\.\d+|1\.0+)$")
 
 
 def load_env_file(file_path: str, target: MutableMapping[str, str] | None = None) -> None:
@@ -104,6 +108,25 @@ def parse_non_negative_integer(value: str | None, name: str, fallback: int) -> i
     if not _POSITIVE_INTEGER.match(cleaned):
         raise AgentError(f"{name} must be zero or a positive integer.")
     return int(cleaned)
+
+
+def parse_unit_interval(value: str | None, name: str, fallback: float) -> float:
+    """Parse a fraction of something: ``0.0`` through ``1.0`` inclusive.
+
+    For the two settings that are fractions of a whole - the idle load threshold
+    and the share of cases reserved as a holdout - where the two interesting
+    mistakes are a threshold above 1, which reads as "the machine is never idle"
+    and silently disables the loop, and a holdout of 0, which reserves nothing
+    and makes the property vacuous. Both are accepted deliberately: a holdout of
+    exactly 0 is a caller saying they want no reservation, and a threshold of
+    exactly 1 is a caller saying the machine is never free.
+    """
+    cleaned = _cleaned(value)
+    if not cleaned:
+        return fallback
+    if not _UNIT_INTERVAL.match(cleaned):
+        raise AgentError(f"{name} must be a number between 0 and 1.")
+    return float(cleaned)
 
 
 def parse_directory_entry_limit(value: str | None) -> int:
@@ -283,6 +306,28 @@ class Config:
     improvement_auto: bool
     improvement_interval: int
     improvement_model: str
+    # Autonomous improvement. Off by default, because the one thing this adds is
+    # work the user did not ask for on a machine they may be using, and the
+    # throttle that makes it acceptable is the idle gate rather than good
+    # intentions. Every budget below is a hard stop: the systems that run
+    # unattended in the literature all stop on a budget rather than on
+    # convergence, because an agent that decides it is finished is an agent that
+    # can decide it is finished while still making things worse.
+    improvement_autonomous: bool
+    improvement_idle_seconds: int
+    improvement_cycle_seconds: int
+    improvement_max_cycles: int
+    improvement_model_calls_per_cycle: int
+    improvement_cpu_threshold: float
+    # The evidence gate. Zero means "measure once and believe it", which is the
+    # setting the noise measurements argue against: single-run pass@1 moves by
+    # more than two points depending on which run was kept, so one run discovers
+    # improvements that do not exist. The default is the smallest number that
+    # can tell a real change from noise.
+    improvement_min_runs: int
+    improvement_max_regressions: int
+    improvement_holdout_fraction: float
+    improvement_lesson_budget: int
     web_search_enabled: bool
     ollama_api_key: str | None
     web_search_base_url: str
@@ -443,6 +488,42 @@ def load_configuration(
         # reflection and loaded back after. That trade is measured, but it is the
         # user's card and their call - see the README for the numbers.
         improvement_model=(environment.get("IMPROVEMENT_MODEL") or "").strip(),
+        improvement_autonomous=parse_boolean_setting(
+            environment.get("IMPROVEMENT_AUTONOMOUS"), "IMPROVEMENT_AUTONOMOUS", False
+        ),
+        improvement_idle_seconds=parse_positive_integer(
+            environment.get("IMPROVEMENT_IDLE_SECONDS"), "IMPROVEMENT_IDLE_SECONDS", 120
+        ),
+        improvement_cycle_seconds=parse_positive_integer(
+            environment.get("IMPROVEMENT_CYCLE_SECONDS"), "IMPROVEMENT_CYCLE_SECONDS", 900
+        ),
+        improvement_max_cycles=parse_positive_integer(
+            environment.get("IMPROVEMENT_MAX_CYCLES"), "IMPROVEMENT_MAX_CYCLES", 4
+        ),
+        improvement_model_calls_per_cycle=parse_positive_integer(
+            environment.get("IMPROVEMENT_MODEL_CALLS_PER_CYCLE"),
+            "IMPROVEMENT_MODEL_CALLS_PER_CYCLE",
+            6,
+        ),
+        improvement_cpu_threshold=parse_unit_interval(
+            environment.get("IMPROVEMENT_CPU_THRESHOLD"), "IMPROVEMENT_CPU_THRESHOLD", 0.25
+        ),
+        improvement_min_runs=parse_positive_integer(
+            environment.get("IMPROVEMENT_MIN_RUNS"), "IMPROVEMENT_MIN_RUNS", 9
+        ),
+        improvement_max_regressions=parse_non_negative_integer(
+            environment.get("IMPROVEMENT_MAX_REGRESSIONS"), "IMPROVEMENT_MAX_REGRESSIONS", 1
+        ),
+        improvement_holdout_fraction=parse_unit_interval(
+            environment.get("IMPROVEMENT_HOLDOUT_FRACTION"), "IMPROVEMENT_HOLDOUT_FRACTION", 0.2
+        ),
+        # A small pool on purpose. Work on self-evolving agents reached higher
+        # accuracy from a pool several times smaller than the one that survived
+        # screening, because every lesson kept is carried in the prompt on every
+        # later call and most of them were teaching nothing.
+        improvement_lesson_budget=parse_positive_integer(
+            environment.get("IMPROVEMENT_LESSON_BUDGET"), "IMPROVEMENT_LESSON_BUDGET", 12
+        ),
         memory_direct_answer=parse_boolean_setting(
             environment.get("MEMORY_DIRECT_ANSWER"), "MEMORY_DIRECT_ANSWER", True
         ),
