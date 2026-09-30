@@ -1,0 +1,47 @@
+[Unit]
+# Runs MinAgent's improvement loop with no terminal attached.
+#
+# The loop is the part of MinAgent that works when nobody is typing, so this
+# unit is the whole of "resident": there is no second implementation to keep in
+# step. Anything this file could do, `minagent resident` does by hand.
+Description=MinAgent improvement loop
+# The loop asks the provider whether the machine is free, so it needs the
+# network. It does not need a login session, which is why this is a user unit.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# MINAGENT_ROOT is not optional. Without it MinAgent looks for its project root
+# by walking up from the installed package, which lands on the wrong directory
+# whenever the interpreter lives outside the project - and then the loop quietly
+# reads a different .env, or none at all.
+Environment=MINAGENT_ROOT=/home/victor/proyecto/MinAgent
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/home/victor/proyecto/MinAgent
+
+# Set IMPROVEMENT_AUTONOMOUS=on in the project .env before enabling this. The
+# unit deliberately does not set it here: the switch lives with the rest of the
+# configuration, and a unit that enabled itself would start spending provider
+# credits the moment someone ran `systemctl enable`.
+ExecStart=/home/victor/proyecto/MinAgent/.venv/bin/python -m minagent resident
+
+# A cycle holds provider calls. On failure, back off and try again rather than
+# restarting in a tight loop against a failing endpoint.
+Restart=on-failure
+RestartSec=60
+
+# The loop stops on SIGTERM and waits for the cycle in flight to close, so give
+# it room. Without this systemd sends SIGKILL at TimeoutStopSec, which is the
+# case that leaves a half-written trial document behind.
+KillSignal=SIGTERM
+TimeoutStopSec=120
+
+# The loop reads and writes the project, and talks to one endpoint. It does not
+# need to be root, and does not need to create devices or change identity.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
