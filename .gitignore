@@ -64,3 +64,8 @@ node_modules/
 *.log
 .DS_Store
 Thumbs.db
+
+# Runtime state written with an underscore, distinct from the .minagent/ above.
+# Whoever writes these writes them on every run; untracked state that is not
+# ignored makes `git status` look clean when nothing is actually clean.
+.min_agent/

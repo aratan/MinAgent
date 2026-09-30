@@ -518,15 +518,45 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--idioma", default="", help="Código de idioma, p.ej. es. Vacío = autodetectar.")
     parser.add_argument("--modelo-stt", default=WHISPER_DEFAULT_MODEL, help="Modelo de whisper.cpp.")
     parser.add_argument("--estado", action="store_true", help="Informa del estado de los motores.")
+    parser.add_argument(
+        "--verificar",
+        action="store_true",
+        help="Con --estado, sintetiza una palabra de verdad para probar que Kokoro funciona.",
+    )
     arguments = parser.parse_args(argv)
 
     if arguments.estado:
         # A status probe is a question, not a job, so a missing engine is an
         # answer rather than a failure: exit 0 with the install line included.
+        #
+        # Importing Kokoro is not evidence that it synthesises. 0.7.x imports
+        # perfectly and returns a fixed 0.25 s clip for every input, so a probe
+        # that only checked the import reported "disponible" while speech was
+        # broken. Say what was actually checked, and leave the expensive check
+        # to --verificar rather than charging every status call a model load.
         if not _kokoro_available():
             emit({"ok": False, "error": _KOKORO_HINT, "whisper": _whisper_binary() or "no instalado"})
+        elif arguments.verificar:
+            probe = speak("Hola.", "", "", 1.0)
+            emit(
+                {
+                    "ok": bool(probe.get("ok")),
+                    "kokoro": "funciona" if probe.get("ok") else "roto",
+                    "verificado": True,
+                    "detalle": probe.get("error") or probe.get("path", ""),
+                    "whisper": _whisper_binary() or "no instalado",
+                }
+            )
+            return 0 if probe.get("ok") else 1
         else:
-            emit({"ok": True, "kokoro": "disponible", "whisper": _whisper_binary() or "no instalado"})
+            emit(
+                {
+                    "ok": True,
+                    "kokoro": "instalado, síntesis sin verificar",
+                    "verificado": False,
+                    "whisper": _whisper_binary() or "no instalado",
+                }
+            )
         return 0
 
     if arguments.texto:

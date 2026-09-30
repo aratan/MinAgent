@@ -503,6 +503,34 @@ def test_a_missing_backend_says_where_it_was_looked_for(tmp_path: Path) -> None:
     assert "COMPUTE_SCRIPTS_DIR" in message
 
 
+def test_a_status_probe_does_not_claim_kokoro_works_without_proving_it() -> None:
+    """The cheapest honest answer is "installed", never "working".
+
+    Kokoro 0.7.x imported perfectly and returned a fixed 0.25 s clip for every
+    input, so the probe that only checked the import reported the engine as
+    available while speech was broken. An unverified probe has to be explicit
+    that it did not check, and --verificar is what turns it into a real claim.
+    """
+    script = Path(__file__).resolve().parent.parent / "scripts" / "compute" / "voz.py"
+    completed = subprocess.run(
+        [sys.executable, str(script), "--estado"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    answer = json.loads(completed.stdout.split("RESULT ", 1)[-1])
+
+    if not answer["ok"]:
+        # No engine installed: that is a real answer and it carries the hint.
+        assert "kokoro" in answer["error"].lower()
+        return
+
+    assert answer["verificado"] is False
+    assert "funciona" not in answer["kokoro"]
+    assert "disponible" not in answer["kokoro"]
+    assert "sin verificar" in answer["kokoro"]
+
+
 def test_a_missing_whisper_says_how_to_install_it() -> None:
     """The one diagnosis the user cannot work out alone.
 
