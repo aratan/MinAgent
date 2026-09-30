@@ -98,7 +98,7 @@ def main() -> int:
     except AgentError as error:
         # Configuration and provider failures are reported, not raised: a
         # service that exits with a traceback tells nobody what to fix.
-        print(f"MinAgent: {error}", file=sys.stderr)
+        print(f"Ara: {error}", file=sys.stderr)
         return 1
 
 

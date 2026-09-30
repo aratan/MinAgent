@@ -509,7 +509,7 @@ def wav_duration(path: Path) -> float:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="STT y TTS locales de MinAgent.")
+    parser = argparse.ArgumentParser(description="STT y TTS locales de Ara.")
     parser.add_argument("--texto", help="Texto a sintetizar con Kokoro.")
     parser.add_argument("--salida", default="", help="Ruta del wav de salida.")
     parser.add_argument("--voz", default="", help="Voz de Kokoro, p.ej. af_heart o ef_dora.")

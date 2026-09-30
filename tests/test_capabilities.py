@@ -487,3 +487,29 @@ def test_the_index_is_cheaper_than_the_schemas_it_replaces(tmp_path):
     assert index is not None
     eager = estimate_text_tokens(json_stringify(app.tools))
     assert estimate_text_tokens(index["content"]) < eager
+
+
+def test_the_agent_is_called_ara_and_the_project_is_still_minagent(tmp_path):
+    """The name the agent answers to and the name on disk are two different things.
+
+    The agent is Ara in every string the user and the model read. The project
+    is still MinAgent in every place that resolves to something real: the
+    package, the module the systemd unit runs, and the directory those paths
+    point at. Renaming the identity was a rename of who it is, not of where
+    it lives, and a well-meaning sweep that took the paths along with it would
+    break `python -m minagent` and MINAGENT_ROOT for a cosmetic gain.
+    """
+    app = _app(tmp_path)
+    prompt = json_stringify(app.build_base_system_prompt())
+
+    # Ara: everything the model or the user reads.
+    assert "You are Ara" in prompt
+    for stale in ("You are MinAgent", "Exit MinAgent", "MinAgent · SESSION"):
+        assert stale not in prompt, f"{stale!r} is the old name in a user-visible string"
+
+    # MinAgent: everything that resolves to a path, a module, or an env var.
+    import minagent
+    import minagent.app
+
+    assert minagent.__name__ == "minagent"
+    assert hasattr(minagent.app, "MinAgent"), "the class is the project name, not the identity"

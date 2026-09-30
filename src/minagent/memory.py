@@ -930,7 +930,7 @@ def create_memory_tools() -> list[dict[str, Any]]:
             "function": {
                 "name": "recall",
                 "description": (
-                    "Search MinAgent's persistent memory for a procedure, fact, or past experience that "
+                    "Search Ara's persistent memory for a procedure, fact, or past experience that "
                     "already answers this task. Call it before a non-trivial task to reuse verified "
                     "knowledge instead of rediscovering it."
                 ),
