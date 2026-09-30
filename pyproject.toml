@@ -31,6 +31,10 @@ packages = ["src/minagent"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Some test modules import helpers from `tests.other_module`, which needs the
+# project root on the path. Without this, the documented `uv run pytest` fails
+# at collection with "No module named 'tests'" and only `python -m pytest` works.
+pythonpath = ["."]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 filterwarnings = ["ignore::DeprecationWarning"]

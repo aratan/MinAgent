@@ -44,6 +44,17 @@ node_modules/
 # Screen captures written by the captura-pantalla skill, not part of the project.
 /capturas/
 
+# Generated media and downloads: what the agent produces, not the project.
+/salida/
+/output/
+
+# Scratch scripts and one-off probes written while working.
+/workspace/
+/historial_capturas.txt
+
+# Capability modules the agent wrote and has not been asked to keep durable.
+/.minagent/subagents/
+
 # Snapshots, console logs and screenshots the Playwright MCP server writes.
 /.playwright-mcp/
 
