@@ -380,6 +380,19 @@ Naming a model is also not free on a card where the two do not fit together: the
 
 What the guards cannot do is check that a number moves in the right direction. Every value in range is survivable, which is what the bounds are for, but the reason a change is defensible is the evidence in the document, not the number in the file. Source code is deliberately not in the set: an agent that rewrites itself has no way to notice that it made things worse.
 
+### Dreaming: looking things up while nobody is watching
+
+`IMPROVEMENT_AUTO=on` also runs the loop while the machine is idle. It is the same guard every time: `logind`'s `IdleHint` says nobody is at the keyboard, and a turn of yours in flight makes it stand down at once. On top of that it runs the research pass, which is why `WEB_SEARCH_ENABLED=on` is what turns this from reflection into learning.
+
+The pass answers the oldest open question in `agente/PREGUNTAS.md`. That file is the point of the whole arrangement: choosing what to ask and answering what was asked are two different actions, and only the second one costs anything. So overnight the agent can *propose* questions, and everything it proposes lands in a file you can read, edit or delete over breakfast, before a single request is spent answering them. What it then believes still has to walk the same path a question you wrote by hand would: looked up, stated from the cited pages, checked against what is already known, and admitted only if the gate agrees.
+
+When the queue is short, the proposal pass runs first, and it goes through the six thinking hats - the fact, feeling, risk, benefit, alternative and control disciplines Edward de Bono set out for forcing a single habitual frame off a subject. Each hat asks a different question about the *same* subject, which is what makes the set worth more than one question asked twice. The hats read what is known about you (`agente/USER.md`), what has been learned (the memory store), and what has already been answered, so the subject comes from your work rather than from the agent's imagination.
+
+Two deliberate deviations, both about money:
+
+- **The six hats are one request, not six.** Six requests per cycle is six requests nobody is around to audit. That is a reading of the method chosen for a budget, and it is why a hat that comes back empty is simply not asked about.
+- **A cycle funds at most three passes.** Two or three happen when the budget affords them and the queue has that many; the stop is always the budget. A queue holding two or more questions is left alone, because questions you wrote down outrank anything the agent would add.
+
 ### Validating the change
 
 The first version of this applied a change and never found out whether it was right, which is not a loop - it is a sequence of unverified edits and a growing pile of settings nobody chose. A change is now put on probation instead: the value moves, a baseline is taken, and at the end of a window of real turns it is judged and either kept or **reverted on its own**, with the verdict said out loud and `.env` left in the state the verdict implies.

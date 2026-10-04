@@ -46,6 +46,16 @@ MIN_CALLS_PER_CYCLE = 2
 #: a cycle that cannot pay for both cannot produce a promotable finding.
 RESEARCH_MIN_CALLS = 2
 
+#: How many research passes one cycle may fund.
+#:
+#: This is a floor on the budget, not a substitute for it: the loop still stops
+#: when :meth:`Budget.can_fund_research` says no, so a cycle with room for two
+#: runs two. It exists because the number of passes a *cycle* may make is not
+#: the same question as how many calls are left, and a loop that only reads the
+#: latter would let one quiet stretch run six searches while nothing was watching.
+#: The budget is what is spent; this is what one cycle may attempt.
+MAX_RESEARCH_PASSES_PER_CYCLE = 3
+
 #: What the loop is doing, for a transcript. A user reading a log at 2am should
 #: be able to tell the difference between "I did nothing" and "I was not
 #: allowed to".
@@ -367,11 +377,20 @@ class ResidentWorker:
             # It shares the reflection's error handling on purpose: a research
             # pass that raises is the same kind of event as a reflection that
             # raises, and neither is a reason to stop a loop nobody is watching.
-            if (
+            #
+            # Repeated while the budget still affords a whole investigation,
+            # rather than once per cycle: a pass that returns a note and leaves
+            # budget behind is a pass being asked to stop for no reason, and the
+            # budget is the only thing here entitled to say when to stop.
+            notes: list[str] = []
+            passes = 0
+            while (
                 self.research is not None
                 and self.cycles[-1].outcome != ERROR
+                and passes < MAX_RESEARCH_PASSES_PER_CYCLE
                 and self.budget.can_fund_research()
             ):
+                passes += 1
                 try:
                     note = (await self.research()).strip()
                 except asyncio.CancelledError:
@@ -380,9 +399,16 @@ class ResidentWorker:
                 except Exception as exc:  # noqa: BLE001
                     note = f"research failed: {type(exc).__name__}: {exc}"
                 if note:
-                    self.cycles[-1].detail = (
-                        f"{self.cycles[-1].detail}; {note}" if self.cycles[-1].detail else note
-                    )
+                    notes.append(note)
+                if not note:
+                    # Nothing queued, nothing worth asking: the loop has run dry
+                    # and another pass would only spend another cycle's look.
+                    break
+            if notes:
+                joined = "; ".join(notes)
+                self.cycles[-1].detail = (
+                    f"{self.cycles[-1].detail}; {joined}" if self.cycles[-1].detail else joined
+                )
             self.cycles[-1].charged = self.budget.model_calls - spent_before
             if self.budget.remaining_in_cycle() == 0 and not self.cycles[-1].detail:
                 # Said out loud because the alternative is a night that produced
@@ -425,6 +451,10 @@ def build_worker(
     """
     return ResidentWorker(
         reflect=lambda: agent.reflect_on_session("idle"),
+        # The research hook, wired. It was left optional so a host that only
+        # wanted the reflection was not made to supply a callable it would never
+        # use; this is that host, and the call it has been waiting for.
+        research=lambda: agent.run_research_pass(),
         enabled=bool(getattr(config, "improvement_autonomous", False)),
         cycle_seconds=float(getattr(config, "improvement_cycle_seconds", 900.0) or 900.0),
         budget=_budget_from(config),

@@ -20,6 +20,7 @@ from typing import Any
 
 import httpx
 
+from . import curiosity
 from .admission import (
     CONSISTENCY,
     REDUNDANT,
@@ -197,7 +198,7 @@ from .ollama_models import (
     format_models_table,
 )
 from .openai import OpenAiClient
-from .persona import persona_sections
+from .persona import load_persona_file, persona_sections
 from .reflection import (
     REFLECTION_MAX_TOKENS,
     build_review_prompt,
@@ -2073,6 +2074,116 @@ class MinAgent:
         # join has to happen here rather than with ``/``, which would concatenate
         # a path onto the text and produce a file that is never read again.
         return Path(self.application_root) / "agente" / "PREGUNTAS.md"
+
+    async def run_research_pass(self) -> str:
+        """One unit of research work, for the resident cycle.
+
+        Two things happen here, in this order, and only one of them spends
+        requests. If the queue is short, this proposes questions to it - which
+        costs one request and writes text a person can read and delete before
+        anything is spent answering it. Then the pass that already existed
+        answers the oldest open question.
+
+        Curating first is what makes the autonomy safe: the agent can only ever
+        *ask* for something overnight. What gets believed still has to walk the
+        same path a question written by hand would - looked up, stated from
+        cited pages, checked against what is already known, and admitted only
+        if the gate agrees.
+        """
+        curated = await self._curate_research_questions()
+        answered = await self._research_one_question()
+        return "; ".join(part for part in (curated, answered) if part)
+
+    async def _curate_research_questions(self) -> str:
+        """Propose questions for the queue through the six hats, if it is short.
+
+        Returns a line for the cycle record, or ``""`` when nothing was needed
+        or nothing usable came back. A pass that cannot reach the model, or that
+        answers with something unparsable, is not an error: it is a cycle that
+        spent nothing and wrote nothing.
+        """
+        path = self._research_queue_path
+        try:
+            queued = path.read_text(encoding="utf-8")
+        except OSError:
+            queued = ""
+        if not curiosity.needs_curation(queued):
+            return ""
+        if self.web_search_client is None:
+            return ""
+        reserved = self._reserve_resident_call()
+        if not reserved:
+            return ""
+        try:
+            reply = await self._ask_with_reflection_model(
+                [{"role": "user", "content": await self._curation_prompt(queued)}]
+            )
+        except (AgentError, OSError, ValueError):
+            return ""
+        finally:
+            self._commit_resident_call(reserved)
+
+        questions = curiosity.parse_questions(reply or "")
+        if not questions:
+            return ""
+        added = curiosity.append_questions(str(path), questions)
+        if not added:
+            return ""
+        return f"curated {added} question(s) from the hats: {curiosity.describe(questions[:added])}"
+
+    async def _curation_prompt(self, queued: str) -> str:
+        """The one request that proposes what to ask about while nobody watches."""
+        store = self.memory_store
+        known: list[Lesson] = []
+        if store is not None:
+            known = await self._recent_lessons(store)
+        lessons = "\n".join(f"- {lesson.title}: {lesson.guideline}" for lesson in known)
+        user_model = load_persona_file(
+            os.path.join(self.application_root, "agente", "USER.md"), limit=2000
+        )
+        return curiosity.build_prompt(
+            subject=self._curation_subject(),
+            user_model=user_model or "",
+            lessons=lessons,
+            already_asked=curiosity.already_asked(queued),
+        )
+
+    def _curation_subject(self) -> str:
+        """What the last turn was actually about, as the hats' starting point.
+
+        Deliberately short and factual: the subject is a seed, not a direction.
+        The hats widen it, and a subject that arrived with a conclusion attached
+        would hand the whole exercise its answer before it started.
+        """
+        request = (self._current_user_request or "").strip()
+        return request[:200]
+
+    async def _recent_lessons(self, store: MemoryStore) -> list[Lesson]:
+        """Recent lessons for the prompt, bounded, and never worth a failed cycle.
+
+        A store that cannot be read costs this pass some context and nothing
+        else: the cycle carries on with a thinner prompt rather than dying over
+        a memory lookup nobody asked for.
+        """
+        try:
+            rows = await store.recent(limit=12)
+        except (AgentError, OSError, ValueError):
+            return []
+        lessons: list[Lesson] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            content = str(row.get("content") or "").strip()
+            if not content:
+                continue
+            lessons.append(
+                Lesson(
+                    title=str(row.get("title") or "previous lesson")[:120],
+                    guideline=content,
+                    trigger=str(row.get("source") or "recorded earlier"),
+                )
+            )
+        return lessons
 
     async def _research_one_question(self) -> str:
         """Answer the oldest open question, if this cycle can still afford it.
