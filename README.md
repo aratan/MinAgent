@@ -299,6 +299,33 @@ When `MCP_ENABLED=on`, MinAgent reads `.minagent/mcp.json` from the MinAgent pro
 
 MinAgent reads the file at startup and re-reads it before each request when the file changed, reconnecting the servers and withdrawing the tools of a server that is no longer configured. Servers authored by the model through `write_mcp_server` are written to the project's `.agents/mcp/<name>/` directory and registered in the same `.minagent/mcp.json`. It exposes up to 32 tools to the model. Each input schema is limited to 8 KiB, all exposed tool definitions together to 64 KiB, and combined server instructions to 8 KiB. MCP text results are limited to 48,000 characters; supported images follow the same 10 MiB and four-image limits as local attachments. MCP servers run with your account permissions.
 
+### Teaching it how to drive a server
+
+A server may describe itself in its `initialize` handshake, and those instructions ride along with its tools. Most good ones publish nothing at all, and a bare list of schemas is not enough to drive them correctly: the order of the calls, which argument carries an element handle, what the server refuses - none of that is inferable from a tool name. So a server entry may carry its own `instructions`:
+
+```json
+{
+  "mcpServers": {
+    "playwright": {
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp@0.0.82", "--headless", "--isolated", "--browser", "chromium"],
+      "instructions": "Navigate, then snapshot, then act on a ref from that snapshot. The argument carrying the handle is named 'target', not 'ref'."
+    }
+  }
+}
+```
+
+The note is shown to the model together with that server's tools, ahead of anything the server said about itself, and `write_mcp_server` keeps it when it rewrites an entry. It is bounded like any other guidance, stripped of control characters, and never sent to a server. A server with neither an `instructions` field nor handshake instructions adds no prompt section at all.
+
+### Driving a real browser
+
+Playwright's MCP server is the usual example, and it is worth registering rather than shelling out to a script, because it drives a real Chromium and pages that need their JavaScript to run actually work. Two flags matter on a machine without a system Chrome:
+
+- `--headless`, because the server is headed by default, which is wrong for a terminal agent.
+- `--browser chromium` with `--executable-path` pointing at a Chromium that exists here. Without the executable path it asks for a `chrome-for-testing` build this machine may not have. To use the server's own build instead, run `npx @playwright/mcp@0.0.82 install-browser chrome-for-testing`.
+
+Note that `.minagent/mcp.json` is local and gitignored, so a fresh clone has no browser configured: the entry above has to be recreated, and an absolute `--executable-path` is the part that will not survive on another machine.
+
 ## Memory
 
 When `MEMORY_ENABLED=on`, MinAgent keeps a local SQLite database of what it has learned at `.agents/memory/memoria.db` (override with `MEMORY_DB_PATH`). The database holds entries with a kind (`procedure`, `solution`, `fact`, `preference`, or `experience`), a title, the content, tags, and running success, failure, and reuse counts. Duplicate titles reinforce the existing entry instead of creating a second one, and the weakest entries are pruned once the store grows past its cap. The store runs in WAL mode, keeps indexes for confidence, recency, and last use, and on open refreshes the query planner with `PRAGMA optimize` and vacuums the file when free pages dominate.

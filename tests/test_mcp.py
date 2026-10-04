@@ -37,11 +37,17 @@ class _McpTestHandler(BaseHTTPRequestHandler):
 
     def _result_for(self, call: dict[str, Any]) -> Any:
         if call["method"] == "initialize":
-            return {
+            result: dict[str, Any] = {
                 "protocolVersion": "2025-11-25",
                 "capabilities": {},
                 "serverInfo": {"name": "test", "version": "1"},
             }
+            # One mode publishes instructions and the rest do not, because that
+            # is the split that matters: most servers say nothing, which is why
+            # the operator's own note has to reach the model as well.
+            if self.server.mode == "instructed":  # type: ignore[attr-defined]
+                result["instructions"] = "Call the snapshot tool before anything that needs a handle."
+            return result
         if call["method"] == "tools/list":
             if self.server.mode == "many":  # type: ignore[attr-defined]
                 return {
@@ -109,6 +115,12 @@ class _McpTestHandler(BaseHTTPRequestHandler):
 def _write_config(root, url: str) -> str:
     config_path = root / "mcp.json"
     config_path.write_text(json.dumps({"mcpServers": {"local": {"url": url}}}))
+    return str(config_path)
+
+
+def _write_config_with_instructions(root, url: str, instructions: str) -> str:
+    config_path = root / "mcp.json"
+    config_path.write_text(json.dumps({"mcpServers": {"local": {"url": url, "instructions": instructions}}}))
     return str(config_path)
 
 
@@ -232,3 +244,93 @@ async def test_a_server_that_speaks_another_dialect_is_named_in_one_line(tmp_pat
     finally:
         server.shutdown()
         server.server_close()
+
+
+async def test_a_local_note_reaches_the_model_when_the_server_says_nothing(tmp_path):
+    """The Playwright case: 25 schemas, no instructions, and nothing to drive them.
+
+    A server's guidance comes from its own handshake, and most good ones
+    publish none. Without the operator's note the model gets a list of tool
+    names and has to work out the order of the calls from the names alone.
+    """
+    server = _McpTestServer("plain")
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        config_path = _write_config_with_instructions(
+            tmp_path, server.url, "Navigate, then snapshot, then act on a ref from that snapshot."
+        )
+        connections = await asyncio.wait_for(connect_mcp_servers(config_path, str(tmp_path)), timeout=5)
+        try:
+            guidance = [entry for entry in connections["server_guidance"] if entry["server_name"] == "local"]
+            assert len(guidance) == 1
+            assert "Navigate, then snapshot, then act" in guidance[0]["instructions"]
+        finally:
+            await connections["close"]()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+async def test_the_operator_note_comes_before_what_the_server_said(tmp_path):
+    server = _McpTestServer("instructed")
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        config_path = _write_config_with_instructions(tmp_path, server.url, "Local note first.")
+        connections = await asyncio.wait_for(connect_mcp_servers(config_path, str(tmp_path)), timeout=5)
+        try:
+            instructions = connections["server_guidance"][0]["instructions"]
+            assert instructions.startswith("Local note first.")
+            assert "Call the snapshot tool" in instructions
+        finally:
+            await connections["close"]()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+async def test_a_server_with_no_instructions_of_either_kind_adds_no_guidance(tmp_path):
+    """Nothing to say is not worth a prompt section."""
+    server = _McpTestServer("plain")
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        config_path = _write_config(tmp_path, server.url)
+        connections = await asyncio.wait_for(connect_mcp_servers(config_path, str(tmp_path)), timeout=5)
+        try:
+            assert connections["server_guidance"] == []
+        finally:
+            await connections["close"]()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_rewriting_a_server_keeps_the_note_written_for_it(tmp_path):
+    """write_mcp_server replaces the whole entry, so a dropped key is lost text.
+
+    The note is the only thing telling the model how to drive a server that
+    publishes no instructions, so losing it on the next unrelated registration
+    would be a silent regression nobody notices until the agent gets stuck.
+    """
+    root = tmp_path / "project"
+    (root / ".minagent").mkdir(parents=True)
+    config_path = root / ".minagent" / "mcp.json"
+    config_path.write_text(
+        json.dumps({"mcpServers": {"notas": {"url": "http://127.0.0.1:1/mcp", "instructions": "Usa el snapshot."}}})
+    )
+    write_mcp_server(str(root), str(config_path), {"name": "otro", "command": "node"})
+    stored = json.loads(config_path.read_text())
+    assert stored["mcpServers"]["notas"]["instructions"] == "Usa el snapshot."
+
+
+def test_write_mcp_server_rejects_a_note_it_cannot_carry(tmp_path):
+    root = tmp_path / "project"
+    root.mkdir()
+    with pytest.raises(AgentError, match="instructions must be a non-empty string"):
+        write_mcp_server(str(root), str(root / ".minagent" / "mcp.json"), {"name": "ok", "command": "node", "instructions": "   "})
+    with pytest.raises(AgentError, match="instructions exceed"):
+        write_mcp_server(
+            str(root),
+            str(root / ".minagent" / "mcp.json"),
+            {"name": "ok", "command": "node", "instructions": "x" * 9000},
+        )
+    assert not (root / ".minagent" / "mcp.json").exists()

@@ -464,6 +464,28 @@ async def _list_tools(client: Any) -> dict[str, Any]:
     raise AgentError("MCP tools/list exceeded the 100-page limit.")
 
 
+def _local_instructions(config: Any) -> str:
+    """The operator's own note about a server, from ``mcp.json``.
+
+    A server's instructions come from its own handshake, and plenty of good ones
+    publish nothing at all: a bare list of schemas is not enough to drive them
+    correctly. This is where the knowledge that cannot be introspected goes -
+    the order of the calls, which argument carries an element handle, what the
+    server refuses - written by whoever configured it.
+    """
+    if not isinstance(config, dict):
+        return ""
+    instructions = config.get("instructions")
+    if not isinstance(instructions, str):
+        return ""
+    return instructions.strip()[:MAX_MCP_GUIDANCE_CHARS]
+
+
+def _join_instructions(local: str, remote: str) -> str:
+    """The operator's note first, then what the server said about itself."""
+    return "\n\n".join(part for part in (local, remote) if part).strip()
+
+
 def _create_client(server_name: str, config: Any, default_cwd: str, timeout_ms: int = REQUEST_TIMEOUT_MS) -> Any:
     """Build a stdio or HTTP client from one ``mcpServers`` entry."""
     if not isinstance(config, dict):
@@ -544,8 +566,9 @@ async def connect_mcp_servers(
                     f"only the first {MAX_MCP_TOOLS} were considered."
                 )
             clients.append(client)
-            if client.instructions:
-                server_guidance.append({"server_name": server_name, "instructions": client.instructions})
+            if client.instructions or _local_instructions(server_config):
+                guidance = _join_instructions(_local_instructions(server_config), client.instructions)
+                server_guidance.append({"server_name": server_name, "instructions": guidance})
 
             # A server that answers tools/list in another dialect is worth one
             # clear line rather than one per tool: the agent silently loses the
@@ -742,6 +765,15 @@ def _stored_server_entry(config: Any) -> dict[str, Any]:
         if not isinstance(cwd, str) or not cwd.strip():
             raise AgentError("Server cwd must be a non-empty string.")
         entry["cwd"] = cwd
+    instructions = config.get("instructions")
+    if instructions is not None:
+        # Stored rather than dropped: write_mcp_server rewrites the whole entry,
+        # so a note left out here would vanish the next time a server is added.
+        if not isinstance(instructions, str) or not instructions.strip():
+            raise AgentError("Server instructions must be a non-empty string.")
+        if len(instructions) > MAX_MCP_GUIDANCE_CHARS:
+            raise AgentError(f"Server instructions exceed {MAX_MCP_GUIDANCE_CHARS} characters.")
+        entry["instructions"] = instructions.strip()
     return entry
 
 
@@ -821,7 +853,11 @@ def write_mcp_server(application_root: str, config_path: str, args: dict[str, An
         if len(content.encode("utf-8")) > MAX_MCP_SCRIPT_BYTES:
             raise AgentError(f"script content exceeds {MAX_MCP_SCRIPT_BYTES} bytes.")
 
-    supplied = {key: args[key] for key in ("url", "command", "args", "env", "headers", "cwd") if args.get(key) is not None}
+    supplied = {
+        key: args[key]
+        for key in ("url", "command", "args", "env", "headers", "cwd", "instructions")
+        if args.get(key) is not None
+    }
     if script is not None and not supplied.get("url") and not supplied.get("command"):
         supplied["command"] = MCP_SCRIPT_COMMANDS[os.path.splitext(filename)[1].lower()]
         supplied.setdefault("args", ["{script}"])
@@ -894,6 +930,14 @@ def create_mcp_authoring_tools() -> list[dict[str, Any]]:
                             "description": "Extra environment variables as string values",
                         },
                         "cwd": {"type": "string", "description": "Working directory for the server"},
+                        "instructions": {
+                            "type": "string",
+                            "description": (
+                                "How this server must be driven: the order of the calls, which argument carries "
+                                "an element handle, what it refuses. Shown to the model with the server's tools, "
+                                "and worth writing for any server that publishes no instructions of its own."
+                            ),
+                        },
                         "url": {"type": "string", "description": "Streamable HTTP server URL instead of a command"},
                         "overwrite": {
                             "type": "boolean",
