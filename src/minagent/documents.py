@@ -78,7 +78,6 @@ BASE_CSS = (
 )
 
 _TEXT_SUFFIXES = {".txt", ".md", ".markdown", ".rst", ".log", ".jsonl", ".ini", ".yaml", ".yml"}
-_TABULAR_SUFFIXES = {".csv", ".tsv", ".txt"}
 _PYMUPDF_HINT = "Install it with `uv sync --extra documents`."
 
 
