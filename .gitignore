@@ -21,6 +21,10 @@
 # twice and never belongs in a repository.
 .minagent/resident.lock
 
+# The question queue the idle loop appends to. It grows on its own and belongs
+# to whoever is reading it, not to the repository.
+/agente/PREGUNTAS.md
+
 # Python / uv
 .venv/
 # The generation backends run on their own Python 3.12: Kokoro's misaki
