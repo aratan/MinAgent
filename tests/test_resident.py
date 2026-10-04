@@ -701,6 +701,34 @@ class FakeAgent:
 
     async def reflect_on_session(self, reason):
         self.reasons.append(reason)
+        return ""
+
+
+def test_a_cycle_keeps_what_the_reflection_said():
+    """The reflection's answer reaches the cycle that paid for it.
+
+    It used to be discarded at the `await`: the return value was never bound,
+    so a cycle recorded "idle" and nothing else, and the only thing a reader
+    could learn from a night of work was what research had queued.
+    """
+
+    class Talkative(FakeAgent):
+        async def reflect_on_session(self, reason):
+            await super().reflect_on_session(reason)
+            return "12 hipótesis; propuso REVIEW_EVERY_TURNS=2"
+
+    built = build_worker(Talkative(), FakeConfig(), sleep=Clock())
+    built._gate = lambda: IdleState(IDLE, "logind")
+
+    asyncio.run(built.run())
+
+    assert all("12 hipótesis" in cycle.detail for cycle in built.cycles)
+    # And it composes rather than replaces: the budget notice is about work that
+    # did not happen, and must not push out the finding that did.
+    assert built.cycles[-1].detail.startswith("12 hipótesis")
+
+
+
 
 
 def test_the_builder_reflects_with_a_reason_the_transcript_can_show():

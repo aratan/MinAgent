@@ -429,7 +429,7 @@ class ResidentWorker:
                 )
             )
             try:
-                await self.reflect()
+                reflected = await self.reflect()
             except asyncio.CancelledError:
                 self.budget.cancel_cycle()
                 raise
@@ -440,6 +440,13 @@ class ResidentWorker:
                 # is least able to look after itself.
                 self.detail = f"{type(exc).__name__}: {exc}"
                 self.cycles[-1].outcome, self.cycles[-1].detail = ERROR, self.detail
+            else:
+                # Kept on the cycle. It used to be dropped on the floor: the
+                # reflection's answer went nowhere, so a cycle that reflected
+                # perfectly reported nothing beyond "idle" unless research had
+                # something to add.
+                if reflected:
+                    self.cycles[-1].detail = reflected.strip()
 
             # Research runs after the reflection and out of what it left, so a
             # cycle that reflected well is not also charged for going looking.
@@ -479,14 +486,22 @@ class ResidentWorker:
                     f"{self.cycles[-1].detail}; {joined}" if self.cycles[-1].detail else joined
                 )
             self.cycles[-1].charged = self.budget.model_calls - spent_before
-            if self.budget.remaining_in_cycle() == 0 and not self.cycles[-1].detail:
+            if self.budget.remaining_in_cycle() == 0:
                 # Said out loud because the alternative is a night that produced
                 # fewer findings than it looks like it should have, with no
                 # record of why. The reflection model is allowed to return up to
                 # twelve hypotheses and the reviewer is one call each, so a
                 # cycle capped below that reviews only as many as it can afford
                 # - and says so here rather than dropping the rest in silence.
-                self.cycles[-1].detail = "out of cycle budget; the rest went unexamined"
+                #
+                # Appended rather than standing in for the detail: the notice is
+                # about work that did not happen, and the reflection's answer is
+                # about work that did, so replacing the second with the first
+                # would hide the only finding the cycle actually made.
+                notice = "out of cycle budget; the rest went unexamined"
+                self.cycles[-1].detail = (
+                    f"{self.cycles[-1].detail}; {notice}" if self.cycles[-1].detail else notice
+                )
         else:
             self.outcome, self.detail = STOPPED, "stopped on request"
 
