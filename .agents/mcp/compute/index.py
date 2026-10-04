@@ -51,13 +51,22 @@ if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from minagent.compute import (  # noqa: E402
+    DEFAULT_JOB_TIMEOUT_SECONDS,
+    DEFAULT_QUEUE_LIMIT,
+    DEFAULT_VRAM_TOTAL_MIB,
     QUEUE_TOOL_NAME,
     RESULT_TOOL_NAME,
+    VOICE_TIMEOUT_SECONDS,
     ComputeOrchestrator,
     create_compute_tools,
     format_heavy_result,
     format_speak_result,
     format_transcribe_result,
+)
+from minagent.config import (  # noqa: E402
+    load_env_file,
+    parse_ollama_unload_mode,
+    parse_positive_integer,
 )
 
 MAX_MESSAGE_CHARS = 4 * 1024 * 1024
@@ -70,15 +79,78 @@ def _log(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
 
+def _configured_orchestrator(root_directory: str, application_root: str) -> ComputeOrchestrator:
+    """An orchestrator that obeys the project's ``.env``, not just its defaults.
+
+    This was built as ``ComputeOrchestrator(root_directory=root_directory)`` and
+    nothing else, so every compute setting silently fell back to its default. The
+    one that mattered was ``COMPUTE_UNLOAD_OLLAMA``: with the default ``off`` this
+    server never moves a resident Ollama model, so a heavy job that the native
+    tool renders in 25 s is refused here for lack of VRAM. Same policy on both
+    surfaces is the entire point of delegating to ``minagent.compute``, and a
+    default was not that.
+
+    Only the compute settings are read, through the same parsers ``Config`` uses,
+    rather than through ``load_configuration``: that one demands ``OPENAI_MODEL``
+    and every other setting of a full agent session, and a GPU server for other
+    MCP clients has no business failing because a model id is absent.
+    """
+    environment: dict[str, str] = dict(os.environ)
+    load_env_file(os.path.join(application_root, ".env"), environment)
+    return ComputeOrchestrator(
+        root_directory=root_directory,
+        # The backends live in the project that owns the agent; the client that
+        # connected here may be working somewhere else entirely.
+        script_directories=(application_root, root_directory),
+        vram_total_mib=parse_positive_integer(
+            environment.get("COMPUTE_VRAM_TOTAL_MIB"), "COMPUTE_VRAM_TOTAL_MIB",
+            DEFAULT_VRAM_TOTAL_MIB,
+        ),
+        job_timeout_seconds=parse_positive_integer(
+            environment.get("COMPUTE_JOB_TIMEOUT_SECONDS"), "COMPUTE_JOB_TIMEOUT_SECONDS",
+            DEFAULT_JOB_TIMEOUT_SECONDS,
+        ),
+        voice_timeout_seconds=parse_positive_integer(
+            environment.get("COMPUTE_VOICE_TIMEOUT_SECONDS"), "COMPUTE_VOICE_TIMEOUT_SECONDS",
+            VOICE_TIMEOUT_SECONDS,
+        ),
+        ollama_mode=parse_ollama_unload_mode(environment.get("COMPUTE_UNLOAD_OLLAMA")),
+        queue_limit=parse_positive_integer(
+            environment.get("COMPUTE_QUEUE_LIMIT"), "COMPUTE_QUEUE_LIMIT", DEFAULT_QUEUE_LIMIT
+        ),
+    )
+
+
 class ComputeServer:
     """The MCP surface over the orchestrator."""
 
-    def __init__(self, root_directory: str) -> None:
-        self.orchestrator = ComputeOrchestrator(root_directory=root_directory)
+    def __init__(self, root_directory: str, application_root: str | None = None) -> None:
+        self.orchestrator = _configured_orchestrator(
+            root_directory, application_root or root_directory
+        )
 
     def tools(self) -> list[dict[str, Any]]:
-        """The same schemas the agent publishes, so both surfaces stay in step."""
-        return create_compute_tools()
+        """The same schemas the agent publishes, so both surfaces stay in step.
+
+        Translated into MCP's shape on the way out. ``create_compute_tools``
+        speaks the OpenAI function-calling dialect - ``{"type": "function",
+        "function": {...}}`` - because that is what the agent's own request
+        expects, while ``tools/list`` answers with a flat
+        ``{name, description, inputSchema}``. Handing the first shape to a
+        client that reads the second is not a cosmetic mismatch: every one of
+        these tools is silently dropped, and the server looks like it works.
+        """
+        published: list[dict[str, Any]] = []
+        for schema in create_compute_tools():
+            function = schema.get("function") or {}
+            published.append(
+                {
+                    "name": str(function.get("name") or ""),
+                    "description": str(function.get("description") or ""),
+                    "inputSchema": function.get("parameters") or {"type": "object", "properties": {}},
+                }
+            )
+        return published
 
     async def call(self, name: str, arguments: dict[str, Any]) -> str:
         """Run one tool and return the text a model should read.
@@ -115,6 +187,7 @@ class ComputeServer:
             record = await orchestrator.generate_music(
                 str(arguments.get("prompt", "")),
                 seconds=int(arguments.get("seconds", 10) or 10),
+                device=str(arguments.get("device", "") or "cuda"),
                 name=str(arguments.get("name", "")),
             )
             return format_heavy_result(record, record.output)
@@ -133,6 +206,7 @@ class ComputeServer:
                 job_id = orchestrator.submit_music(
                     prompt,
                     seconds=int(arguments.get("seconds", 10) or 10),
+                    device=str(arguments.get("device", "") or "cuda"),
                     name=str(arguments.get("name", "")),
                 )
             else:
@@ -230,11 +304,12 @@ async def write(payload: dict[str, Any]) -> None:
 
 
 def main() -> int:
-    root = os.environ.get("MINAGENT_ROOT") or str(_ROOT)
-    if not (Path(root) / "pyproject.toml").is_file():
-        root = os.getcwd()
+    application_root = os.environ.get("MINAGENT_ROOT") or str(_ROOT)
+    if not (Path(application_root) / "pyproject.toml").is_file():
+        application_root = os.getcwd()
+    root = application_root
     try:
-        server = ComputeServer(root)
+        server = ComputeServer(root, application_root)
     except Exception as error:  # noqa: BLE001
         _log(f"compute: cannot start: {error}")
         return 1

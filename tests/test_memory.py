@@ -5,12 +5,14 @@ from __future__ import annotations
 import pytest
 
 from minagent.app import MinAgent
+from minagent.app import _is_request_titled as app_request_titled
 from minagent.config import load_configuration
 from minagent.errors import AgentError
 from minagent.memory import (
     AUTO_CAPTURE_SOURCE,
     MemoryStore,
     format_memory_hints,
+    format_memory_stats,
     format_recall,
     format_remember_result,
     match_ratio,
@@ -492,3 +494,129 @@ def test_the_embedding_model_is_configurable_and_optional(tmp_path):
     )
     assert on.memory_embed_model == "nomic-embed-text"
     assert on.improvement_model == "gemma4:12b-q3km"
+
+
+def test_a_relative_memory_path_belongs_to_the_project_not_to_the_workspace(tmp_path):
+    """The bug this fixes cost the agent every memory it had.
+
+    MinAgent is started from the workspace it may edit, so a relative
+    MEMORY_DB_PATH resolved against the working directory opens a *new* empty
+    database inside somebody else's project: the session starts with nothing,
+    writes what it learns into a file nobody reads, and the real store never
+    grows. Here the same relative setting resolves to the project in both
+    directories, which is the only reading under which the setting means what
+    .env.example says it means.
+    """
+    from minagent.config import load_configuration
+
+    project = tmp_path / "MinAgent"
+    workspace = tmp_path / "otro-proyecto"
+    project.mkdir(parents=True)
+    workspace.mkdir(parents=True)
+    (project / ".env").write_text("MEMORY_DB_PATH=.agents/memory/memoria.db\n", encoding="utf-8")
+
+    from_project = load_configuration(str(project), cwd=str(project), env={"OPENAI_MODEL": "test"})
+    from_workspace = load_configuration(str(project), cwd=str(workspace), env={"OPENAI_MODEL": "test"})
+
+    assert from_project.memory_db_path == str(project / ".agents" / "memory" / "memoria.db")
+    assert from_workspace.memory_db_path == from_project.memory_db_path
+    assert not from_workspace.memory_db_path.startswith(str(workspace))
+
+
+def test_an_absolute_memory_path_is_left_exactly_as_written(tmp_path):
+    from minagent.config import load_configuration
+
+    elsewhere = tmp_path / "otro" / "memoria.db"
+    config = load_configuration(
+        str(tmp_path),
+        cwd=str(tmp_path),
+        env={"OPENAI_MODEL": "test", "MEMORY_DB_PATH": str(elsewhere)},
+    )
+    assert config.memory_db_path == str(elsewhere)
+
+
+# ---------------------------------------------------------------- what /memory reports
+
+
+async def test_the_summary_says_how_much_was_reused_and_how_much_was_taken_back(tmp_path):
+    """The panel has to distinguish a store that learns from one that accumulates.
+
+    Totals cannot: 36 reinforcements and no failures looks the same as 36 and 20,
+    and the first is not a record of things going well. It is a store where every
+    lesson turned out to be permanent - which is what a store that never learned
+    anything from a failure looks like from the inside.
+    """
+    store = await _store(tmp_path)
+    reused = await store.remember("procedure", "Read the csv with iconv", "iconv -f utf-8 in.csv", ["csv"])
+    await store.remember("fact", "The project is python", "There is a pyproject.toml", ["project"])
+    await store.record_outcome(reused["id"], False)
+    await store.record_outcome(reused["id"], True)
+
+    text = format_memory_stats(await store.statistics(), await store.recent(5))
+
+    assert "Reused at least once: 1 of 2 (50%)" in text
+    assert "rewarded 1" in text
+    assert "degraded 1" in text
+    # Named, because a store fed by one path and starved of the other is a
+    # finding, and "80 entries" would have hidden it.
+    assert "from " in text
+
+
+async def test_an_untouched_store_reports_zero_and_does_not_divide_by_zero(tmp_path):
+    store = await _store(tmp_path)
+
+    text = format_memory_stats(await store.statistics(), await store.recent(5))
+
+    assert "Reused at least once: 0 of 0 (0%)" in text
+    assert "Nothing learned yet" in text
+
+
+# ---------------------------------------------------------------- retitling
+
+
+async def test_a_memory_can_be_renamed_without_losing_what_it_knows(tmp_path):
+    """The content, the counters and the confidence are the record of what happened.
+
+    Only the words it can be found by change: an entry a store titled with the
+    request cannot be found by anything except repeating that request, and its
+    steps - the part a later session needs - were in the body the whole time.
+    """
+    store = await _store(tmp_path)
+    await store.remember("experience", "hazlo", "Request: escanea la red\nSteps: run_terminal(command=nmap -sV --open localhost)", None)
+    saved = (await store.recent())[0]
+    await store.record_outcome(saved["id"], True)
+    saved = (await store.recent())[0]  # after the reinforcement, which is part of the record
+
+    changed = await store.retitle(saved["id"], "run_terminal: nmap -sV --open localhost")
+
+    entry = (await store.recent())[0]
+    assert entry["title"] == "run_terminal: nmap -sV --open localhost"
+    assert changed["previous"] == "hazlo"
+    assert entry["content"] == saved["content"]
+    assert entry["success_count"] == 1
+    assert entry["confidence"] == saved["confidence"]
+
+
+async def test_renaming_onto_a_title_already_taken_is_refused_not_silently_merged(tmp_path):
+    """Two memories renamed onto the same method is a merge, and a merge is a decision."""
+    store = await _store(tmp_path)
+    first = await store.remember("procedure", "Uno", "a", None)
+    second = await store.remember("procedure", "Dos", "b", None)
+
+    with pytest.raises(AgentError) as error:
+        await store.retitle(second["id"], "Uno")
+
+    assert str(first["id"]) in str(error.value)
+    assert (await store.recent())[0]["title"] == "Uno"
+
+
+async def test_an_entry_the_model_named_itself_is_left_alone(tmp_path):
+    """/memory retitle only touches the auto-captured ones.
+
+    A title the model wrote through ``remember`` is its own wording, and
+    renaming it would be a preference of the migration, not a repair.
+    """
+    store = await _store(tmp_path)
+    mine = await store.remember("procedure", "Quitar el BOM con tail", "tail -c +4 in.csv", None)
+
+    assert not app_request_titled(mine)

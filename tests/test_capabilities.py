@@ -26,6 +26,29 @@ from minagent.jsutil import json_stringify
 from minagent.web_search import WebSearchClient
 from minagent.workspace import WorkspaceAccess
 
+CAPABILITY_TOKEN_BUDGET = 2500
+"""What one capability may cost to load: its schemas plus its guidance.
+
+Measured on this project, the heaviest is ``compute`` at 2369 tokens, and the
+bar is set just above it rather than at a round number so the test says what it
+means: no capability may cost a large slice of a small 8k window before a word of
+the conversation is in it. The model runs on a local 9B where 8k is a real
+size, so a capability that doubles this is not a detail - it is a turn of
+context the user does not get.
+
+It was 2200 while ``compute`` only explained how to queue jobs. It went up
+because the tool schemas now show what a detailed prompt looks like - the
+instruments to name, the lens and the light - and that text is what turns
+"epic music" into a usable track. Cutting it to fit the old number would have
+saved the budget and lost the reason the tools exist, so the bar moved instead.
+
+Guidance is budgeted separately and much tighter, because that is the half that
+grows by writing: schemas change when a tool changes, and guidance changes
+whenever somebody explains one more rule in prose.
+"""
+
+GUIDANCE_TOKEN_BUDGET = 550
+
 
 class _FakeOutput:
     """A stdout stand-in that records what was written."""
@@ -259,6 +282,7 @@ def test_builtin_capabilities_follow_the_enabled_features():
         "files.write",
         "files.delete",
         "tool_output.recall",
+        "documents",
         "files.download",
     ]
     on = build_builtin_capabilities(
@@ -274,6 +298,7 @@ def test_builtin_capabilities_follow_the_enabled_features():
         "files.write",
         "files.delete",
         "tool_output.recall",
+        "documents",
         "files.download",
         "terminal",
         "skills",
@@ -282,6 +307,9 @@ def test_builtin_capabilities_follow_the_enabled_features():
     }
     assert "user approval is required" in by_name["terminal"].guidance
     assert "System: Linux." in by_name["terminal"].guidance
+    # A diagnostic that finds nothing exits non-zero, and that is the answer.
+    assert "exit non-zero when there is nothing to report" in by_name["terminal"].guidance
+    assert "do not retry the same command" in by_name["terminal"].guidance
     assert by_name["skills"].guidance == "Skills: one."
     assert "recall" in by_name["memory"].tool_names
     assert by_name["web"].tool_names == ("web_search", "web_fetch")
@@ -487,6 +515,111 @@ def test_the_index_is_cheaper_than_the_schemas_it_replaces(tmp_path):
     assert index is not None
     eager = estimate_text_tokens(json_stringify(app.tools))
     assert estimate_text_tokens(index["content"]) < eager
+
+
+# ------------------------------------------------------- the context budget
+
+
+def _everything_on(tmp_path) -> MinAgent:
+    """The catalogue this machine can offer, with every tool group registered.
+
+    A budget measured against a catalogue where the schemas are missing measures
+    nothing, so the test turns the features on and registers the tools before it
+    adds up what loading each capability would cost.
+    """
+    app = MinAgent(stdout=_FakeOutput())
+    app.root_directory = str(tmp_path)
+    app.application_root = str(tmp_path)
+    app.workspace_name = "Test"
+    app.workspace_access = WorkspaceAccess(str(tmp_path), "Test", 0)
+    app.terminal_mode = "auto"
+    app.memory_enabled = True
+    app.web_search_enabled = True
+    app.compute_enabled = True
+    app.subagents_enabled = True
+    app.vision_enabled = True
+    app.input_enabled = True
+    app.senses_enabled = True
+    app.ollama_models_enabled = True
+    app.flows_enabled = True
+    app.input_modalities = ["text", "image"]
+    app.rebuild_capabilities()
+    app.register_tool_schemas([build_terminal_tool()])
+    for ensure in (
+        "ensure_skill_tools",
+        "ensure_memory_tools",
+        "ensure_flow_tools",
+        "ensure_web_search_tools",
+        "ensure_download_tools",
+        "ensure_image_tools",
+        "ensure_vision_tools",
+        "ensure_input_tools",
+        "ensure_senses_tools",
+        "ensure_ollama_models_tools",
+        "ensure_subagent_tools",
+        "ensure_compute_tools",
+    ):
+        getattr(app, ensure)()
+    return app
+
+
+def test_no_capability_costs_more_than_the_budget(tmp_path):
+    """The load-on-demand design is only worth anything if loading is cheap.
+
+    Every one of these tokens goes out with every request that touches the
+    capability, before the user's own words. Nothing in the code pushes back on
+    a capability that grows: the schemas are whatever a tool author wrote and
+    the guidance is whatever somebody managed to explain, so the only place the
+    size is defended is here.
+    """
+    app = _everything_on(tmp_path)
+    catalog = app.capabilities
+    assert catalog is not None
+    measured: list[tuple[str, int]] = []
+    for entry in catalog.entries:
+        schemas = sum(
+            estimate_text_tokens(json_stringify(app._tool_schemas[name]))
+            for name in entry.tool_names
+            if name in app._tool_schemas
+        )
+        guidance = estimate_text_tokens(entry.guidance) if entry.guidance else 0
+        measured.append((entry.name, schemas + guidance))
+    assert measured, "the catalogue is empty, so this test would pass on nothing"
+    expensive = [name for name, cost in measured if cost > CAPABILITY_TOKEN_BUDGET]
+    assert not expensive, (
+        f"{expensive} cost more than {CAPABILITY_TOKEN_BUDGET} tokens to load; "
+        f"measured: {sorted(measured, key=lambda row: -row[1])}"
+    )
+
+
+def test_guidance_stays_cheaper_than_the_schemas_it_explains(tmp_path):
+    """Prose is the half that grows by writing, so it gets the tighter bar."""
+    app = _everything_on(tmp_path)
+    catalog = app.capabilities
+    assert catalog is not None
+    heavy = [
+        entry.name
+        for entry in catalog.entries
+        if entry.guidance and estimate_text_tokens(entry.guidance) > GUIDANCE_TOKEN_BUDGET
+    ]
+    assert not heavy, f"{heavy} carry more than {GUIDANCE_TOKEN_BUDGET} tokens of guidance"
+
+
+def test_every_capability_with_a_schema_also_carries_its_rules(tmp_path):
+    """A group of tools with no guidance is a bare schema list, and the model
+    is left guessing the part that only the author knew: when not to use it."""
+    app = _everything_on(tmp_path)
+    catalog = app.capabilities
+    assert catalog is not None
+    silent = [
+        entry.name
+        for entry in catalog.entries
+        if entry.guidance == "" and any(name in app._tool_schemas for name in entry.tool_names)
+    ]
+    # The plain file tools are deliberate: the core prompt already says when to
+    # read, what to edit and when to reread after a failure.
+    allowed = {"files.write", "files.delete"}
+    assert set(silent) <= allowed, f"{sorted(set(silent) - allowed)} are tools with no guidance at all"
 
 
 def test_the_agent_is_called_ara_and_the_project_is_still_minagent(tmp_path):

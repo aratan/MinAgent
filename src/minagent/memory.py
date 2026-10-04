@@ -732,6 +732,42 @@ class MemoryStore:
                 "confidence": confidence,
             }
 
+    async def retitle(self, memory_id: Any, title: Any) -> dict[str, Any]:
+        """Rename one memory without touching what it knows or how it scored.
+
+        For the entries a store accumulated under a title that describes the
+        request rather than the method: the content, the counters and the
+        confidence are the record of what happened and are kept exactly, and
+        only the words it can be found by change.
+        """
+        if isinstance(memory_id, bool) or not isinstance(memory_id, int):
+            raise AgentError("id must be the integer of a stored memory.")
+        cleaned = _clean_text(title, MAX_TITLE_CHARS, "title")
+        return await asyncio.to_thread(self._retitle_sync, memory_id, cleaned)
+
+    def _retitle_sync(self, memory_id: int, title: str) -> dict[str, Any]:
+        key = _title_key(title)
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+            if row is None:
+                raise AgentError(f"There is no memory with id {memory_id}.")
+            # Checked rather than caught: two memories renamed onto the same
+            # method is a merge, and silently letting the unique index abort the
+            # rename would leave the caller thinking it had worked.
+            clash = connection.execute(
+                "SELECT id FROM memories WHERE kind = ? AND title_key = ? AND id != ?",
+                (row["kind"], key, memory_id),
+            ).fetchone()
+            if clash is not None:
+                raise AgentError(
+                    f"Memory #{clash['id']} already has that title; merge them instead of renaming."
+                )
+            connection.execute(
+                "UPDATE memories SET title = ?, title_key = ?, updated_at = ? WHERE id = ?",
+                (title, key, _now(), memory_id),
+            )
+            return {"id": memory_id, "title": title, "previous": row["title"]}
+
     async def forget(self, memory_id: Any) -> bool:
         """Delete one memory and its outcome history."""
         if isinstance(memory_id, bool) or not isinstance(memory_id, int):
@@ -763,7 +799,33 @@ class MemoryStore:
                 "uses": row["uses"],
                 "confidence": row["confidence"],
                 "fts": self.fts_enabled,
+                # The two numbers that say whether the store is learning rather
+                # than accumulating. Totals cannot answer either: a store that
+                # reinforced 36 memories and degraded none looks identical to
+                # one that reinforced 36 and degraded 20, and the first is not a
+                # record of things going well - it is a store where every lesson
+                # turned out to be permanent, which is what a store that never
+                # learned anything from a failure looks like.
+                "reused": self._count(connection, "SELECT COUNT(*) AS n FROM memories WHERE uses > 0"),
+                "rewarded": self._count(
+                    connection, "SELECT COUNT(*) AS n FROM memories WHERE success_count > 0"
+                ),
+                "degraded": self._count(
+                    connection, "SELECT COUNT(*) AS n FROM memories WHERE failure_count > 0"
+                ),
+                "sources": {
+                    (entry["source"] or "?")[:48]: entry["n"]
+                    for entry in connection.execute(
+                        "SELECT source, COUNT(*) AS n FROM memories GROUP BY source "
+                        "ORDER BY n DESC LIMIT 6"
+                    )
+                },
             }
+
+    @staticmethod
+    def _count(connection: sqlite3.Connection, sql: str) -> int:
+        row = connection.execute(sql).fetchone()
+        return int(row["n"]) if row else 0
 
     async def recent(self, limit: int = 10) -> list[dict[str, Any]]:
         """The strongest memories, for display."""
@@ -903,13 +965,32 @@ def format_memory_hints(memories: Sequence[dict[str, Any]], max_chars: int = MAX
 
 
 def format_memory_stats(statistics: dict[str, Any], memories: Sequence[dict[str, Any]]) -> str:
-    """Render the ``/memory`` summary."""
+    """Render the ``/memory`` summary.
+
+    Written to answer "is it learning, and how much" with the store's own
+    numbers rather than with an impression: how many entries were ever recalled
+    again, how many were rewarded, how many were degraded. A store with no
+    failures and many rewards is not a store that got everything right - it is a
+    store that never took anything back, and saying only the totals hides that
+    distinction.
+    """
+    total = statistics["total"]
+    reused = statistics.get("reused", 0)
     lines = [
-        f"Memory: {statistics['total']} entries · {statistics['successes']} successes · "
+        f"Memory: {total} entries · {statistics['successes']} successes · "
         f"{statistics['failures']} failures · {statistics['uses']} reuses · "
         f"average confidence {statistics['confidence']:.2f} · "
         f"{'FTS5 search' if statistics['fts'] else 'LIKE fallback'}"
     ]
+    share = f"{reused * 100 // total}%" if total else "0%"
+    lines.append(
+        f"Reused at least once: {reused} of {total} ({share}) · "
+        f"rewarded {statistics.get('rewarded', 0)} · degraded {statistics.get('degraded', 0)}"
+    )
+    # Named rather than left implicit, because a store full of one kind is a
+    # store where one path was writing and the other three were not.
+    for source, count in (statistics.get("sources") or {}).items():
+        lines.append(f"  · {count} from {source}")
     for memory in memories:
         lines.append(
             f"#{memory['id']} [{memory['kind']}] {memory['title']} ({_stats_label(memory)})"

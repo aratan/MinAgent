@@ -14,6 +14,9 @@
 # Oversized tool results archived outside the context window, so recall works.
 .minagent/tool-outputs/
 
+# Checkpointed long plans: they name this machine's paths and the state of a run.
+.minagent/flows.json
+
 # Python / uv
 .venv/
 # The generation backends run on their own Python 3.12: Kokoro's misaki

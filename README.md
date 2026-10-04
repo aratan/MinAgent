@@ -72,6 +72,7 @@ Boolean settings use only `on` and `off`:
 - `SKILLS_ENABLED=on` loads local skills. The default is `off`.
 - `MCP_ENABLED=on` loads configured MCP servers. The default is `off`.
 - `MEMORY_ENABLED=on` loads MinAgent's persistent SQLite memory, which recalls what already worked and records what works. The default is `off`. `MEMORY_DB_PATH` overrides the database location; the default is `.agents/memory/memoria.db` in the MinAgent project directory. `MEMORY_DIRECT_ANSWER=off` stops MinAgent from answering a known request straight from memory; the default is `on`. `MEMORY_EMBED_MODEL=nomic-embed-text` also compares stored memories by meaning, not only by shared words, and is `off` when empty.
+- `FLOWS_ENABLED=on` lets the model write a long multi-step plan and run it, checkpointed per step. The default is `on`. See [Long plans](#long-plans-flows). `FLOW_BATCH_STEPS` bounds how many steps run before the runner hands control back to the model; it defaults to `8`.
 - `WEB_SEARCH_ENABLED=on` lets the model search the web and fetch pages through Ollama's hosted API. The default is `off`. It requires `OLLAMA_API_KEY` (an Ollama account key). `WEB_SEARCH_BASE_URL` defaults to `https://ollama.com/api` and `WEB_SEARCH_TIMEOUT_SECONDS` to `120`.
 
 For llama.cpp, use `--reasoning-format deepseek` when the model template does not automatically emit a separate `reasoning_content` channel. MinAgent displays that channel as progress text and keeps the final answer in its normal response presentation.
@@ -187,6 +188,7 @@ Type `/` to open command autocomplete. Use ↑/↓ to choose a command and Enter
 - `/init [focus]`: inspect a one-time workspace inventory and selected project files, show which files were selected, and create or update the workspace root `AGENTS.md`. It reads up to 24 files, with excerpt and total-size limits.
 - `/skills [reload | show <name> | delete <name>]`: list the registered skills, force a rescan, print one skill's instructions, or delete a skill that lives inside the workspace.
 - `/memory [forget <id>]`: show how many memories exist, their success and reuse counts, and the strongest entries; `forget` deletes one entry.
+- `/flow [<id> [continue|abort|forget]]`: list the plans the agent has written for this workspace, show one, run its remaining steps yourself without the model deciding anything, stop it, or delete it.
 - `/mejoras [now]`: show what past reflections concluded, or force a reflection on the current session.
 - `/skill <what it should do>`: ask the model to draft a `SKILL.md` for that capability, register it immediately, and report the resulting name and path. An unfinished draft is reported; nothing is registered unless it validates.
 - `/model [name]`: list the models the endpoint advertises through its OpenAI-compatible `/models` endpoint (Ollama and llama.cpp both expose it), marking the current one, or switch to `name` when given. While you type `/model `, ↑/↓ choose from a live picker and Enter completes the name. Switching persists `OPENAI_MODEL` in the project `.env` and warms the model with a one-token request so the first turn is not the load.
@@ -212,10 +214,53 @@ The model can use these built-in tools; directory listings and file changes stay
 - `run_terminal`: available only when `TERMINAL_MODE` is `auto` or `ask`, and part of the `terminal` capability. It runs in the workspace directory; `ask` requires approval for each command. It is the tool for system facts such as the current date and time, the environment, or installed tools.
 - `recall`, `remember`, and `record_outcome`: available only when `MEMORY_ENABLED` is `on`, and part of the `memory` capability. `recall` searches the persistent memory before a task, `remember` saves a verified procedure or conclusion, and `record_outcome` reinforces or degrades a memory after it is reused.
 - `web_search` and `web_fetch`: available only when `WEB_SEARCH_ENABLED` is `on`, and part of the `web` capability. `web_search` returns titles, URLs, and snippets; `web_fetch` reads one result page. Web content is untrusted data.
+- `read_document`: read a data file as text - PDF, CSV, TSV, JSON, JSONL, TXT, MD, HTML, DOCX or XLSX - which `read_file` cannot do, because a PDF and a spreadsheet are not line-based text. A PDF can be narrowed with `pages`; tabular files return a table preview plus a per-column profile (types, ranges, examples) and take `offset`/`limit` so a long file can be paged. A PDF with no text layer is a scan and needs OCR, which this tool does not do. Part of the `documents` capability.
+- `create_pdf`: write one or more PDF files from Markdown or HTML, with headings, lists, tables and code laid out across as many pages as the content needs. Every file lands in `salida/` and is numbered rather than overwritten, like `download_file`. Several files are one call, so two reports cost one round trip. Part of the `documents` capability.
 
 The prompt carries the host's local date and time, refreshed with every request, so a time question is answered from the real clock instead of a guess. When `TERMINAL_MODE` is not `off`, the prompt also states that `run_terminal` can read the rest of the system, and the shell instructions themselves arrive with the `terminal` capability. If a reply claims a capability is unavailable without calling any tool, MinAgent sends one corrective message naming the tools that are callable right now and the capabilities that are not loaded yet, and asks the model to use one, or to save a reusable skill with `write_skill` when something is genuinely missing, rather than ending the turn on "I have no access". A reply that only describes the next step ("voy a listar los correos") without calling a tool gets the same single nudge, so an announced plan is not mistaken for the work. A second refusal is returned as the answer, so the turn never loops over it.
 
 Reads check file identity and changes around opening and reading. `read_file` can read only a specifically named outside file; outside directories cannot be discovered through `list_directory`, and edit, write, and delete tools remain confined to the workspace. Within the workspace, file operations check for symbolic links, hard links, special files, and paths outside the workspace. Individual reads and writes are limited to 10 MiB. The workspace root cannot be deleted. A successful edit or write is reread and compared with the requested content before the tool reports success. As with all path-based file operations, an untrusted process that concurrently swaps parent directories can still race a rename or deletion; use a workspace directory tree that other untrusted processes cannot modify.
+
+## Long plans (flows)
+
+A turn runs as many tool calls as the model asks for, and that is enough for most work. It is not enough for work that has to survive twenty minutes: the context gets compacted in the middle of it, the session is closed, the process is restarted, and the plan is gone. So the model can write the plan down instead.
+
+`run_flow(objective, steps)` writes a flow to `.minagent/flows.json` and starts running it. Each step is a tool name and its arguments, so a flow is not a scripting language and cannot do anything the tools cannot:
+
+```json
+{"objective": "Summarise the repo into salida/informe.md",
+ "steps": [
+   {"tool": "list_directory", "args": {"path": "src"}, "note": "what is in src"},
+   {"tool": "read_file", "args": {"path": "README.md"}, "decide": true},
+   {"tool": "write_file", "args": {"path": "salida/informe.md", "content": "..."}}
+ ]}
+```
+
+Four things make it a plan rather than a script. **`{{steps.N.output}}`** inside any argument is replaced by what step N returned, so a step can read a file, edit what it found, and run the checks without the model having to see any of it in between. **`decide: true`** stops the flow right there and gives the model the results, which is where it puts a step whose input it could not have known. **`optional: true`** lets a step fail without stopping the flow, for the steps where "not found" is a real answer. **`note`** is the one line that shows in the progress display and the report.
+
+A step can also be guarded with **`when`**, which runs it only if an earlier step says so:
+
+| `when` | runs when |
+| --- | --- |
+| `steps.2.ok` | step 2 ran and did not fail |
+| `!steps.2.ok` | step 2 failed, was skipped, or did not run |
+| `steps.2.status == done` | the same thing, spelled out |
+| `steps.2.output contains "3 failed"` | step 2's output contains that text |
+| `steps.2.output` | step 2 produced anything at all |
+
+`N` counts steps from 1 and always names an **earlier** step: a guard that reads a later one, or itself, is refused before the plan runs, because a plan written from the end backwards is a plan nobody can run. The grammar is one clause on purpose - anything that needs two conditions to answer is what `decide` is for. A skipped step is recorded with the guard that did not hold, and it costs nothing: it runs no tool and spends no slot of the batch.
+
+One composition is worth stating because it is the obvious way to branch on a failing test and it cannot work any other way: a step that fails stops the flow, so a step you want to branch **on** needs `optional: true` as well as the `when` on the step that follows. A plan whose guard could only ever be true after a failure the flow stops on - `when: "!steps.2.ok"` over a non-optional step 2 - is **refused while the plan is written**, with that fix named, rather than run to a point where the branch is unreachable.
+
+A `run_terminal` step whose command exits non-zero counts as **failed**, not as a result that happened to contain an error. `run_terminal` reports an exit code instead of raising, so without that rule `pytest` failing would read as `steps.1.ok` and every "if the tests failed" branch would take the wrong side.
+
+A step whose result is larger than the flow report keeps a head-and-tail preview and the rest goes to the same off-window archive `recall_tool_output` reads, so nothing is lost to a long run: the record names the id, and the report lists every id the flow produced.
+
+The runner is deliberately not left alone. Control comes back at every `decide` step, at every failure, at every step whose input does not exist yet, and every `FLOW_BATCH_STEPS` (8 by default) - which is the batch limit's whole job: a mechanical run of eight steps costs one request instead of eight, and a plan that is going wrong is caught while the wrong step is still the one that just ran. When it stops, the model corrects the plan with `flow_continue` - `continue`, `skip_step`, `replace_remaining` with the rewritten steps, or `abort`. The decision text it gets back says so explicitly, because the failure mode of a plan that halted is restarting it from the top, which repeats every side effect that already worked.
+
+Two properties are worth stating because they are what the runner is built around. Every step is checkpointed to disk the moment it finishes, so an interrupted flow resumes at the step it stopped on rather than the one before, and the steps that already ran never run twice. And every step goes through the same `execute_tool` the turn loop uses, so the capability it needs is loaded on demand, `TERMINAL_MODE=ask` still asks, an MCP server still answers to its own approval mode, and a denied call stops the flow rather than being routed around by the next step.
+
+A flow that is still unfinished stays visible: the prompt carries one line naming the objective, where it stopped and what is next, so a long task is not the one that loses its plan, and `/flow` lists, shows, resumes, abandons or deletes what the store holds. `FLOWS_ENABLED=off` turns the capability off; each workspace keeps up to 20 flows, and the store prunes the oldest finished ones, dropping their outputs because the steps that matter are the ones still running.
 
 ## Skills
 

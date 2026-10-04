@@ -23,6 +23,7 @@ from minagent.reflection import (
     format_review_result,
     parse_review,
     parse_verdict,
+    turn_title,
 )
 from tests.test_memory import _memory_app
 
@@ -293,7 +294,9 @@ async def test_the_review_forgets_the_noise_and_keeps_the_method(tmp_path):
     kept = next(memory for memory in remaining if memory["title"] == "the method")
     assert kept["id"] == entries[1]["id"]
     assert kept["source"] == REVIEWED_SOURCE
-    assert [entry["title"] for entry in await app.memory_store.reviewable()] == ["Make the video render"]
+    # The turn's own entry is named by what it did, not by the request that
+    # produced it: a title the next session could search for.
+    assert [entry["title"] for entry in await app.memory_store.reviewable()] == ["read_file: README.md"]
     assert "1 kept, 1 forgotten" in app._stdout.text
 
 
@@ -366,3 +369,139 @@ def test_a_reflection_interval_of_zero_is_refused(tmp_path):
         load_configuration(
             str(tmp_path), cwd=str(tmp_path), env={"OPENAI_MODEL": "m", "MEMORY_REFLECTION_INTERVAL": "0"}
         )
+
+
+# --------- turn_title: what a memory is named by, and why
+
+def test_a_turn_is_named_by_what_it_did_not_by_what_was_asked():
+    """The title is what a later session searches on, so it has to be the method.
+
+    Measured on a real session: every auto-captured memory in the store was
+    titled with the user's own words, so the recall that did fire brought back
+    the request being asked instead of the way it was answered. One entry, the
+    only method the store held, was titled ``read_file: datos.csv;
+    run_terminal`` - which is searchable by the file a later task would be about.
+    """
+    steps = (
+        'read_file(path=datos.csv) -> run_terminal(command=tr -d "\\r" < datos.csv) '
+        "-> read_file(path=limpio.csv)"
+    )
+    title = turn_title(steps, "read_file, run_terminal")
+
+    assert title == "read_file: datos.csv; run_terminal"
+    # The words a later task would use, and not the ones that were asked with.
+    assert "datos.csv" in title
+
+
+def test_one_tool_in_the_title_even_when_the_arguments_differ():
+    """Three reads are one method; listing all three reads as three memories."""
+    title = turn_title("read_file(path=a.txt) -> read_file(path=b.txt) -> read_file(path=c.txt)", "read_file")
+    assert title == "read_file: a.txt"
+
+
+def test_a_title_survives_a_malformed_call_without_raising():
+    """The steps come from tool calls the model wrote, so bad syntax is input.
+
+    An unclosed quote or a missing bracket has to cost the argument, not the
+    capture: raising here would lose the whole turn from the log the review
+    culls, which is the opposite of what a malformed call deserves.
+    """
+    for steps in (
+        'run_terminal(command=echo "sin cerrar) -> read_file(path=a.txt)',
+        "read_file(path=a.txt) -> ??? -> run_terminal(command=ls)",
+        "-> -> ->",
+        "",
+    ):
+        assert isinstance(turn_title(steps, "read_file, run_terminal"), str)
+
+
+def test_a_turn_with_no_parsable_step_still_gets_a_title():
+    """No title means the entry can never be found, which is worse than a vague one."""
+    assert turn_title("", "read_file, run_terminal") == "read_file, run_terminal"
+
+
+# --------- degrading what was recalled into a turn that failed
+
+
+async def _hinted_app(tmp_path, query: str = "how do I clean the csv"):
+    """An app with one stored memory, offered as a hint for ``query``."""
+    app = _memory_app(tmp_path)
+    await app.initialize_optional_features()
+    saved = await app.memory_store.remember(
+        "procedure", "Use iconv to drop the BOM", "iconv -f utf-8 -t utf-8 < in.csv", ["csv"]
+    )
+    app._current_user_request = query
+    await app.refresh_memory_hints(query)
+    assert app.memory_hint_context, "the memory has to actually reach the prompt"
+    return app, saved["id"]
+
+
+async def test_a_hint_offered_into_a_failed_turn_loses_confidence(tmp_path):
+    """The negative reinforcement the store could do and nothing ever asked for.
+
+    ``record_outcome`` is a tool, so only the model could lower a memory, and
+    the model cannot tell that a hint it followed was the wrong one: the
+    traceback names the tool, not the advice. Measured over a real store, 36
+    reinforcements and no failures - not a record of things going well, but a
+    store where every lesson was permanent.
+    """
+    app, memory_id = await _hinted_app(tmp_path)
+    app._tools_used_this_turn = ["run_terminal"]
+    app._tool_error_this_turn = True
+    app._tool_errors_this_turn = 2
+
+    await app.capture_experience("The command failed.")
+
+    entry = (await app.memory_store.recent())[0]
+    assert entry["id"] == memory_id
+    assert entry["failure_count"] == 1
+    assert entry["success_count"] == 0
+    assert entry["confidence"] < 0.65
+
+
+async def test_a_successful_turn_leaves_the_hint_it_used_alone(tmp_path):
+    """Punishing a memory for a turn that worked teaches the store to hide it."""
+    app, memory_id = await _hinted_app(tmp_path)
+    app._tools_used_this_turn = ["run_terminal"]
+    app._tool_error_this_turn = False
+
+    await app.capture_experience("The command worked.")
+
+    entry = (await app.memory_store.recent())[0]
+    assert entry["id"] == memory_id
+    assert entry["failure_count"] == 0
+
+
+async def test_a_failed_turn_punishes_only_the_memories_it_was_given(tmp_path):
+    """A memory that was never offered cannot have caused the turn.
+
+    Without this the store would learn to stop volunteering its own contents,
+    because everything in it would be charged for whatever happened next.
+    """
+    app, hinted_id = await _hinted_app(tmp_path)
+    bystander = await app.memory_store.remember(
+        "fact", "The project is in python", "There is a pyproject.toml", ["project"]
+    )
+    app._tools_used_this_turn = ["run_terminal"]
+    app._tool_error_this_turn = True
+
+    await app.capture_experience("The command failed.")
+
+    entries = {entry["id"]: entry for entry in await app.memory_store.recent()}
+    assert entries[hinted_id]["failure_count"] == 1
+    assert entries[bystander["id"]]["failure_count"] == 0
+
+
+async def test_a_failure_is_charged_once_and_not_repeated_by_the_next_turn(tmp_path):
+    """The ids are spent with the punishment; a later turn has its own."""
+    app, memory_id = await _hinted_app(tmp_path)
+    app._tools_used_this_turn = ["run_terminal"]
+    app._tool_error_this_turn = True
+    await app.capture_experience("failed")
+
+    app._tool_error_this_turn = True
+    await app.capture_experience("failed again, with no hint offered")
+
+    entry = (await app.memory_store.recent())[0]
+    assert entry["id"] == memory_id
+    assert entry["failure_count"] == 1

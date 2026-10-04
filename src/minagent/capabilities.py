@@ -27,6 +27,8 @@ from .compute import (
     TRANSCRIBE_TOOL_NAME,
     VIDEO_TOOL_NAME,
 )
+from .documents import CREATE_PDF_TOOL_NAME, READ_DOCUMENT_TOOL_NAME
+from .flows import FLOWS_GUIDANCE
 from .input import INPUT_GUIDANCE
 from .mcp import format_mcp_server_context
 from .ollama_models import OLLAMA_MODELS_GUIDANCE
@@ -262,6 +264,7 @@ def build_builtin_capabilities(
     images_enabled: bool = False,
     download_enabled: bool = True,
     compute_enabled: bool = False,
+    flows_enabled: bool = False,
 ) -> list[Capability]:
     """The built-in capability groups, shaped by what the session enabled.
 
@@ -302,6 +305,26 @@ def build_builtin_capabilities(
             eager=True,
         ),
     ]
+    entries.append(
+        Capability(
+            name="documents",
+            summary="Read a PDF, spreadsheet, CSV, DOCX or text file, and write PDFs from the result",
+            tool_names=(READ_DOCUMENT_TOOL_NAME, CREATE_PDF_TOOL_NAME),
+            guidance=(
+                "read_file returns raw bytes, so it is useless for a PDF or a spreadsheet. Call "
+                "read_document for those, and for CSV, JSON, DOCX, XLSX, HTML and text files: it "
+                "returns the content as text, or a table preview plus a per-column profile when the "
+                "file is tabular. A PDF with no text layer is a scan and needs OCR, which this does "
+                "not do - say so rather than reporting an empty document.\n"
+                f"create_pdf writes {CREATE_PDF_TOOL_NAME} the other way: Markdown (or HTML) in, a "
+                "paginated PDF with real tables out, into salida/ without overwriting anything. It "
+                "writes several files in one call, so a request for two reports is one call, not two. "
+                "Read the data before writing the report: a table copied from a spreadsheet and a "
+                "number quoted from the profile are facts, one invented from memory is not. Say what "
+                "the numbers mean; do not add a source, a date or a total the data does not carry."
+            ),
+        )
+    )
     if terminal_mode != "off":
         mode = "ask; user approval is required" if terminal_mode == "ask" else "auto; commands run without approval"
         entries.append(
@@ -312,7 +335,12 @@ def build_builtin_capabilities(
                 guidance=(
                     f"Terminal mode: {mode}. Commands use user permissions and may access paths outside the "
                     "workspace. Use run_terminal for system facts you cannot see from the workspace, such as "
-                    f"the current time (`date`), the environment, or installed tools. {terminal_environment}"
+                    f"the current time (`date`), the environment, or installed tools. {terminal_environment}\n"
+                    "A diagnostic that finds nothing is an answer, not a broken turn: nmap, grep, curl and "
+                    "pytest all exit non-zero when there is nothing to report, and the result says so "
+                    "before the output. Read the exit code, do not retry the same command hoping for a "
+                    "different answer, and keep the code visible (`cmd; echo \"exit=$?\"`) rather than "
+                    "hiding it behind `|| true`."
                 ).strip(),
             )
         )
@@ -439,23 +467,18 @@ def build_builtin_capabilities(
                     STATUS_TOOL_NAME,
                 ),
                 guidance=(
-                    "The GPU has 8 GB, and that is a hard ceiling rather than a slow setting. Two heavy "
-                    "models cannot be resident at once, so speak_text and transcribe_audio are the voice "
-                    "engines that stay loaded and answer immediately, and they keep working while a video "
-                    "or music job runs - do not wait for a render to finish to speak. Video and music are "
-                    "serialized: each takes the card alone, runs for minutes, and streams layers into "
-                    "system RAM. A render is minutes, so when the user asks for several, queue_job them "
-                    "all in one turn and collect each with compute_result instead of calling "
-                    "generate_video repeatedly and blocking on the first; call compute_status for "
-                    "positions. A job that will not fit is queued rather than refused, and is only "
-                    "refused at the front of the queue, so do not treat a wait as a failure. When it is "
-                    "refused the error names the process holding the memory: call compute_status, then "
-                    "either free it or shrink the request - fewer frames for video, offload sequential, or "
-                    "a shorter duration for music. Do not retry the same oversized job: an unchanged "
-                    "retry fails the same way and costs minutes. Frames drive video memory and steps do "
-                    "not, so lower frames to save VRAM and steps only to save time. Video output must be "
-                    "8k+1 frames (9, 17, 25, 49, 97); anything else is adjusted for you. Generation saves "
-                    "into salida/ and returns a path, not the media itself."
+                    "The GPU has 8 GB, a hard ceiling. Two heavy models cannot be resident at once, so "
+                    "speak_text and transcribe_audio are the voice engines that stay loaded, and they keep "
+                    "working while a video or music job runs. Video and music are serialized: each takes "
+                    "the card alone for minutes, so queue_job several in one turn and collect each with "
+                    "compute_result. A job that will not fit is queued, not refused, only at the front of "
+                    "the queue - do not treat a wait as a failure. The refusal names the process holding "
+                    "the memory: free it or shrink the request - fewer frames for video (steps cost "
+                    "time, not memory), offload sequential, or a shorter duration for music. Never retry "
+                    "an unchanged oversized job. Video frames must be 8k+1 (9, 17, 25, 49, 97). Both "
+                    "prompt schemas show what a detailed prompt looks like: follow them, because detail "
+                    "is what buys quality. Generation saves into salida/ and returns a path. Music alone "
+                    "can leave the card: device='cpu' runs it in RAM, ~6x slower, zero VRAM."
                 ),
             )
         )
@@ -485,6 +508,15 @@ def build_builtin_capabilities(
                     "needs it and stop there, because each call costs a couple of thousand tokens of the "
                     "window and a screenshot often answers in one look."
                 ),
+            )
+        )
+    if flows_enabled:
+        entries.append(
+            Capability(
+                name="flows",
+                summary="Write and run a long multi-step plan that survives the turn",
+                tool_names=("run_flow", "flow_continue"),
+                guidance=FLOWS_GUIDANCE,
             )
         )
     return entries

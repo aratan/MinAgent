@@ -20,6 +20,11 @@ voice = [
 ]
 # whisper.cpp is a compiled binary, not a wheel: see the compute-gpu skill.
 transcribe = []
+# read_document and create_pdf. CSV, JSON, DOCX, XLSX and text files are read
+# with the standard library alone; only PDF reading and PDF writing need PyMuPDF.
+documents = [
+    "pymupdf>=1.24",
+]
 
 [project.scripts]
 minagent = "minagent.__main__:main"

@@ -41,6 +41,11 @@ from .idle import IdleReader, IdleState, should_run
 #: the admission log as though they were judgements on merit.
 MIN_CALLS_PER_CYCLE = 2
 
+#: A complete investigation costs two requests: one to state the claim, one to
+#: ask whether it contradicts what Ara already believes. The second decides, so
+#: a cycle that cannot pay for both cannot produce a promotable finding.
+RESEARCH_MIN_CALLS = 2
+
 #: What the loop is doing, for a transcript. A user reading a log at 2am should
 #: be able to tell the difference between "I did nothing" and "I was not
 #: allowed to".
@@ -118,6 +123,29 @@ class Budget:
         self.cycles += 1
         self._cycle_calls = 0
         self._cycle_reserved = 0
+
+    def can_fund_research(self, cost: int = RESEARCH_MIN_CALLS) -> bool:
+        """Whether this cycle can still pay for a whole investigation.
+
+        Research is funded from the same envelope as the reflection, and only
+        from what the reflection left. That is the whole of the policy, and it
+        is derived rather than chosen: :attr:`remaining_in_cycle` already tracks
+        the remainder, the run is meant to reflect, and a second budget here
+        would be the one thing :class:`Budget` exists to prevent - a cap
+        enforced somewhere other than where the calls are reserved.
+
+        The check is for the *whole* investigation, not for its first call. A
+        finding that cannot be consistency-checked is a finding that may not be
+        promoted, so starting one and abandoning it halfway spends the calls
+        without ever producing the thing they were for. Two is the floor
+        because extraction and consistency are two separate requests, and the
+        second is the one that decides.
+
+        This is a pre-check, not the cap. The calls themselves are still
+        reserved one at a time by the caller; this only avoids beginning work
+        that is already unaffordable.
+        """
+        return self.live and self.remaining_in_cycle() >= cost
 
     def cancel_cycle(self) -> None:
         """Give back the slot of a cycle that was cut short.
@@ -209,6 +237,11 @@ class ResidentWorker:
     """
 
     reflect: Callable[[], Awaitable[Any]]
+    #: Optional second pass over the same envelope, run after the reflection.
+    #: Returns a line for the cycle record, or an empty string for "nothing to
+    #: ask". Kept optional so a host that wants the reflection alone is not made
+    #: to supply a research callable it will never use.
+    research: Callable[[], Awaitable[str]] | None = None
     enabled: bool = True
     cycle_seconds: float = 900.0
     budget: Budget = field(default_factory=Budget)
@@ -328,6 +361,28 @@ class ResidentWorker:
                 # is least able to look after itself.
                 self.detail = f"{type(exc).__name__}: {exc}"
                 self.cycles[-1].outcome, self.cycles[-1].detail = ERROR, self.detail
+
+            # Research runs after the reflection and out of what it left, so a
+            # cycle that reflected well is not also charged for going looking.
+            # It shares the reflection's error handling on purpose: a research
+            # pass that raises is the same kind of event as a reflection that
+            # raises, and neither is a reason to stop a loop nobody is watching.
+            if (
+                self.research is not None
+                and self.cycles[-1].outcome != ERROR
+                and self.budget.can_fund_research()
+            ):
+                try:
+                    note = (await self.research()).strip()
+                except asyncio.CancelledError:
+                    self.budget.cancel_cycle()
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    note = f"research failed: {type(exc).__name__}: {exc}"
+                if note:
+                    self.cycles[-1].detail = (
+                        f"{self.cycles[-1].detail}; {note}" if self.cycles[-1].detail else note
+                    )
             self.cycles[-1].charged = self.budget.model_calls - spent_before
             if self.budget.remaining_in_cycle() == 0 and not self.cycles[-1].detail:
                 # Said out loud because the alternative is a night that produced

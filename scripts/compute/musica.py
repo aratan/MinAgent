@@ -82,7 +82,7 @@ tokens, pero un clip de 30 s no usa 6x lo de uno de 5 s.
 """
 
 DEFAULT_GUIDANCE = 3.0
-MAX_SECONDS = 30
+MAX_SECONDS = 40
 """Techo razonado, no medido a 30 s: 5 s usaron 1303 MiB y 30 s son 1500 tokens
 frente a 250, o sea 6x la secuencia. La atención es cuadrática en la longitud,
 pero la caché de 1500 tokens sigue siendo pequeña para 8 GB. Si alguna vez se
@@ -91,6 +91,45 @@ supera, el propio OOM cae aquí y lo dice."""
 TOKENS_PER_SECOND = 50
 """A 32 kHz, MusicGen decodifica 50 tokens por segundo. Se usa como respaldo si
 la config del modelo no expone `hop_length`; lo normal es leerlo de ahí."""
+
+DEVICE_MODES = ("cuda", "cpu")
+"""Dónde corre el modelo.
+
+`cpu` existe porque la tarjeta es un recurso disputado, no uno disponible. Con
+Ollama resident se quedan ~1 GB libres y un job de música no entra; bajarlo a
+RAM no cuesta rendimiento al resto del sistema, solo tiempo.
+
+Medido en esta máquina (24 núcleos, 8 GB de tarjeta), 8 hilos:
+
+    clip   GPU      CPU
+      3 s   22 s      6 s   <- el número que hace parecer la CPU más rápida
+     10 s    -       88 s
+     20 s   30 s    164 s
+
+El de 3 s es engañoso y por eso está aquí: son solo 150 tokens y el clip cabe en
+la caché, así que sale rápido y parece que la CPU gana. A partir de 10 s la
+relación se estabiliza en **~0,12x tiempo real**, o sea que un minuto de música
+tarda unos ocho. La GPU hace lo mismo unas seis veces más rápido, así que `cpu`
+no es la opción rápida: es la que no necesita la tarjeta. Se usa cuando la
+tarjeta está ocupada o cuando dejarla libre importa más que esperar.
+"""
+
+CPU_THREADS = 8
+"""Hilos para el modo CPU, medido en vez de supuesto.
+
+Más hilos no es más rápido aquí, y es peor: 8 -> 6,3 s por clip de 3 s, 16 -> 11,9 s
+y 24 -> 30,6 s. Cada token es una operación pequeña sobre matrices que ya caben
+en L2, así que pasar de 8 hilos satura la memoria antes de ganar en cómputo y se pasa
+el tiempo en sincronización. 8 es el punto donde todavía mejora.
+"""
+
+CPU_DTYPE = "float32"
+"""En CPU el peso es float32, no float16.
+
+No es una preferencia de comfort: la mitad de las instrucciones de fp16 no
+existen en x86 sin AVX-512, así que torch las emula y el job sale más lento que
+con float32 en lugar de más rápido. En CUDA sí compensa y ahí se mantiene.
+"""
 
 SILENCE_RMS = 1e-4
 """Por debajo de este RMS la salida es silencio digital, no música. El umbral es
@@ -189,6 +228,21 @@ def main(argv: list[str] | None = None) -> int:
         help="Guidance scale. 3.0 es el valor de MusicGen; subirlo fuerza más al prompt.",
     )
     parser.add_argument("--semilla", type=int, default=42)
+    parser.add_argument(
+        "--device",
+        default="cuda",
+        choices=DEVICE_MODES,
+        help=(
+            "'cpu' corre el modelo en RAM: mucho más lento (~0,12x tiempo real) "
+            "pero no toca la tarjeta, así que Ollama puede seguir resident."
+        ),
+    )
+    parser.add_argument(
+        "--hilos",
+        type=int,
+        default=CPU_THREADS,
+        help=f"Hilos del modo CPU. {CPU_THREADS} es el punto medido; más es más lento.",
+    )
     parser.add_argument("--salida", default="", help="Ruta del wav de salida.")
     parser.add_argument("--nombre", default="musica", help="Nombre base de la salida.")
     parser.add_argument("--estado", action="store_true", help="Solo informa; no genera.")
@@ -258,8 +312,22 @@ def main(argv: list[str] | None = None) -> int:
             f"=={version.split('+')[0]}+{tag} --index-url https://download.pytorch.org/whl/{tag}"
         )
 
-    if not torch.cuda.is_available():
-        return fail("No hay CUDA disponible. MusicGen en CPU es impracticable.")
+    if not torch.cuda.is_available() and arguments.device == "cuda":
+        return fail(
+            "No hay CUDA disponible. Pide --device cpu para correrlo en RAM, que es más "
+            "lento pero funciona: ~0,12x tiempo real en esta máquina."
+        )
+    device = arguments.device
+    if device == "cpu":
+        # Antes de cargar los pesos: el reparto de hilos decide cuánto tarda cada
+        # token, y cambiarlo después no recoloca lo ya cargado.
+        torch.set_num_threads(max(1, arguments.hilos))
+        device_torch = "cpu"
+        dtype_name = CPU_DTYPE
+    else:
+        device_torch = "cuda"
+        dtype_name = "float16"
+    dtype = getattr(torch, dtype_name)
 
     model_name = MODEL_IDS[arguments.modelo]
     output = _output_path(arguments.salida, arguments.nombre)
@@ -268,8 +336,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         processor = AutoProcessor.from_pretrained(model_name)
         model = MusicgenForConditionalGeneration.from_pretrained(
-            model_name, torch_dtype=torch.float16
-        ).to("cuda")
+            model_name, torch_dtype=dtype
+        ).to(device_torch)
     except Exception as error:  # noqa: BLE001
         return fail(f"No se pudieron cargar los pesos de {model_name}: {error}")
 
@@ -280,7 +348,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         inputs = processor(
             text=[arguments.prompt], padding=True, return_tensors="pt"
-        ).to("cuda")
+        ).to(device_torch)
         with torch.no_grad():
             audio = model.generate(
                 **inputs,
@@ -313,14 +381,19 @@ def main(argv: list[str] | None = None) -> int:
             "ok": True,
             "path": str(output),
             "modelo": arguments.modelo,
+            "device": device,
             "segundos": round(len(samples) / sample_rate, 2),
             "muestra_hz": sample_rate,
             "tokens": max_new_tokens,
             "rms": round(rms, 5),
             "pico": round(float(np.abs(samples).max()), 4),
             "elapsed": round(time.time() - started, 1),
-            "vram_pico_mib": round(torch.cuda.max_memory_allocated() / 2**20),
-            "vram_estimada_mib": VRAM_ESTIMATE_MIB[arguments.modelo],
+            # El pico de VRAM se informa siempre, y en CPU vale 0 porque no se
+            # reservó nada: es el dato que dice si la tarjeta quedó libre.
+            "vram_pico_mib": (
+                round(torch.cuda.max_memory_allocated() / 2**20) if device == "cuda" else 0
+            ),
+            "vram_estimada_mib": VRAM_ESTIMATE_MIB[arguments.modelo] if device == "cuda" else 0,
         }
     )
     return 0

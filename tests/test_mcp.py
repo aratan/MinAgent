@@ -50,6 +50,24 @@ class _McpTestHandler(BaseHTTPRequestHandler):
                         for index in range(33)
                     ]
                 }
+            if self.server.mode == "openai":  # type: ignore[attr-defined]
+                # The shape a server speaks when it hands over the agent's own
+                # schemas unchanged: the name sits under "function", so nothing
+                # here is a valid MCP tool and all of them used to be dropped
+                # with a warning that named nothing anybody could act on.
+                return {
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": f"tool_{index}",
+                                "description": "d",
+                                "parameters": {"type": "object", "properties": {}},
+                            },
+                        }
+                        for index in range(3)
+                    ]
+                }
             return {"tools": [{"name": "echo", "inputSchema": {"type": "object", "properties": {}}}]}
         return {"content": [{"type": "text", "text": "ok"}]}
 
@@ -182,6 +200,33 @@ async def test_mcp_tool_discovery_keeps_the_first_32_tools_from_an_oversized_lis
         try:
             assert len(connections["tool_definitions"]) == 32
             assert any("first 32" in warning for warning in connections["warnings"])
+        finally:
+            await connections["close"]()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+async def test_a_server_that_speaks_another_dialect_is_named_in_one_line(tmp_path):
+    """A whole group of tools disappearing is worth saying exactly why.
+
+    The compute server in this project answered tools/list with the agent's own
+    function-calling schemas, so all seven of its tools were dropped and the
+    only trace was "an MCP tool with no valid name" - which names a symptom
+    the operator cannot see, at a place they will not look. The warning has to
+    name the dialect and the fix, and it has to be said once rather than once
+    per lost tool.
+    """
+    server = _McpTestServer("openai")
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        config_path = _write_config(tmp_path, server.url)
+        connections = await asyncio.wait_for(connect_mcp_servers(config_path, str(tmp_path)), timeout=5)
+        try:
+            assert connections["tool_definitions"] == []
+            dialect = [w for w in connections["warnings"] if "OpenAI function shape" in w]
+            assert len(dialect) == 1, f"expected one clear warning, got {connections['warnings']}"
+            assert "3" in dialect[0] and "tools/list" in dialect[0]
         finally:
             await connections["close"]()
     finally:

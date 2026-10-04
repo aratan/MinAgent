@@ -89,8 +89,12 @@ def _name_from_url(url: str) -> str:
     return _sanitize(candidate) if candidate else ""
 
 
-def _unique_path(directory: Path, name: str) -> Path:
-    """A free path in ``directory``, numbered rather than overwriting."""
+def unique_output_path(directory: Path, name: str) -> Path:
+    """A free path in ``directory``, numbered rather than overwriting.
+
+    Shared with ``create_pdf``, which has the same rule: a generated file never
+    silently replaces the one the user already has.
+    """
     path = directory / name
     if not path.exists():
         return path
@@ -169,7 +173,7 @@ async def run_download(
 
     if not body:
         raise AgentError(f"{url} returned an empty body.")
-    path = _unique_path(destination.parent, destination.name)
+    path = unique_output_path(destination.parent, destination.name)
     path.write_bytes(body)
     detail = f" ({content_type})" if content_type else ""
     return f"Downloaded {url} to {OUTPUT_DIRNAME}/{path.name}{detail}, {size} bytes."

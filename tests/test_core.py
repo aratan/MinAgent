@@ -17,11 +17,11 @@ import pytest
 
 from minagent.app import (
     _ANNOUNCED_ACTION,
-    _CLAIMED_WRITE,
     _MISSING_CAPABILITY_REQUEST,
     UI_COLORS,
     MinAgent,
     build_terminal_tool,
+    claimed_write,
 )
 from minagent.attachments import prepare_user_message
 from minagent.config import Config, load_configuration, parse_directory_entry_limit
@@ -2212,7 +2212,7 @@ def test_a_finished_answer_is_not_mistaken_for_an_announced_plan(text):
     ],
 )
 def test_claims_of_a_completed_write_are_detected(text):
-    assert _CLAIMED_WRITE.search(text), text
+    assert claimed_write(text), text
 
 
 @pytest.mark.parametrize(
@@ -2226,7 +2226,7 @@ def test_claims_of_a_completed_write_are_detected(text):
 )
 def test_a_honest_answer_is_not_mistaken_for_a_false_write_claim(text):
     """The guard must not fire on a denial or on an honest report."""
-    assert not _CLAIMED_WRITE.search(text), text
+    assert not claimed_write(text), text
 
 
 async def test_a_write_claimed_without_a_tool_call_is_retried(tmp_path, monkeypatch):
@@ -2966,3 +2966,53 @@ async def test_the_prompt_warns_the_model_only_in_auto_mode(tmp_path):
     assert "without asking the user first" in guidance("auto")
     assert "without asking the user first" not in guidance("ask")
     assert "without asking the user first" not in guidance("off")
+
+
+# --------- what counts as claiming a write, measured against a real reply
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # The reply a real session produced, verbatim, after being asked to
+        # repeat a task it had already been given once: it made no tool call at
+        # all and the guard let it past, because the phrase carried none of the
+        # words the old pattern knew - "creado", "generado", "listo".
+        "Ya está hecho. El archivo `salida/limpio.csv` existe y contiene la copia",
+        "Ya hecho.",
+        "El archivo `salida/informe.md` existe y contiene la tabla",
+    ],
+)
+def test_a_claim_needing_none_of_the_old_keywords_is_still_a_claim(text):
+    assert claimed_write(text), text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "No se ha creado el archivo porque faltan datos",
+        "El informe no esta creado todavia",
+        "No he escrito nada aún, necesito los datos",
+        # The same words, reading the workspace rather than claiming the work:
+        # the guard must not fire on the model narrating what it can already see.
+        "El archivo ya está en el workspace. Ya tengo claro que `salida/` existe",
+        "el directorio de salida ya existe",
+    ],
+)
+def test_a_denial_or_an_observation_is_not_a_claim(text):
+    assert not claimed_write(text), text
+
+
+def test_one_denial_does_not_excuse_a_claim_in_the_next_clause():
+    """Clause by clause, not sentence by sentence.
+
+    "No he creado nada. El informe está creado." is one honest clause and one
+    false claim in the same reply, and the second is the one the user would be
+    misled by.
+    """
+    assert claimed_write("No he creado nada. El informe está creado y en salida/informe.md")
+
+
+def test_a_denial_the_reply_then_takes_back_counts_again():
+    """It denies the work and then offers it; the offer is what the user waits on."""
+    assert claimed_write("No se ha creado el archivo pero puedo hacerlo si me das los datos")

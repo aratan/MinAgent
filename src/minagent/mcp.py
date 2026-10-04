@@ -547,6 +547,23 @@ async def connect_mcp_servers(
             if client.instructions:
                 server_guidance.append({"server_name": server_name, "instructions": client.instructions})
 
+            # A server that answers tools/list in another dialect is worth one
+            # clear line rather than one per tool: the agent silently loses the
+            # whole group otherwise, and "no valid name" names nothing that can
+            # be acted on. Checked once, before the loop, so the warning says
+            # how many tools went and why.
+            if remote_tools and all(
+                isinstance(item, dict) and isinstance(item.get("function"), dict) and not item.get("name")
+                for item in remote_tools
+            ):
+                warnings.append(
+                    f'Ignoring all {len(remote_tools)} tools from server "{server_name}": it answers '
+                    f"tools/list in the OpenAI function shape (type/function) instead of MCP's "
+                    f"(name, description, inputSchema). The server's logic is fine; its tools() has to "
+                    f"flatten each definition."
+                )
+                continue
+
             for tool_index, remote_tool in enumerate(remote_tools):
                 if len(tool_definitions) >= MAX_MCP_TOOLS:
                     warnings.append(f"Ignoring additional MCP tools after the {MAX_MCP_TOOLS}-tool limit.")

@@ -235,3 +235,71 @@ def _excerpts(text: str, *, limit: int = 240, count: int = 2) -> list[str]:
         return []
     return [body[index * limit : index * limit + limit].strip() for index in range(count)][:count]
 
+
+# --- the question queue --------------------------------------------------------
+#
+# Where the questions come from is not a planner, because a planner is a
+# component nobody can audit from the outside. Ara writes down what she wants
+# to know, in a file in the repository, in the same spirit as IDENTITY.md: the
+# queue is a thing she can read, edit, and be wrong about. A research pass with
+# nothing queued costs nothing and says so.
+#
+# The format is deliberately dull, because a queue that is pleasant to write is
+# a queue that will be malformed:
+#
+#     - [ ] What is the real default context length of the local model?
+#       why: the compaction thresholds were guessed, not measured
+#     - [x] Already answered, kept for the record.
+#
+# One open question is taken per pass, in file order. Order matters more than
+# breadth: the point of a queue is that the oldest unanswered thing is the one
+# Ara cared about first, and a pass that answered everything at once would be a
+# pass nobody could price.
+
+_OPEN_MARKERS = ("- [ ]", "* [ ]", "- [?]", "- [ ]:")
+_DONE_MARKERS = ("- [x]", "* [x]", "- [X]")
+
+
+def parse_open_questions(text: str, *, max_pages: int = 4) -> list[tuple[str, str]]:
+    """Return ``(question, why)`` for each unanswered item, in file order.
+
+    An item runs until the next bullet or a blank line, so a ``why:`` on its own
+    line belongs to the question above it and does not become a question of its
+    own. Anything without text after the marker is skipped rather than guessed
+    at: an empty checkbox is a formatting slip, not a research request.
+    """
+    found: list[tuple[str, str]] = []
+    question: str | None = None
+    why: list[str] = []
+
+    def flush() -> None:
+        nonlocal question, why
+        if question:
+            found.append((question, " ".join(why).strip()))
+        question, why = None, []
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        lowered = line.lower()
+        if lowered.startswith(_DONE_MARKERS):
+            flush()
+            continue
+        if lowered.startswith(_OPEN_MARKERS):
+            flush()
+            body = line[line.index("]") + 1 :].strip().lstrip("-*?").strip()
+            question = body or None
+            continue
+        if line.startswith(("why:", "porque:")):
+            if question is not None:
+                why.append(line.split(":", 1)[1].strip())
+            continue
+        # A bare continuation line extends the current question rather than
+        # starting one, so a wrapped question still reads as one question.
+        if question is not None and not why:
+            question = f"{question} {line}".strip()
+    flush()
+    return found
+
+

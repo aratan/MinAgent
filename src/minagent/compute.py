@@ -144,7 +144,42 @@ DEFAULT_VIDEO_FRAMES = 49
 DEFAULT_VIDEO_STEPS = 40
 DEFAULT_OFFLOAD = "sequential"
 
-MAX_MUSIC_SECONDS = 30
+MUSIC_DEVICE_MODES = ("cuda", "cpu")
+"""Where a music job runs: the card, or system RAM.
+
+``cpu`` is not the slow fallback nobody should use. The card is a shared
+resource - an Ollama model holding 6 GB of an 8 GB card is the normal state of
+this machine - and a music job that needs the card then has to evict it, which
+costs the user their warm session. RAM is 32 GB and mostly idle, so ``cpu`` is
+the mode that lets both keep running. It is ~6x slower and that is the trade;
+measured in ``scripts/compute/musica.py`` rather than guessed.
+"""
+
+MUSIC_CPU_VRAM_MIB = 0
+"""What a CPU music job asks the card for: nothing, because it never touches it.
+
+Not a shortcut in the estimate. Passing the real 2200 MiB would make the
+orchestrator evict Ollama to make room for a job that is not going to use the
+card, which is the exact opposite of what asking for CPU is for.
+"""
+
+MAX_MUSIC_SECONDS = 40
+"""The most a single music job may ask for, in seconds.
+
+This is the checkpoint's own ceiling and not a round number picked for comfort.
+``facebook/musicgen-small`` declares ``max_position_embeddings=2048`` and packs
+**50 audio tokens per second** - measured, by reading back the length of the wav
+a known number of tokens produced - so 2048 tokens is 40,96 s.
+
+Getting this wrong fails in both directions, and neither is small. Below the
+ceiling the job is refused for a reason the model cannot act on. Over it,
+``generate`` asks for positions the decoder does not have and the output degrades
+into noise that still exits zero - the same failure this project already refuses
+to accept for silence, and one that is much harder to notice.
+
+Longer than this has to be several jobs. That is a limit of the model, not a
+policy, so it is stated as one rather than dressed up as a default.
+"""
 # How long a reloaded model is asked to stay resident. Ollama's default is five
 # minutes, which is short enough that a slow render would let the model time out
 # again on its own; an hour is long enough to cover the rest of the session.
@@ -165,6 +200,18 @@ misreads "queue it" ends up with a backlog nobody is waiting for.
 """
 
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def music_vram_estimate(model: str, device: str = "cuda") -> int:
+    """What a music job asks the card for, given where it will run.
+
+    Zero on CPU, and that is the whole point of the mode: the estimate is what
+    decides whether the orchestrator evicts a resident model to make room. A CPU
+    job that reported 2200 MiB would evict Ollama for memory it never touches.
+    """
+    if device == "cpu":
+        return MUSIC_CPU_VRAM_MIB
+    return MUSIC_VRAM_ESTIMATE_MIB.get(model, MUSIC_VRAM_ESTIMATE_MIB["small"])
 
 
 def estimate_video_vram(frames: int, offload: str) -> int:
@@ -335,6 +382,12 @@ class ComputeOrchestrator:
     """
 
     root_directory: str
+    script_directories: tuple[str, ...] = ()
+    """Where the backends under ``scripts/compute/`` are looked for, in order.
+
+    Empty means the workspace alone, which is what a caller that only knows one
+    directory wants; the app passes the project that owns the agent first.
+    """
     vram_total_mib: int = DEFAULT_VRAM_TOTAL_MIB
     job_timeout_seconds: int = DEFAULT_JOB_TIMEOUT_SECONDS
     voice_timeout_seconds: int = VOICE_TIMEOUT_SECONDS
@@ -378,15 +431,28 @@ class ComputeOrchestrator:
         """Where generated media lands: the same ``salida/`` downloads use."""
         return Path(self.root_directory) / self.output_dirname
 
+    @property
+    def _script_roots(self) -> tuple[str, ...]:
+        if self.script_directories:
+            return self.script_directories
+        return (self.root_directory,)
+
     def _script(self, name: str) -> Path:
         """Resolve a backend script, with an error that says how to get it."""
-        path = Path(self.root_directory) / "scripts" / "compute" / name
-        if not path.is_file():
-            raise AgentError(
-                f"The {name} backend is not installed (expected {path}). It ships with the project; "
-                "run it from the repository root, or set COMPUTE_SCRIPTS_DIR if it lives elsewhere."
-            )
-        return path
+        # The backends ship with MinAgent, so they are looked for in the project
+        # that owns the agent and in the workspace it is editing, in that order:
+        # started from any other directory - which is how it is meant to run -
+        # a lookup against the workspace alone finds nothing and the whole GPU
+        # capability is dead with an error that blames the missing file.
+        searched = [Path(directory) / "scripts" / "compute" / name for directory in self._script_roots]
+        for path in searched:
+            if path.is_file():
+                return path
+        raise AgentError(
+            f"The {name} backend is not installed (looked in "
+            f"{', '.join(str(path) for path in searched)}). It ships with the project; "
+            "run it from the repository root, or set COMPUTE_SCRIPTS_DIR if it lives elsewhere."
+        )
 
     def _scripts_dir_override(self) -> Path | None:
         raw = (os.environ.get("COMPUTE_SCRIPTS_DIR") or "").strip()
@@ -451,6 +517,7 @@ class ComputeOrchestrator:
         *,
         seconds: int = 10,
         model: str = "small",
+        device: str = "cuda",
         name: str = "",
         runner: Any = None,
     ) -> JobRecord:
@@ -459,10 +526,16 @@ class ComputeOrchestrator:
         ``small`` is the only size listed because it is the only one measured:
         1303 MiB peaked on a 5 s clip, so it coexists with the resident voice
         engines on an 8 GB card.
+
+        ``device="cpu"`` runs it in RAM instead. Slower by about 6x, and it needs
+        no VRAM at all, so it neither waits for the card nor evicts whatever is
+        on it.
         """
         text = _require_text(prompt, MUSIC_TOOL_NAME, MAX_PROMPT_CHARS)
         if model not in MUSIC_VRAM_ESTIMATE_MIB:
             raise AgentError(f"model must be one of: {', '.join(sorted(MUSIC_VRAM_ESTIMATE_MIB))}.")
+        if device not in MUSIC_DEVICE_MODES:
+            raise AgentError(f"device must be one of: {', '.join(MUSIC_DEVICE_MODES)}.")
         if seconds < 1 or seconds > MAX_MUSIC_SECONDS:
             raise AgentError(f"Music must be between 1 and {MAX_MUSIC_SECONDS} seconds.")
         output = self._output_path(name, "wav", "musica")
@@ -470,13 +543,14 @@ class ComputeOrchestrator:
             "--prompt", text,
             "--segundos", str(seconds),
             "--modelo", model,
+            "--device", device,
             "--salida", str(output),
         ]
         return await self.run_heavy(
             "Music generation",
             "musica.py",
             argv,
-            needed_mib=MUSIC_VRAM_ESTIMATE_MIB[model],
+            needed_mib=music_vram_estimate(model, device),
             runner=runner,
         )
 
@@ -615,12 +689,15 @@ class ComputeOrchestrator:
         *,
         seconds: int = 10,
         model: str = "small",
+        device: str = "cuda",
         name: str = "",
     ) -> str:
         """Queue a music generation and return its job id without waiting."""
         text = _require_text(prompt, MUSIC_TOOL_NAME, MAX_PROMPT_CHARS)
         if model not in MUSIC_VRAM_ESTIMATE_MIB:
             raise AgentError(f"model must be one of: {', '.join(sorted(MUSIC_VRAM_ESTIMATE_MIB))}.")
+        if device not in MUSIC_DEVICE_MODES:
+            raise AgentError(f"device must be one of: {', '.join(MUSIC_DEVICE_MODES)}.")
         if seconds < 1 or seconds > MAX_MUSIC_SECONDS:
             raise AgentError(f"Music must be between 1 and {MAX_MUSIC_SECONDS} seconds.")
         output = self._output_path(name, "wav", "musica")
@@ -628,10 +705,11 @@ class ComputeOrchestrator:
             "--prompt", text,
             "--segundos", str(seconds),
             "--modelo", model,
+            "--device", device,
             "--salida", str(output),
         ]
         return self.submit(
-            "Music generation", "musica.py", argv, needed_mib=MUSIC_VRAM_ESTIMATE_MIB[model]
+            "Music generation", "musica.py", argv, needed_mib=music_vram_estimate(model, device)
         )
 
     async def _run_queued(
@@ -1365,15 +1443,23 @@ def create_compute_tools() -> list[dict[str, Any]]:
                 "name": VIDEO_TOOL_NAME,
                 "description": (
                     "Generate a short video clip from a text prompt with LTX-Video and save an mp4 in "
-                    "salida/. This is heavy: on this card it takes minutes, it runs alone, and the voice "
-                    "engines stay resident so speech still works while it runs. If free VRAM is too low "
-                    "the call is refused with the numbers rather than crashing - free the memory, or ask "
-                    "for fewer frames."
+                    "salida/. Heavy: minutes on this card, runs alone, voice engines stay resident so "
+                    "speech still works. Refused with the numbers if free VRAM is too low."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "prompt": {"type": "string", "description": "What the video should show."},
+                        "prompt": {
+                            "type": "string",
+                            "description": (
+                                "One clear scene, written like a shot description: subject and action, "
+                                "setting, then camera and light - 'lens 35mm, shallow depth of field, "
+                                "golden hour backlight, slow dolly in, cinematic grade'. LTX-Video answers "
+                                "that vocabulary like a cinematographer: 'a cat' gets a cat, the same "
+                                "words plus a lens and a camera move get a shot. One scene per clip; it "
+                                "renders seconds, not a sequence."
+                            ),
+                        },
                         "frames": {
                             "type": "integer",
                             "description": "Frame count; more frames means more VRAM and longer renders. 25 is fast, 49 default.",
@@ -1402,20 +1488,38 @@ def create_compute_tools() -> list[dict[str, Any]]:
             "function": {
                 "name": MUSIC_TOOL_NAME,
                 "description": (
-                    "Generate music or ambience from a text prompt with MusicGen (facebook/musicgen-small) "
-                    "and save a wav in salida/. Heavy, like video: it runs alone, the voice engines stay "
-                    "resident, and it is refused up front when free VRAM is too low."
+                    "Generate music or ambience from a text prompt with MusicGen "
+                    "(facebook/musicgen-small) and save a wav in salida/. Heavy, like video: it runs "
+                    "alone and is refused when free VRAM is too low. Pass device='cpu' to run it in RAM "
+                    "instead - about 6x slower, but it needs no VRAM, so it evicts nothing and leaves the "
+                    "card free."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "prompt": {
                             "type": "string",
-                            "description": "What to hear, e.g. 'lo-fi hip hop, warmRhodes, relaxed'.",
+                            "description": (
+                                "What to hear, in the model's own language: genre, the instruments by "
+                                "name ('Rhodes piano, upright bass, brushed drums', not 'piano and bass'), "
+                                "the production ('tape saturation, lo-fi hiss'), key or BPM, and the arc "
+                                "('calm intro, builds, resolves'). MusicGen follows the words closely, so "
+                                "detail is what buys quality: 'epic orchestral score, sweeping legato "
+                                "strings, French horns in unison, taiko drums to a massive crescendo, "
+                                "cinematic trailer, D minor' beats 'epic music'."
+                            ),
                         },
                         "seconds": {
                             "type": "integer",
                             "description": f"Duration, 1 to {MAX_MUSIC_SECONDS}. 10 is quick. Longer costs VRAM, not just time.",
+                        },
+                        "device": {
+                            "type": "string",
+                            "enum": list(MUSIC_DEVICE_MODES),
+                            "description": (
+                                "'cuda' is the default and ~6x faster. 'cpu' runs in RAM: slower, but "
+                                "zero VRAM, so nothing resident is evicted. Use it when the card is busy."
+                            ),
                         },
                         "name": {"type": "string", "description": "Optional output file name."},
                     },
@@ -1463,6 +1567,14 @@ def create_compute_tools() -> list[dict[str, Any]]:
                                 "description": "Video only. 'sequential' is the default and fits alongside another model on the card.",
                             },
                             "seconds": {"type": "integer", "description": f"Music only. Duration, 1 to {MAX_MUSIC_SECONDS}."},
+                        "device": {
+                                "type": "string",
+                                "enum": list(MUSIC_DEVICE_MODES),
+                                "description": (
+                                    "Music only. 'cpu' runs the job in RAM: ~6x slower, but zero VRAM, "
+                                    "so nothing resident is evicted."
+                                ),
+                            },
                             "name": {"type": "string", "description": "Optional output file name."},
                         },
                         "required": ["kind", "prompt"],

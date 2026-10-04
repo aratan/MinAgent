@@ -53,6 +53,92 @@ REFLECTION_MAX_TOKENS = 3000
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 _KINDS = ("procedure", "solution", "fact", "preference", "experience", "hypothesis")
 
+# The arguments that carry the method, in the order a reader would give them:
+# which file was touched and which command was run are what a later session has
+# to recognise its own situation in. Everything else in a call - a limit, a
+# timeout, a mode - is dropped from the title because it belongs in the body,
+# where it is kept, and not in the few characters a search compares.
+_TITLE_ARGUMENTS = ("path", "file", "command", "url", "query", "name", "target", "pattern")
+_STEP_CALL = re.compile(r"^(?P<tool>[a-z_]+)\((?P<args>.*)\)$")
+_TITLE_MAX_CHARS = 120
+
+
+def turn_title(steps: str, tools: str) -> str:
+    """Name an auto-captured turn by what it did, not by what was asked.
+
+    The title is what a search matches on, so it has to be written in the words
+    a *later* task would use when it needs the same thing - the file, the
+    command, the subject - and not in the words of the request that happened to
+    produce it. A memory titled ``abrelo con la aplicacion 'code'`` comes back
+    only to somebody who asks for that again; one titled ``run_terminal:
+    which code`` comes back to anybody with an editor to open.
+
+    Built from the steps rather than from the request for the same reason, and
+    for a second one measured on a real session: the steps are the only part of
+    the entry that is evidence, where the request is what was merely wanted.
+    """
+    parts: list[str] = []
+    named: set[str] = set()
+    for step in steps.split(" -> "):
+        match = _STEP_CALL.match(step.strip())
+        if not match:
+            continue
+        tool = match.group("tool")
+        # One entry per tool: a turn that read three files is one method, and a
+        # title listing all three reads as three unrelated memories.
+        if tool in named:
+            continue
+        arguments: list[str] = []
+        for key, value in _call_arguments(match.group("args")):
+            if key in _TITLE_ARGUMENTS and value:
+                arguments.append(value)
+        parts.append(f"{tool}: {arguments[0]}" if arguments else tool)
+        named.add(tool)
+    if not parts:
+        return (tools or steps or "").strip()[:_TITLE_MAX_CHARS] or "a turn with tools"
+    # Two steps is enough to name the shape of the turn without turning the title
+    # into a log line; the third and onwards are in the body for the reader.
+    return "; ".join(parts[:2])[:_TITLE_MAX_CHARS]
+
+
+def _call_arguments(text: str) -> list[tuple[str, str]]:
+    """Split ``a=1, b="two words"`` into pairs without a full parser.
+
+    A hand-rolled split rather than ``ast`` because the text comes from a tool
+    call the model wrote, and a malformed one is normal input here, not an error
+    to raise over.
+    """
+    pairs: list[tuple[str, str]] = []
+    key = ""
+    value = ""
+    in_value = False
+    quote = ""
+    for character in text:
+        if in_value:
+            if quote:
+                if character == quote:
+                    in_value = False
+                else:
+                    value += character
+            elif character in "'\"":
+                quote = character
+            elif character == ",":
+                if key.strip():
+                    pairs.append((key.strip(), value.strip()))
+                key = value = ""
+                in_value = False
+            else:
+                value += character
+            continue
+        if character == "=":
+            key = key.strip()
+            in_value = True
+        else:
+            key += character
+    if key.strip():
+        pairs.append((key.strip(), value.strip()))
+    return pairs
+
 
 @dataclass(frozen=True)
 class EurekaSignal:

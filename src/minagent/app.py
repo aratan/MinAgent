@@ -44,6 +44,7 @@ from .capabilities import (
     build_mcp_capabilities,
 )
 from .compute import (
+    DEFAULT_OFFLOAD,
     MUSIC_TOOL_NAME,
     QUEUE_TOOL_NAME,
     RESULT_TOOL_NAME,
@@ -86,6 +87,13 @@ from .context_budget import (
     SHED_STEPS,
     ContextPolicy,
 )
+from .documents import (
+    CREATE_PDF_TOOL_NAME,
+    READ_DOCUMENT_TOOL_NAME,
+    create_document_tools,
+    run_create_pdf,
+    run_read_document,
+)
 from .download import (
     DOWNLOAD_TOOL_NAME,
     create_download_tools,
@@ -104,6 +112,30 @@ from .editor import (
     reset_prompt_rows,
 )
 from .errors import AgentError, CancellationToken, OperationAborted, find_application_root
+from .flows import (
+    DEFAULT_BATCH_STEPS,
+    FLOWS_FILE_NAME,
+    RUNNER_TOOL_NAMES,
+    STEP_SKIPPED,
+    Flow,
+    Step,
+    StepRecord,
+    abandon_flow,
+    active_flow,
+    advance_flow,
+    create_flow_tools,
+    forget_flow,
+    format_decision,
+    format_flow_panel,
+    format_flow_report,
+    format_flow_result,
+    format_prompt_section,
+    load_flows,
+    make_flow,
+    next_flow_id,
+    parse_steps,
+    save_flow,
+)
 from .image import image_content_part
 from .images import VIEW_IMAGE_TOOL_NAME, create_image_tools, run_view_image
 from .improvement import (
@@ -175,8 +207,15 @@ from .reflection import (
     format_review_result,
     parse_review,
     parse_verdict,
+    turn_title,
 )
 from .request_cache import RequestCache
+from .research import (
+    ResearchOutcome,
+    ResearchQuestion,
+    ResearchWorker,
+    parse_open_questions,
+)
 from .resident import ResidentWorker, build_worker
 from .secrets import approval_preview, redact_likely_secrets
 from .senses import SensesClient, create_senses_tools
@@ -270,6 +309,7 @@ _CONCURRENT_READ_TOOLS = frozenset(
         "web_fetch",
         "describe_image",
         VIEW_IMAGE_TOOL_NAME,
+        READ_DOCUMENT_TOOL_NAME,
     }
 )
 # The archive reference a truncated result already carries.
@@ -303,6 +343,9 @@ _RELEASED_IMAGE_NOTE = "[pixels released from context; view_image(path) shows it
 _SKILLS_COMMAND = re.compile(r"^\/skills(?:\s+([\s\S]*))?$", re.IGNORECASE)
 _SKILL_COMMAND = re.compile(r"^\/skill(?:\s+([\s\S]*))?$", re.IGNORECASE)
 _MEMORY_COMMAND = re.compile(r"^\/memory(?:\s+([\s\S]*))?$", re.IGNORECASE)
+_FLOW_COMMAND = re.compile(r"^\/flow(?:\s+([\s\S]*))?$", re.IGNORECASE)
+FLOW_VERBS = ("show", "status", "continue", "abort", "forget")
+"""What ``/flow <id> <verb>`` accepts, so a mistyped verb is named rather than ignored."""
 _IMPROVEMENT_COMMAND = re.compile(r"^\/mejoras(?:\s+([\s\S]*))?$", re.IGNORECASE)
 _DOCTOR_COMMAND = re.compile(r"^\/doctor(?:\s+([\s\S]*))?$", re.IGNORECASE)
 _MODEL_COMMAND = re.compile(r"^\/model(?:\s+([\s\S]*))?$", re.IGNORECASE)
@@ -376,15 +419,36 @@ _ANNOUNCED_MUTATION = re.compile(
 # turn calling tools, and then reports the work it never did. The user is told a
 # file exists that does not, which is silent data loss rather than a visible
 # error, so it gets the same one-shot correction the other two get.
-_CLAIMED_WRITE = re.compile(
+#
+# Two steps rather than one regular expression, because a single pattern could
+# not say "this is a claim" and "this is a denial of one" at the same time. Every
+# attempt to fold the negation into lookbehinds failed in the same way: the
+# honest replies are the ones that matter, and "no se ha creado el archivo
+# porque faltan datos" kept matching because the negation sits two words back,
+# past the reflexive "se". So the sentence is cut into clauses, a clause with a
+# negation in it is dropped whole, and only what is left is tested.
+_CLAIMED_WRITE_CLAUSES = re.compile(
     r"(?:"
-    # The lookbehinds keep a denial out: "no he creado" and "nunca he creado"
-    # contain the claim but assert the opposite, and a guard that fires on them
-    # would argue with an honest answer.
-    r"(?<!no )(?<!nunca )\b(?:he|ha|hemos|hay) (?:creado|escrito|guardado|generado)\b"
-    r"|(?<!no )\b(?:creado|escrito|guardado|generado) (?:correctamente|con \u00e9xito)\b"
-    r"|\bya (?:est\u00e1|hecho) (?:creado|generado|listo)\b"
-    r"|(?<!no )\bse ha (?:creado|escrito|guardado)\b"
+    # A thing the turn was asked to produce. The subject is restricted to those,
+    # because "el directorio ya existe" is a true observation about a directory
+    # and arguing with it would be the guard being wrong.
+    r"\b(?:he|ha|hemos|hay) (?:creado|escrito|guardado|generado)\b"
+    r"|\bse ha (?:creado|escrito|guardado|generado)\b"
+    r"|\best[a\u00e1] (?:creado|escrito|guardado|generado|copiado)\b"
+    r"|\bse (?:copi\u00f3|copio|cre\u00f3|creo|gener\u00f3|genero)\b"
+    r"|\b(?:creado|escrito|guardado|generado) (?:correctamente|con \u00e9xito)\b"
+    # "Ya está hecho", answered to a request the turn never did. Measured on a
+    # real session: the model replied exactly this, made no tool call at all, and
+    # the guard stayed silent because it only knew the word that followed -
+    # "creado", "generado", "listo" - and this claim needed none of them. A guard
+    # that misses the commonest way of saying it is worse than none, because the
+    # absence of a correction reads as the claim having been checked.
+    r"|\bya (?:est\u00e1 |)(?:hecho|listo|creado|generado|escrito|guardado|terminado)\b"
+    r"|\bhecho\b"
+    # The file name the model is pointing at, backticks and all: the claim is
+    # "this path exists" and the path arrives quoted more often than not.
+    r"|\bel (?:archivo|fichero|documento|video|audio|imagen|musica|m\u00f3sica|voz|clip|script|c[oó]digo|codigo)\b"
+    r"\s*(?:[\w./`-]+\s+){0,3}existe\b"
     r"|\bi(?:'ve| have)? ?(?:created|written|saved|generated)\b"
     r"|\b(?:created|written|saved|generated) (?:successfully|the file)\b"
     r"|\bfile (?:created|written|saved)\b"
@@ -392,10 +456,71 @@ _CLAIMED_WRITE = re.compile(
     re.IGNORECASE,
 )
 
+# The words that turn a claim into a denial. "no he creado" contains the claim
+# and asserts the opposite, and a guard that fires on it argues with the model
+# for telling the truth.
+_CLAIM_DENIALS = re.compile(
+    r"\b(?:no|nunca|jam[aá]s|todav[ií]a\s+no|sin)\b[^.!?]{0,24}$",
+    re.IGNORECASE,
+)
+# A denial that the same clause then takes back: "no se ha creado, pero puedo
+# hacerlo". The work is still not done, but the reply promises it, and it is the
+# promise the user is waiting on, so the clause is read as a claim again.
+_CLAIM_REVERSALS = re.compile(
+    r"(?:\bper[oa]\b|\baunque\b|\ben\s+cambio\b|\bs[ií]\s+me\s+d[ao]s\b)", re.IGNORECASE
+)
+
+
+def _steps_of(memory: dict[str, Any]) -> str:
+    """The step line an auto-captured entry carries in its body."""
+    for line in str(memory.get("content") or "").splitlines():
+        if line.startswith("Steps:"):
+            return line[len("Steps:") :].strip()
+    return ""
+
+
+def _is_request_titled(memory: dict[str, Any]) -> bool:
+    """Whether an entry is one of the ones titled with the request, not the method.
+
+    Recognised by shape rather than by date: the auto-captured entries are the
+    ones whose body starts with "Request:" and carries a "Steps:" line, and they
+    were the ones whose title was the request. An entry the model wrote through
+    ``remember`` has neither marker and is left exactly as it was written.
+    """
+    content = str(memory.get("content") or "")
+    return content.startswith("Request:") and "Steps:" in content
+
+
+def claimed_write(text: str) -> bool:
+    """Whether the reply claims work that a tool would have had to do.
+
+    Clause by clause rather than one regex over the whole reply, so that a
+    denial can drop the clause it belongs to and leave the rest of the sentence
+    alone. The measured case that forced this: "no se ha creado el archivo
+    porque faltan datos" - the negation is two words before the claim, which no
+    fixed-width lookbehind placed next to the claim can see.
+    """
+    # Split on punctuation followed by whitespace, not on the punctuation alone:
+    # a full stop inside "salida/informe.md" ends a file name, not a sentence,
+    # and splitting there hides the claim in the middle of the path.
+    for clause in re.split(r"(?<=[.!?])\s+|\n", text):
+        # Checked per clause and not per sentence: a denial in one clause says
+        # nothing about the next, and "no he creado nada. El informe está
+        # creado." is one honest sentence followed by one false claim.
+        for match in _CLAIMED_WRITE_CLAUSES.finditer(clause):
+            before = clause[: match.start()]
+            # The reversal is looked for on both sides of the claim: "no se ha
+            # creado el archivo, pero puedo hacerlo" puts the "pero" after it,
+            # which is where an offer of the work naturally lands.
+            if _CLAIM_DENIALS.search(before) and not _CLAIM_REVERSALS.search(clause):
+                continue
+            return True
+    return False
+
 # The tools that change the workspace. A turn that ran none of these cannot have
 # created, edited or deleted anything, whatever the reply claims.
 _MUTATING_TOOLS = frozenset(
-    {"write_file", "edit_file", "create_directory", "delete_file", "delete_directory"}
+    {"write_file", "edit_file", "create_directory", "delete_file", "delete_directory", CREATE_PDF_TOOL_NAME}
 )
 
 FILE_TOOL_LABELS = {
@@ -413,8 +538,11 @@ FILE_TOOL_LABELS = {
     "recall": "Recall memory",
     "remember": "Save memory",
     "record_outcome": "Record outcome",
+    "run_flow": "Run flow",
+    "flow_continue": "Continue flow",
     "web_search": "Web search",
-    "web_fetch": "Fetch page",        "describe_image": "Describe image",
+    "web_fetch": "Fetch page",
+    "describe_image": "Describe image",
         "press_keys": "Press keys",
         "type_text": "Type text",
         "move_mouse": "Move mouse",
@@ -436,6 +564,8 @@ FILE_TOOL_LABELS = {
         "delete_module": "Delete module",
         "module_template": "Module template",
     VIEW_IMAGE_TOOL_NAME: "View image",
+    READ_DOCUMENT_TOOL_NAME: "Read document",
+    CREATE_PDF_TOOL_NAME: "Create PDF",
     DOWNLOAD_TOOL_NAME: "Download file",
     SPEAK_TOOL_NAME: "Speak text",
     TRANSCRIBE_TOOL_NAME: "Transcribe audio",
@@ -465,6 +595,7 @@ SLASH_COMMANDS = [
     {"name": "skills", "description": "List, reload, or delete local skills"},
     {"name": "skill", "description": "Draft a new skill from a description"},
     {"name": "memory", "description": "Show what Ara has learned, or forget an entry"},
+    {"name": "flow", "description": "List plans, or resume one the agent started"},
     {"name": "mejoras", "description": "Reflect now, or read what past reflections concluded"},
     {"name": "doctor", "description": "Check the model, context window, and fixed prompt"},
     {"name": "model", "description": "List the endpoint's models, or switch to one"},
@@ -534,6 +665,12 @@ class MinAgent:
         self.tools: list[dict[str, Any]] = []
         self.capabilities: CapabilityCatalog | None = None
         self.capability_idle_turns = DEFAULT_CAPABILITY_IDLE_TURNS
+        # Long work the agent plans for itself. The plan lives in a file and is
+        # checkpointed per step, so a task that outlives the turn that started it
+        # is not a task the agent has to remember.
+        self.flows_enabled = False
+        self.flow_batch_steps = DEFAULT_BATCH_STEPS
+        self.flow: Flow | None = None
         self._capabilities_used_this_turn: set[str] = set()
         # What the context governor has given up, in the order it gave it up,
         # and how far down the cascade it has already looked.
@@ -552,6 +689,11 @@ class MinAgent:
         # window, and the truncation note that names the archive reference is
         # useless unless the model already knows it can call this.
         for definition in build_tools() + [build_tool_output_recall_tool()]:
+            self._tool_schemas[definition["function"]["name"]] = definition
+        # The document tools are not gated on any setting, so they exist from
+        # the start; storing a schema costs nothing until the capability is
+        # loaded and its schemas are published.
+        for definition in create_document_tools():
             self._tool_schemas[definition["function"]["name"]] = definition
         self.tools = [self._tool_schemas["recall_tool_output"]]
 
@@ -595,6 +737,9 @@ class MinAgent:
         self.improvement_model = ""
         self.memory_store: MemoryStore | None = None
         self.memory_hint_context = ""
+        # The ids offered as hints this turn, so a turn that fails on its tools
+        # can degrade exactly the memories it was given and nothing else.
+        self._memory_hinted_ids: list[int] = []
         self.web_search_enabled = False
         self.ollama_api_key: str | None = None
         self.web_search_base_url = ""
@@ -777,6 +922,8 @@ class MinAgent:
         self.mcp_enabled = config.mcp_enabled
         self.mcp_approval_mode = config.mcp_approval_mode
         self.memory_enabled = config.memory_enabled
+        self.flows_enabled = config.flows_enabled
+        self.flow_batch_steps = config.flow_batch_steps
         self.memory_db_path = config.memory_db_path
         self.memory_direct_answer = config.memory_direct_answer
         self.memory_eureka = config.memory_eureka
@@ -832,6 +979,9 @@ class MinAgent:
             self.ensure_mcp_tools()
         if self.memory_enabled:
             self.ensure_memory_tools()
+        if self.flows_enabled:
+            self.ensure_flow_tools()
+            self.flow = active_flow(self.application_root, self.root_directory)
         if self.web_search_enabled:
             self.web_search_client = WebSearchClient(
                 self.web_search_base_url, self.ollama_api_key, self.web_search_timeout_seconds
@@ -860,6 +1010,7 @@ class MinAgent:
         if self.compute_enabled:
             self.orchestrator = ComputeOrchestrator(
                 root_directory=self.root_directory,
+                script_directories=(self.application_root, self.root_directory),
                 vram_total_mib=config.compute_vram_total_mib,
                 job_timeout_seconds=config.compute_job_timeout_seconds,
                 voice_timeout_seconds=config.compute_voice_timeout_seconds,
@@ -868,6 +1019,7 @@ class MinAgent:
             )
         self.ensure_image_tools()
         self.ensure_download_tools()
+        self.ensure_document_tools()
         if self.input_enabled:
             self.ensure_input_tools()
         if self.senses_enabled:
@@ -968,9 +1120,23 @@ class MinAgent:
         """Expose the memory tools once, whenever memory is enabled."""
         self._register_missing(create_memory_tools())
 
+    def ensure_flow_tools(self) -> None:
+        """Expose the flow tools once, whenever flow planning is enabled."""
+        self._register_missing(create_flow_tools())
+
     def ensure_web_search_tools(self) -> None:
         """Expose the web tools once, whenever web search is enabled."""
         self._register_missing(create_web_search_tools())
+
+    def ensure_document_tools(self) -> None:
+        """Expose the document tools once, whenever a session starts.
+
+        They need no configuration: reading a CSV and writing a report are
+        ordinary work with the workspace. PyMuPDF is imported when a PDF is
+        actually touched, so a session without that optional dependency still
+        has the schemas and still reads spreadsheets.
+        """
+        self._register_missing(create_document_tools())
 
     def ensure_download_tools(self) -> None:
         """Expose the download tool once; it is the only write that uses the network."""
@@ -1063,7 +1229,7 @@ class MinAgent:
             str(args.get("prompt", "")),
             frames=_as_int(args.get("frames"), 49, "frames"),
             steps=_as_int(args.get("steps"), 40, "steps"),
-            offload=str(args.get("offload", "group") or "group"),
+            offload=self._offload(args),
             name=str(args.get("name", "")),
         )
         return format_heavy_result(record, self._relative_media(record.output))
@@ -1074,6 +1240,7 @@ class MinAgent:
         record = await orchestrator.generate_music(
             str(args.get("prompt", "")),
             seconds=_as_int(args.get("seconds"), 15, "seconds"),
+            device=str(args.get("device", "") or "cuda"),
             name=str(args.get("name", "")),
         )
         return format_heavy_result(record, self._relative_media(record.output))
@@ -1081,6 +1248,19 @@ class MinAgent:
     def run_compute_status(self, args: dict[str, Any]) -> str:
         """Report free VRAM, what holds it, and the heavy job queue."""
         return self._require_orchestrator().status_text()
+
+    def _offload(self, args: dict[str, Any]) -> str:
+        """The offload mode a call asked for, or the one the schema promises.
+
+        Read from one place because the two entry points - the direct call and
+        the queued one - each had their own default, and the queued one said
+        ``group``: the mode the schema and the guidance both describe as needing
+        a nearly empty card, for a call whose whole point is to run alongside
+        something else. The tool description is read before the arguments are
+        written, so a default that contradicts it is not a default the model
+        can reason about.
+        """
+        return str(args.get("offload", "") or DEFAULT_OFFLOAD)
 
     def run_queue_job(self, args: dict[str, Any]) -> str:
         """Accept a heavy job and return its id, without waiting for the render."""
@@ -1092,13 +1272,14 @@ class MinAgent:
                 prompt,
                 frames=_as_int(args.get("frames"), 49, "frames"),
                 steps=_as_int(args.get("steps"), 40, "steps"),
-                offload=str(args.get("offload", "group") or "group"),
+                offload=self._offload(args),
                 name=str(args.get("name", "")),
             )
         elif kind == "music":
             job_id = orchestrator.submit_music(
                 prompt,
                 seconds=_as_int(args.get("seconds"), 15, "seconds"),
+                device=str(args.get("device", "") or "cuda"),
                 name=str(args.get("name", "")),
             )
         else:
@@ -1217,12 +1398,14 @@ class MinAgent:
     async def refresh_memory_hints(self, request_text: str) -> None:
         """Recall prompt hints for a new request, bounded to keep the prompt small."""
         self.memory_hint_context = ""
+        self._memory_hinted_ids = []
         store = self.memory_store
         if store is not None and self.memory_enabled and request_text.strip():
             try:
                 memories = await store.hints(request_text)
             except AgentError:
                 memories = []
+            self._memory_hinted_ids = [int(memory["id"]) for memory in memories]
             self.memory_hint_context = format_memory_hints(memories)
         self.refresh_system_prompt()
 
@@ -1249,6 +1432,7 @@ class MinAgent:
             await self._store_raw_turn(store, final_text)
             await self._judge_finished_turn(store, final_text)
             await self._maybe_review(store)
+            await self._punish_failed_hints(store)
         except (AgentError, OSError, ValueError):
             pass
         # Outside the memory work on purpose: a reflection has to happen even
@@ -1280,6 +1464,16 @@ class MinAgent:
         Storing the concrete steps - not just the tool names - is what makes
         the entry worth reviewing later: a session can repeat what worked
         instead of rediscovering it.
+
+        The title is built from what the turn *did*, not from the request. A
+        memory titled with the user's own words can only ever be found by
+        quoting those words back, so it comes back when the same request is
+        repeated and stays invisible when a later task needs the same method.
+        Measured over a real session, that was every auto-captured memory in
+        the store: the recall that did fire brought back the request being
+        asked rather than the way it was answered, and the one method it did
+        carry - the sequence of tool calls - was the sequence that had produced
+        the wrong file, restated as if it were the lesson.
         """
         if (
             self._memory_remembered_this_turn
@@ -1297,7 +1491,34 @@ class MinAgent:
         if steps:
             content += f"\nSteps: {steps}"
         content += f"\nOutcome: {outcome}"
-        await store.remember("experience", request[:160], content, tools, AUTO_CAPTURE_SOURCE)
+        await store.remember(
+            "experience", turn_title(steps, tools), content, tools, AUTO_CAPTURE_SOURCE
+        )
+
+    async def _punish_failed_hints(self, store: MemoryStore) -> None:
+        """Degrade the memories that were offered into a turn that then failed.
+
+        The store can lower a memory's confidence, and until this nothing in the
+        session ever asked it to: ``record_outcome`` is a tool, so only the model
+        could call it, and the model has no way to know a hint it followed was
+        the wrong one - it reads the hint, tries it, and the traceback names the
+        tool, not the advice. Measured over a real store, 36 reinforcements and
+        not one failure, which is not a record of things going well; it is a
+        store where every lesson was permanent.
+
+        Only the turn's own failures count, and only a hint the model was
+        actually given. A memory that was never offered cannot have caused the
+        turn, and a turn that succeeded says nothing about whether the hint was
+        any good - punishing those would teach the store to hide things that
+        happen to work.
+        """
+        if not self._tool_error_this_turn or not self._memory_hinted_ids:
+            return
+        for memory_id in self._memory_hinted_ids:
+            await store.record_outcome(
+                memory_id, False, "the turn it was recalled for failed on its tools"
+            )
+        self._memory_hinted_ids = []
 
     async def _judge_finished_turn(self, store: MemoryStore, final_text: str) -> None:
         """Ask the model whether a turn that looks like a discovery is worth keeping.
@@ -1846,6 +2067,190 @@ class MinAgent:
         if worker is not None:
             worker.budget.commit_call()
 
+    @property
+    def _research_queue_path(self) -> Path:
+        # application_root is a string everywhere else in this class, so the
+        # join has to happen here rather than with ``/``, which would concatenate
+        # a path onto the text and produce a file that is never read again.
+        return Path(self.application_root) / "agente" / "PREGUNTAS.md"
+
+    async def _research_one_question(self) -> str:
+        """Answer the oldest open question, if this cycle can still afford it.
+
+        Called by the resident *after* the reflection and only when
+        ``Budget.can_fund_research`` said yes, so the decision of whether a
+        cycle deserves research budget belongs to the budget and not to a
+        policy written next to it. What this method decides is narrower: which
+        question, if any, and what the answer was worth.
+
+        The queue is a file rather than a planner, for the same reason the
+        persona is a file. A queue Ara can open is a queue she can be wrong
+        about, and a question she wrote down is one she can check the answer
+        against. An agent that decides on its own what it is curious about
+        spends provider credits on questions nobody recorded.
+
+        Returns a line for the cycle record, or ``""`` for nothing queued.
+        """
+        path = self._research_queue_path
+        if self.web_search_client is None:
+            return "research: no web client configured"
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return ""
+
+        queued = parse_open_questions(text)
+        if not queued:
+            return ""
+        question, why = queued[0]
+        asked = ResearchQuestion(question=question, why=why)
+
+        worker = ResearchWorker(
+            client=self.web_search_client,
+            extract=self._research_extract,
+            consistency=self._research_consistency,
+        )
+        outcome = await worker.investigate(asked)
+
+        if outcome.promoted and outcome.admission is not None:
+            # Only now does anything durable get written. The gate ran before
+            # this line for the same reason the worker has no write path of its
+            # own: a finding that was never admitted must not reach the store,
+            # however convincing its citations looked.
+            lesson = self._lesson_from_outcome(outcome)
+            if lesson is not None and await self._store_lesson(lesson):
+                self._mark_question_answered(path, question)
+                return f"research: learned from '{question[:60]}'"
+
+        self._mark_question_attempted(path, question, outcome)
+        return f"research: '{question[:60]}' -> {outcome.reason}"
+
+    def _lesson_from_outcome(self, outcome: ResearchOutcome) -> Lesson | None:
+        """Rebuild the admitted lesson so it can be stored with its pointers.
+
+        The worker decides whether a claim may be believed and then discards the
+        object, which was right when nothing consumed it. Now that something
+        does, the lesson has to travel. It is rebuilt from the outcome rather
+        than carried through ``ResearchOutcome`` so that a non-promoted
+        investigation cannot hand back a lesson by accident.
+        """
+        promoted = [item for item in outcome.findings if item.claim]
+        if not outcome.promoted or not promoted:
+            return None
+        best = max(promoted, key=lambda item: item.confidence)
+        return Lesson(
+            title=best.claim[:80],
+            guideline=best.claim,
+            trigger=outcome.question.question,
+            cause=outcome.question.why or "researched from the open question queue",
+        )
+
+    async def _store_lesson(self, lesson: Lesson) -> bool:
+        """Write one admitted lesson. ``False`` when there is nowhere to put it."""
+        store = self.memory_store
+        if store is None or not self.improvement_enabled:
+            return False
+        try:
+            return bool(await store.remember("lesson", lesson.title, lesson.guideline, source="research"))
+        except (OSError, ValueError):
+            return False
+
+    def _mark_question_answered(self, path: Path, question: str) -> None:
+        self._rewrite_question(path, question, "[x]", "answered")
+
+    def _mark_question_attempted(self, path: Path, question: str, outcome: ResearchOutcome) -> None:
+        self._rewrite_question(path, question, "[x]", f"not promoted: {outcome.reason}")
+
+    def _rewrite_question(self, path: Path, question: str, marker: str, note: str) -> None:
+        """Tick a question off in place, keeping the queue readable by a person.
+
+        A queue that only shrinks in memory is a queue that re-asks forever, and
+        one that is rewritten wholesale loses the questions someone else wrote.
+        So the file is edited line by line, the answer is appended under the
+        question, and a write that fails is left to fail quietly: a research
+        note is not worth ending a cycle over, and the worst case is the same
+        question being asked again, which is the behaviour without this anyway.
+        """
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return
+        target = question.strip()
+        for index, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped or stripped.startswith(("- [x]", "* [x]", "- [X]")):
+                continue
+            if not stripped.lower().startswith(("- [ ]", "* [ ]", "- [?]")):
+                continue
+            if stripped[stripped.index("]") + 1 :].strip().lstrip("-*?").strip() != target:
+                continue
+            body = stripped[stripped.index("]") + 1 :]
+            lines[index] = f"- {marker}{body}"
+            indent = "  " if line.startswith(" ") else ""
+            lines.insert(index + 1, f"{indent}  — {note}")
+            break
+        try:
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except OSError:
+            return
+
+    async def _research_extract(self, question: str, spans: Sequence[tuple[str, str]]) -> str:
+        """State, in one sentence, what the cited pages actually say.
+
+        The model is told the shape it must answer in because the alternative is
+        a paragraph in a field the gate will read as a claim, and a paragraph
+        that hedges is indistinguishable from a paragraph that does not.
+        """
+        cited = "\n\n".join(f"[{index + 1}] {url}\n{excerpt}" for index, (url, excerpt) in enumerate(spans))
+        if not cited.strip():
+            return ""
+        prompt = (
+            "Answer the question using only the passages below. If they do not "
+            "answer it, reply with nothing.\n"
+            "Reply with ONE sentence and no preamble.\n\n"
+            f"Question: {question}\n\nPassages:\n{cited}\n"
+        )
+        reserved = self._reserve_resident_call()
+        if not reserved:
+            return ""
+        try:
+            answer = (await self._ask_with_reflection_model([{"role": "user", "content": prompt}])) or ""
+        except (AgentError, OSError, ValueError):
+            return ""
+        finally:
+            self._commit_resident_call(reserved)
+        return answer.strip().splitlines()[0].strip() if answer.strip() else ""
+
+    async def _research_consistency(self, lesson: Lesson, known: Sequence[Lesson]) -> Criticism | None:
+        """Ask whether the claim contradicts what is already believed.
+
+        ``None`` when the reviewer cannot be reached, and the gate reads that as
+        a refusal. That is the safe direction: a model that is down must not be
+        able to turn into a promotion, or every outage would quietly become
+        evidence.
+        """
+        held = "; ".join(item.guideline for item in known[:8]) or "(nothing relevant stored)"
+        prompt = (
+            "Does the NEW claim contradict what is already known?\n"
+            "Reply with exactly one line: CONSISTENT <reason> or CONFLICTS <reason>.\n\n"
+            f"Known: {held}\nNew: {lesson.guideline}\n"
+        )
+        reserved = self._reserve_resident_call()
+        if not reserved:
+            return None
+        try:
+            answer = await self._ask_with_reflection_model([{"role": "user", "content": prompt}])
+        except (AgentError, OSError, ValueError):
+            return None
+        finally:
+            self._commit_resident_call(reserved)
+        verdict = (answer or "").strip().upper()
+        if not verdict:
+            return None
+        if "CONFLICTS" in verdict:
+            return Criticism(critic="consistency", verdict="conflict", reason=(answer or "").strip()[:200])
+        return Criticism(critic="consistency", verdict="consistent", reason=(answer or "").strip()[:200])
+
     def _start_resident_worker(self) -> ResidentWorker:
         """Start the loop that works while the machine is free.
 
@@ -2130,6 +2535,8 @@ class MinAgent:
             subagents_enabled=self.subagents_enabled,
             images_enabled="image" in self.input_modalities,
             compute_enabled=self.compute_enabled,
+            flows_enabled=self.flows_enabled,
+
         )
         entries.extend(
             build_mcp_capabilities(
@@ -3008,6 +3415,8 @@ class MinAgent:
         if not self.memory_enabled or self.memory_store is None:
             raise AgentError("Memory is disabled. Set MEMORY_ENABLED=on to use it.")
         argument = argument.strip()
+        if argument.lower().startswith("retitle"):
+            return await self.retitle_stale_memories(argument[len("retitle"):].strip())
         if argument.lower().startswith("forget"):
             raw = argument[len("forget"):].strip()
             if not raw.isdigit():
@@ -3021,7 +3430,326 @@ class MinAgent:
         self.print("")
         for line in format_memory_stats(statistics, memories).splitlines():
             self.ui_print_wrapped((("│ ", "magenta", False), (line, "pale", False)))
-        self.ui_print_wrapped((("╰─ ", "magenta", False), ("/memory forget <id>", "muted", False)))
+        self.ui_print_wrapped((("╰─ ", "magenta", False), ("/memory forget <id> · /memory retitle", "muted", False)))
+
+    async def retitle_stale_memories(self, argument: str) -> None:
+        """Rename the entries a store titled with the request instead of the method.
+
+        ``/memory retitle`` rewrites them from the steps each entry already
+        carries, and ``/memory retitle <id>`` previews one before changing it.
+
+        Measured on this project's own store: 24 of the 80 entries were titled
+        with the user's own words, so a search could only find them by repeating
+        the request. The steps were in the body the whole time - they are what a
+        later session actually needs - so nothing is lost by renaming and
+        nothing has to be reconstructed or guessed.
+
+        Not run silently over everything: a title the model wrote deliberately
+        through ``remember`` is the model's own wording, and only the entries
+        from the automatic capture are renamed.
+        """
+        store = self._require_memory_store()
+        entries = await store.recent(1000)
+        stale = [memory for memory in entries if _is_request_titled(memory)]
+
+        if argument:
+            if not argument.isdigit():
+                raise AgentError("Usage: /memory retitle [id]")
+            memory_id = int(argument)
+            entry = next((m for m in stale if m["id"] == memory_id), None)
+            if entry is None:
+                others = [m for m in entries if m["id"] == memory_id]
+                if not others:
+                    raise AgentError(f"No memory with id {memory_id}.")
+                self.ui_print_wrapped(
+                    ((f"#{memory_id} is already titled by what it did.", "pale", False),)
+                )
+                return
+            stale = [entry]
+        elif not stale:
+            self.ui_print_wrapped(
+                ((f"Nothing to rename: all {len(entries)} entries are already titled by method.", "pale", False),)
+            )
+            return
+
+        renamed = 0
+        self.print("")
+        for memory in stale:
+            new_title = turn_title(_steps_of(memory), memory["tags"] or "")
+            if not new_title or new_title == memory["title"]:
+                continue
+            try:
+                await store.retitle(memory["id"], new_title)
+            except AgentError as error:
+                self.ui_print_wrapped(((f"#{memory['id']} left alone: {error.message}", "warning", False),))
+                continue
+            renamed += 1
+            self.ui_print_wrapped(
+                (
+                    (f"#{memory['id']} ", "muted", False),
+                    (f"{memory['title'][:58]}", "muted", False),
+                    ("  ->  ", "muted", False),
+                    (new_title[:58], "cyan", False),
+                )
+            )
+        self.ui_print_wrapped(
+            ((f"{renamed} of {len(stale)} renamed. The content, counters and confidence are untouched.",
+              "pale", False),)
+        )
+
+    # ---------------------------------------------------------------- the flows
+
+    FLOW_TOOL_NAMES = RUNNER_TOOL_NAMES
+
+    def flow_step_tools(self) -> set[str]:
+        """Every tool a flow step may name, which is every tool but the runner.
+
+        The set is the whole catalogue rather than the loaded slice: a step that
+        names a tool of an unloaded capability is an ordinary thing for the model
+        to write, and ``execute_tool`` loads that capability on the way, exactly
+        as it does for a tool call made in the turn loop. What is excluded is the
+        runner itself, because a flow that starts another flow has no defined
+        end and no defined place to checkpoint.
+        """
+        return set(self._tool_schemas) - set(self.FLOW_TOOL_NAMES)
+
+    def save_current_flow(self, flow: Flow) -> None:
+        """Checkpoint a flow. Called after every step, so this is the hot path."""
+        save_flow(self.application_root, flow)
+
+    async def execute_flow_step(self, tool: str, arguments: dict[str, Any]) -> Any:
+        """Run one planned step through the same funnel as a tool call.
+
+        Going through ``execute_tool`` rather than calling tools directly is the
+        whole safety story of a flow: the capability loads on demand, the
+        approval rules of that tool still apply, a mutation still counts as a
+        mutation this turn, and a step that raises fails like any other call
+        rather than taking the session with it.
+        """
+        result = await self.execute_tool(tool, arguments, annotate=False)
+        self._tools_used_this_turn.append(tool)
+        self._steps_this_turn.append(self.describe_step(tool, arguments))
+        return result
+
+    def announce_flow_step(self, index: int, step: Step, arguments: dict[str, Any]) -> None:
+        """Show which step is running before it runs.
+
+        Every step is announced even though none of them asks: a flow runs on its
+        own between the model and the next decision point, and an unannounced
+        command is indistinguishable from the agent doing something on its own.
+        """
+        flow = self.flow
+        total = len(flow.steps) if flow is not None else index + 1
+        self.print("")
+        header = f"FLOW {flow.id} · STEP {index + 1}/{total}" if flow is not None else f"STEP {index + 1}/{total}"
+        self.ui_print_wrapped((("╭─ ", "magenta", False), (header, "pale", True)))
+        detail = self.describe_step(step.tool, arguments) or step.tool
+        self.ui_print_wrapped((("│ ", "magenta", False), (detail, "muted", False)))
+        if step.note:
+            self.ui_print_wrapped((("│ ", "magenta", False), (step.note, "muted", False)))
+
+    async def advance_current_flow(
+        self,
+        flow: Flow,
+        signal: CancellationToken | None = None,
+    ) -> None:
+        await advance_flow(
+            flow,
+            self.execute_flow_step,
+            save=self.save_current_flow,
+            archive=self.archive_flow_output,
+            is_cancelled=lambda: bool(signal is not None and signal.cancelled),
+            on_step=self.announce_flow_step,
+            batch_limit=self.flow_batch_steps,
+        )
+
+    def archive_flow_output(self, text: str) -> str | None:
+        """Keep a step's whole output out of the window and return its reference.
+
+        The same archive the turn loop writes to, so a flow step that printed
+        forty thousand characters is recoverable with the tool that is always
+        loaded, rather than being the one result in the session that cannot be
+        read back in full.
+        """
+        archive = getattr(self, "tool_archive", None)
+        return archive.store(text) if archive is not None else None
+
+    async def start_flow(self, args: dict[str, Any], signal: CancellationToken | None = None) -> str:
+        """Write the model's plan to a file and run it until it needs a decision."""
+        objective = args.get("objective")
+        if not isinstance(objective, str) or not objective.strip():
+            raise AgentError("run_flow needs an objective: what the whole plan is trying to achieve.")
+        steps = parse_steps(
+            args.get("steps"),
+            known_tools=self.flow_step_tools(),
+            forbidden=self.FLOW_TOOL_NAMES,
+        )
+        previous = self.flow
+        replaced_flow = ""
+        if previous is not None and previous.active:
+            replaced_flow = previous.id
+            abandon_flow(self.application_root, previous)
+        flow = make_flow(
+            flow_id=next_flow_id(load_flows(self.application_root)),
+            objective=objective.strip(),
+            steps=steps,
+            workspace=self.root_directory,
+        )
+        self.flow = flow
+        self.save_current_flow(flow)
+        self.print("")
+        self.ui_print_wrapped((("╭─ ", "magenta", False), (f"FLOW {flow.id}", "pale", True)))
+        self.ui_print_wrapped((("│ ", "magenta", False), (flow.objective, "muted", False)))
+        await self.advance_current_flow(flow, signal)
+        replaced = ""
+        if replaced_flow:
+            replaced = (
+                f"\n\nFlow {replaced_flow} was unfinished and has been abandoned. Its steps are kept in "
+                f"{FLOWS_FILE_NAME} and nothing from it ran again."
+            )
+        return format_flow_result(flow) + replaced
+
+    async def continue_flow(self, args: dict[str, Any], signal: CancellationToken | None = None) -> str:
+        """Drive the current flow forward, or correct it, without repeating it."""
+        # The action is read before the flow is looked up: a mistyped action is
+        # wrong whichever flow it was aimed at, and "no unfinished flow" sent
+        # back for a bad argument teaches the model to keep guessing names.
+        action = str(args.get("action") or "").strip().lower()
+        if action not in ("continue", "skip_step", "replace_remaining", "abort"):
+            raise AgentError(
+                'action must be "continue", "skip_step", "replace_remaining" or "abort", not '
+                f"{action!r}."
+            )
+        flow = self.flow if self.flow is not None and self.flow.active else None
+        if flow is None:
+            flow = active_flow(self.application_root, self.root_directory)
+        if flow is None:
+            # Nothing to drive. If this session is the one that finished the flow
+            # the model is asking about, its own report is the answer; the "there
+            # is no flow" error is only for a workspace that never had one.
+            finished = self.flow if action != "abort" else None
+            if finished is not None:
+                return format_flow_result(finished)
+            raise AgentError(
+                "There is no unfinished flow for this workspace. run_flow starts one; /flow lists "
+                "what exists."
+            )
+        self.flow = flow
+        if action == "abort":
+            abandon_flow(self.application_root, flow)
+            self.flow = None
+            return (
+                f"Flow {flow.id} abandoned after step {flow.cursor} of {len(flow.steps)}. The steps that "
+                f"already ran are not undone and stay in {FLOWS_FILE_NAME}."
+            )
+        if action == "skip_step":
+            if flow.cursor >= len(flow.steps):
+                return format_flow_result(flow)
+            skipped = flow.steps[flow.cursor]
+            flow.records.append(
+                StepRecord(
+                    index=flow.cursor,
+                    tool=skipped.tool,
+                    note=skipped.note,
+                    status=STEP_SKIPPED,
+                    error="Skipped on request; it did not run.",
+                )
+            )
+            flow.cursor += 1
+            self.save_current_flow(flow)
+        elif action == "replace_remaining":
+            steps = parse_steps(
+                args.get("steps"),
+                known_tools=self.flow_step_tools(),
+                forbidden=self.FLOW_TOOL_NAMES,
+                label="steps",
+            )
+            if not steps:
+                raise AgentError("replace_remaining needs the corrected steps.")
+            # Records describe the steps of the plan as it stands, so the ones
+            # the correction replaces go with it. Keeping them would leave the
+            # failure attached to the step that took its place, and a report
+            # that blames the corrected step is worse than no report.
+            flow.records = [record for record in flow.records if record.index < flow.cursor]
+            flow.steps = flow.steps[: flow.cursor] + steps
+            self.save_current_flow(flow)
+        await self.advance_current_flow(flow, signal)
+        return format_flow_result(flow, resumed=True)
+
+    def flow_prompt_section(self) -> dict[str, str] | None:
+        """Keep a half-finished plan in front of the model.
+
+        Placed with the sections that change, not in the stable core, for the
+        same reason as the clock: a plan appearing or advancing must not
+        invalidate the cached prompt prefix of every request before it.
+        """
+        content = format_prompt_section(self.flow)
+        if not content:
+            return None
+        return {"name": "Active flow", "content": content}
+
+    async def handle_flow_command(self, argument: str, signal: CancellationToken | None = None) -> None:
+        """Run ``/flow``: list the plans, or drive one without the model."""
+        if not self.flows_enabled:
+            raise AgentError("Flows are disabled. Set FLOWS_ENABLED=on in .env.")
+        parts = argument.strip().split()
+        verb = ""
+        identifier = ""
+        for part in parts:
+            lowered = part.lower()
+            if lowered in FLOW_VERBS:
+                verb = lowered
+                continue
+            if identifier:
+                raise AgentError(f"/flow does not take {part!r}. Use continue, abort, or forget.")
+            identifier = part
+        flows = load_flows(self.application_root, self.root_directory)
+        if not parts:
+            self.print("")
+            for line in format_flow_panel(flows).splitlines():
+                self.ui_print_wrapped((("│ ", "magenta", False), (line, "pale", False)))
+            if flows:
+                self.ui_print_wrapped(
+                    (("╰─ ", "magenta", False), ("/flow <id> [continue|abort|forget]", "muted", False))
+                )
+            return
+        selected: Flow | None = None
+        if identifier:
+            selected = next((item for item in flows if item.id == identifier), None)
+            if selected is None:
+                raise AgentError(f"There is no flow {identifier}. /flow lists them.")
+        elif self.flow is not None and self.flow.active:
+            selected = self.flow
+        else:
+            selected = active_flow(self.application_root, self.root_directory)
+        if selected is None:
+            raise AgentError("There is no unfinished flow for this workspace.")
+        if verb in ("", "show", "status"):
+            for line in format_flow_report(selected).splitlines():
+                self.ui_print_wrapped((("│ ", "magenta", False), (line, "pale", False)))
+            if selected.active:
+                self.ui_print_wrapped((("╰─ ", "magenta", False), (format_decision(selected)[:120], "muted", False)))
+            return
+        if verb == "abort":
+            abandon_flow(self.application_root, selected)
+            if self.flow is not None and self.flow.id == selected.id:
+                self.flow = None
+            self.ui_print_wrapped((("│ ", "magenta", False), (f"Flow {selected.id} abandoned.", "warning", False)))
+            return
+        if verb == "forget":
+            removed = forget_flow(self.application_root, selected)
+            if self.flow is not None and self.flow.id == selected.id:
+                self.flow = None
+            message = f"Flow {selected.id} removed." if removed else f"Flow {selected.id} was not stored."
+            self.ui_print_wrapped((("│ ", "magenta", False), (message, "pale", False)))
+            return
+        if verb == "continue":
+            self.flow = selected
+            await self.advance_current_flow(selected, signal)
+            for line in format_flow_report(selected).splitlines():
+                self.ui_print_wrapped((("│ ", "magenta", False), (line, "pale", False)))
+            return
+        raise AgentError(f"Unknown /flow action {verb!r}. Use continue, abort, or forget.")
 
     def print_skills_panel(self) -> None:
         """List the registered skills, their warnings, and where new ones go."""
@@ -3262,6 +3990,9 @@ class MinAgent:
             sections.append({"name": "Workspace inventory", "content": self.workspace_snapshot})
         if self.memory_hint_context and not self._minimal_context:
             sections.append({"name": "Memory hints", "content": self.memory_hint_context})
+        flow_section = self.flow_prompt_section()
+        if flow_section is not None:
+            sections.append(flow_section)
         self._current_system_prompt_sections = sections
         self.messages[0]["content"] = "\n\n".join(section["content"] for section in sections)
 
@@ -3476,7 +4207,7 @@ class MinAgent:
         except Exception as error:
             return f"Error: {error}"
 
-    async def execute_tool(self, name: str, args: dict[str, Any]) -> Any:
+    async def execute_tool(self, name: str, args: dict[str, Any], *, annotate: bool = True) -> Any:
         """Dispatch one tool call, loading whatever it needs on the way.
 
         A tool of a capability that is not loaded is loaded here rather than
@@ -3484,6 +4215,11 @@ class MinAgent:
         index already said, and a model that has to be told twice does the work
         anyway; loading it silently costs the schemas only from the next
         request on, and saves the round trip.
+
+        ``annotate`` suppresses the note about that load. A flow step asks for
+        it, because the note would be prepended to a result the next step may
+        substitute into its own arguments, and a file written from it would
+        open with a sentence about capabilities.
         """
         assert self.workspace_access is not None
         self.note_capability_use(name)
@@ -3502,7 +4238,7 @@ class MinAgent:
         # tools raise on every failure path, so the workspace really changed.
         if name in _MUTATING_TOOLS:
             self._mutations_this_turn.append(name)
-        if auto_loaded and isinstance(result, str):
+        if auto_loaded and annotate and isinstance(result, str):
             return (
                 f"[{auto_loaded} was loaded on demand to run this; its instructions are in the system "
                 f"prompt from now on, and calling {name} directly works from here on.]\n\n{result}"
@@ -3550,6 +4286,10 @@ class MinAgent:
         assert self.workspace_access is not None
         if name == LOAD_CAPABILITY_TOOL_NAME:
             return self.load_capabilities(self._requested_capability_names(args))
+        if name == "run_flow":
+            return await self.start_flow(args, self._active_token)
+        if name == "flow_continue":
+            return await self.continue_flow(args, self._active_token)
         if name == "read_file":
             return await self.workspace_access.read_file(args, image_enabled="image" in self.input_modalities)
         if name == "list_directory":
@@ -3581,6 +4321,15 @@ class MinAgent:
             return await self.run_web_search(args)
         if name == "web_fetch":
             return await self.run_web_fetch(args)
+        if name == READ_DOCUMENT_TOOL_NAME:
+            return await run_read_document(args, self.workspace_access)
+        if name == CREATE_PDF_TOOL_NAME:
+            return await run_create_pdf(
+                args.get("documents"),
+                self.root_directory,
+                page_size=str(args.get("page_size") or "a4"),
+                body_format=str(args.get("format") or "markdown"),
+            )
         if name == "describe_image":
             return await self.run_describe_image(args)
         if name == "press_keys":
@@ -5210,7 +5959,7 @@ class MinAgent:
                 if (
                     not self._mutations_this_turn
                     and unclaimed_write_retries == 0
-                    and (_CLAIMED_WRITE.search(final_text) or _ANNOUNCED_MUTATION.search(final_text))
+                    and (claimed_write(final_text) or _ANNOUNCED_MUTATION.search(final_text))
                 ):
                     # The model reported work it never did, or promised work it
                     # never started. One correction, then whatever it says next
@@ -5515,6 +6264,7 @@ class MinAgent:
                     skills_match = _SKILLS_COMMAND.match(text_input)
                     skill_match = _SKILL_COMMAND.match(text_input)
                     memory_match = _MEMORY_COMMAND.match(text_input)
+                    flow_match = _FLOW_COMMAND.match(text_input)
                     improvement_match = _IMPROVEMENT_COMMAND.match(text_input)
                     doctor_match = _DOCTOR_COMMAND.match(text_input)
                     model_match = _MODEL_COMMAND.match(text_input)
@@ -5585,6 +6335,14 @@ class MinAgent:
                             self.clear_submitted_input(text_input, PROMPT_VISIBLE_LENGTH, input_rows_to_clear)
                             self.print_user_bubble(text_input)
                             await self.handle_memory_command(memory_match.group(1) or "")
+                            continue
+                        if flow_match:
+                            state["selected_files"].clear()
+                            self.clear_submitted_input(text_input, PROMPT_VISIBLE_LENGTH, input_rows_to_clear)
+                            self.print_user_bubble(text_input)
+                            await self.run_interruptible_model_operation(
+                                lambda token: self.handle_flow_command(flow_match.group(1) or "", token)
+                            )
                             continue
                         if improvement_match:
                             state["selected_files"].clear()

@@ -366,9 +366,38 @@ def test_the_guidance_states_the_vram_policy(tmp_path: Path) -> None:
     guidance = next(entry for entry in entries if entry.name == "compute").guidance
     assert "8 GB" in guidance
     assert "serialized" in guidance
-    # The two facts that stop the expensive mistakes.
-    assert "frames" in guidance and "steps do not" in guidance
-    assert "compute_status" in guidance
+    # The two facts that stop the expensive mistakes: frames drive memory, steps do not.
+    assert "frames" in guidance and "steps" in guidance
+    assert "not memory" in guidance or "steps do not" in guidance
+    assert "compute_status" in guidance or "compute_result" in guidance
+    # The music job that can leave the card alone, so the model can choose it.
+    assert "device='cpu'" in guidance
+
+
+def test_the_prompt_schemas_show_what_a_detailed_prompt_looks_like() -> None:
+    """"Generate a song" and "What the video should show" produce nothing usable.
+
+    Both schemas used to say only what the prompt was *for*. MusicGen and LTX-Video
+    follow the words closely, so the detail in them is the quality: naming the
+    instruments, the lens and the light is what turns a prompt into a track or a
+    shot. The model reads the schema right before the call, which is where an
+    example of good usage has to be if it is going to be used.
+    """
+    schemas = {
+        schema["function"]["name"]: schema["function"]["parameters"]["properties"]["prompt"][
+            "description"
+        ]
+        for schema in create_compute_tools()
+        if "prompt" in schema["function"]["parameters"]["properties"]
+    }
+
+    music = schemas[MUSIC_TOOL_NAME].lower()
+    for instrument in ("rhodes", "bass", "drum"):
+        assert instrument in music, f"the music prompt should name instruments, not genres: {instrument}"
+
+    video = schemas[VIDEO_TOOL_NAME].lower()
+    for term in ("lens", "depth of field", "light"):
+        assert term in video, f"the video prompt should carry camera and light vocabulary: {term}"
 
 
 def test_no_compute_capability_when_it_is_disabled() -> None:
@@ -1086,7 +1115,7 @@ async def test_every_advertised_tool_is_implemented_by_the_mcp_server() -> None:
     spec.loader.exec_module(module)
 
     server = module.ComputeServer(str(root))
-    advertised = {schema["function"]["name"] for schema in server.tools()}
+    advertised = {schema["name"] for schema in server.tools()}
 
     # Every advertised tool must be dispatchable. A bad argument is fine and
     # expected; "Unknown tool" is not.
@@ -1127,6 +1156,129 @@ async def test_the_mcp_server_queues_and_collects() -> None:
             break
         await asyncio.sleep(0.01)
     assert "salida/q.wav" in await server.call(RESULT_TOOL_NAME, {"job_id": "job-1"})
+
+
+def _compute_mcp_module(name: str = "compute_mcp_settings"):
+    """Load the MCP compute server the way a client would: from its own file."""
+    import importlib.util
+
+    root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location(name, root / ".agents" / "mcp" / "compute" / "index.py")
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_mcp_server_reads_the_compute_settings_from_the_project_env(tmp_path: Path) -> None:
+    """A GPU server for other MCP clients must obey the same .env as the agent.
+
+    It was built as ``ComputeOrchestrator(root_directory=root)`` and nothing else,
+    so every compute setting fell back to its default. The one that cost a real
+    generation: with ``COMPUTE_UNLOAD_OLLAMA=on`` in the project .env and the
+    default ``off`` here, this server never moved a resident Ollama model, so a
+    music request the native tool renders in 25 s was refused here with "0 MiB
+    usable". Delegating to ``minagent.compute`` was supposed to mean one policy on
+    both surfaces; a default is not that policy.
+    """
+    module = _compute_mcp_module("compute_mcp_env")
+    project = tmp_path / "proyecto"
+    project.mkdir()
+    (project / ".env").write_text(
+        "COMPUTE_UNLOAD_OLLAMA=on\n"
+        "COMPUTE_VRAM_TOTAL_MIB=16384\n"
+        "COMPUTE_JOB_TIMEOUT_SECONDS=600\n"
+        "COMPUTE_QUEUE_LIMIT=3\n"
+    )
+    workspace = tmp_path / "otro-sitio"
+    workspace.mkdir()
+
+    server = module.ComputeServer(str(workspace), str(project))
+    orchestrator = server.orchestrator
+
+    assert orchestrator.ollama_mode == "auto", "on must reach the server, or it never frees the card"
+    assert orchestrator.vram_total_mib == 16384
+    assert orchestrator.job_timeout_seconds == 600
+    assert orchestrator.queue_limit == 3
+    # The backends live in the project, not in whatever directory the client
+    # that connected happens to be working in.
+    assert str(project) in orchestrator._script_roots
+
+
+def test_minagent_does_not_offer_the_mcp_copy_of_its_own_gpu_tools() -> None:
+    """One surface for the GPU tools, because a 9B picks the wrong one.
+
+    MinAgent publishes ``generate_music``, ``generate_video`` and the rest
+    natively, and the MCP ``compute`` server published the same seven tools
+    again. Asking for music, the model answered with the MCP copy of
+    ``generate_video`` and reported the resulting VRAM refusal as "music does
+    not work here". The native tool had generated the same track in 27 s. The
+    server stays in the repo for other MCP clients; what must not happen is
+    MinAgent offering a second, differently configured copy of its own tools.
+    """
+    import json
+
+    configured = json.loads(
+        (Path(__file__).resolve().parent.parent / ".minagent" / "mcp.json").read_text()
+    )
+    assert "compute" not in configured.get("mcpServers", {})
+    for server in configured.get("mcpServers", {}).values():
+        rendered = json.dumps(server)
+        assert ".agents/mcp/compute" not in rendered, "the GPU tools would be offered twice again"
+
+
+async def test_a_music_job_in_cpu_asks_the_card_for_nothing(tmp_path: Path) -> None:
+    """CPU means "do not touch the card", so it must not reserve any of it.
+
+    The estimate is what decides whether the orchestrator evicts a resident Ollama
+    model to make room. A CPU job reporting the usual 2200 MiB would evict the
+    user's warm model for memory it never uses - the opposite of what asking for
+    CPU is for, and the eviction is silent enough that it reads as "the agent
+    decided to".
+    """
+    from minagent.compute import music_vram_estimate
+
+    assert music_vram_estimate("small", "cpu") == 0
+    assert music_vram_estimate("small", "cuda") > 0
+
+    orchestrator = _orchestrator(tmp_path, ollama_mode="on")
+    orchestrator._vram_probe = lambda: VramReading(
+        total_mib=FULL_CARD, free_mib=900, used_by_others_mib=6800,
+        processes=("llama-server (6800 MiB)",),
+    )
+    seen: list[list[str]] = []
+
+    async def runner(script: Path, argv: list[str], timeout: int) -> str:
+        seen.append(argv)
+        return 'RESULT {"ok": true, "path": "salida/cpu.wav"}'
+
+    await orchestrator.generate_music("lo-fi", seconds=5, device="cpu", runner=runner)
+
+    assert "--device" in seen[0] and seen[0][seen[0].index("--device") + 1] == "cpu"
+
+
+async def test_a_cpu_music_job_runs_while_the_card_is_full(tmp_path: Path) -> None:
+    """The point of the mode: a busy card is not a reason to refuse a music job."""
+    orchestrator = _orchestrator(tmp_path, ollama_mode="off")
+    orchestrator._vram_probe = lambda: VramReading(
+        total_mib=FULL_CARD, free_mib=120, used_by_others_mib=7500,
+        processes=("llama-server (7500 MiB)",),
+    )
+
+    async def runner(script: Path, argv: list[str], timeout: int) -> str:
+        return 'RESULT {"ok": true, "path": "salida/cpu.wav"}'
+
+    record = await orchestrator.generate_music("lo-fi", seconds=5, device="cpu", runner=runner)
+    assert record.outcome == "done", record.detail
+
+
+def test_an_unknown_device_is_refused_with_the_choices(tmp_path: Path) -> None:
+    orchestrator = _orchestrator(tmp_path)
+    with pytest.raises(AgentError) as failure:
+        asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+            orchestrator.generate_music("lo-fi", device="tpu")
+        )
+    assert "cuda" in str(failure.value) and "cpu" in str(failure.value)
 
 
 def test_the_video_backend_rejects_incompatible_transformers() -> None:

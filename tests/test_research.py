@@ -251,5 +251,72 @@ def test_a_refusal_says_which_pattern_fired() -> None:
     assert "ignore" in reason.lower()
 
 
+# ------------------------------------------------- the session that runs it
+
+
+class _FakeOutput:
+    def write(self, value: str) -> None:
+        return None
+
+    def isatty(self) -> bool:
+        return False
+
+
+async def test_the_session_wires_the_worker_it_has(tmp_path) -> None:
+    """The wiring is where this used to break, and nothing else covered it.
+
+    Both halves of this path were wrong in ways no type checker complained
+    about until it was asked a second question: the queue path concatenated a
+    string instead of joining a path, and the worker was constructed with a
+    keyword it does not have. Every test above builds the worker itself, so the
+    whole research cycle could be dead while the suite stayed green.
+    """
+    from minagent.app import MinAgent  # noqa: PLC0415 - keeps the import local to the one test that needs it
+
+    app = MinAgent(stdout=_FakeOutput())
+    app.application_root = str(tmp_path)
+    app.root_directory = str(tmp_path)
+    app.improvement_enabled = False
+    app.web_search_client = _FakeClient({"https://docs.example/spec": CLEAN})
+    queue = tmp_path / "agente" / "PREGUNTAS.md"
+    queue.parent.mkdir(parents=True, exist_ok=True)
+    queue.write_text("- [ ] What is the real default context length?\n  why: it was guessed\n", encoding="utf-8")
+
+    async def extract(question, spans):
+        return CLEAN
+
+    async def consistency(lesson, known_lessons):
+        return _ok()
+
+    app._research_extract = extract
+    app._research_consistency = consistency
+
+    line = await app._research_one_question()
+
+    assert line.startswith("research:"), "a pass with nothing to say says so instead of failing"
+    assert app.web_search_client.searched == ["What is the real default context length?"]
+    assert "- [x]" in queue.read_text(encoding="utf-8"), "a question that was tried is ticked"
+
+
+async def test_a_pass_with_no_queue_costs_nothing(tmp_path) -> None:
+    from minagent.app import MinAgent  # noqa: PLC0415
+
+    app = MinAgent(stdout=_FakeOutput())
+    app.application_root = str(tmp_path)
+    app.root_directory = str(tmp_path)
+    app.web_search_client = _FakeClient({})
+    assert await app._research_one_question() == ""
+
+
+async def test_a_pass_without_a_web_client_says_why(tmp_path) -> None:
+    from minagent.app import MinAgent  # noqa: PLC0415
+
+    app = MinAgent(stdout=_FakeOutput())
+    app.application_root = str(tmp_path)
+    app.root_directory = str(tmp_path)
+    app.web_search_client = None
+    assert await app._research_one_question() == "research: no web client configured"
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))

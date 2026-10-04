@@ -23,6 +23,8 @@ from .compute import (
 )
 from .context_budget import ContextPolicy
 from .errors import AgentError, find_application_root
+from .flows import DEFAULT_BATCH_STEPS as DEFAULT_FLOW_BATCH_STEPS
+from .flows import MAX_FLOW_STEPS
 
 DEFAULT_CONTEXT_WINDOW = 262144
 DEFAULT_MAX_TOOL_ROUNDS = 64
@@ -297,6 +299,13 @@ class Config:
     mcp_enabled: bool
     mcp_approval_mode: str
     memory_enabled: bool
+    # Long work the agent plans for itself. On by default, and unlike the four
+    # capabilities that reach outside the workspace it is not gated on reaching
+    # anything: a flow only calls tools the session already offers, each one
+    # still under its own approval rule. What it adds is a plan that survives
+    # the turn that wrote it.
+    flows_enabled: bool
+    flow_batch_steps: int
     memory_db_path: str
     memory_direct_answer: bool
     memory_eureka: bool
@@ -356,6 +365,22 @@ class Config:
     compute_voice_timeout_seconds: int
     compute_unload_ollama: str
     compute_queue_limit: int
+
+
+def resolve_against_root(value: str, root: str) -> str:
+    """Read a configured path as the project would, not as the shell happens to be.
+
+    MinAgent is started from the workspace it is allowed to edit, so the working
+    directory is somebody else's project and is not where the agent's own state
+    lives. A relative ``MEMORY_DB_PATH`` resolved against it opens a *new*,
+    empty database in that workspace: the session starts with no memory, writes
+    everything it learns into a throwaway file, and the store the owner can see
+    never grows. The setting is documented as a path in the project directory,
+    so that is the directory it is resolved against.
+    """
+    if not value or os.path.isabs(value):
+        return value
+    return os.path.join(root, value)
 
 
 def load_configuration(
@@ -461,8 +486,20 @@ def load_configuration(
             environment.get("MCP_APPROVAL_MODE"), "MCP_APPROVAL_MODE", "ask"
         ),
         memory_enabled=parse_boolean_setting(environment.get("MEMORY_ENABLED"), "MEMORY_ENABLED", False),
-        memory_db_path=(environment.get("MEMORY_DB_PATH") or "").strip()
-        or os.path.join(root, ".agents", "memory", "memoria.db"),
+        flows_enabled=parse_boolean_setting(environment.get("FLOWS_ENABLED"), "FLOWS_ENABLED", True),
+        flow_batch_steps=min(
+            parse_positive_integer(
+                environment.get("FLOW_BATCH_STEPS"), "FLOW_BATCH_STEPS", DEFAULT_FLOW_BATCH_STEPS
+            ),
+            # A batch longer than a whole plan would only ever be read as "the
+            # runner stops when it wants to", which is what the decide flag and
+            # the failures already say out loud.
+            MAX_FLOW_STEPS,
+        ),
+        memory_db_path=resolve_against_root(
+            (environment.get("MEMORY_DB_PATH") or "").strip() or os.path.join(".agents", "memory", "memoria.db"),
+            root,
+        ),
         memory_eureka=parse_boolean_setting(environment.get("MEMORY_EUREKA"), "MEMORY_EUREKA", True),
         improvement_enabled=parse_boolean_setting(
             environment.get("IMPROVEMENT_ENABLED"), "IMPROVEMENT_ENABLED", True
