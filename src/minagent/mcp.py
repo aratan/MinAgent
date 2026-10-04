@@ -566,8 +566,9 @@ async def connect_mcp_servers(
                     f"only the first {MAX_MCP_TOOLS} were considered."
                 )
             clients.append(client)
-            if client.instructions or _local_instructions(server_config):
-                guidance = _join_instructions(_local_instructions(server_config), client.instructions)
+            local_instructions = _local_instructions(server_config)
+            if client.instructions or local_instructions:
+                guidance = _join_instructions(local_instructions, client.instructions)
                 server_guidance.append({"server_name": server_name, "instructions": guidance})
 
             # A server that answers tools/list in another dialect is worth one
