@@ -25,6 +25,7 @@ from minagent.curiosity import (
     already_asked,
     append_questions,
     build_prompt,
+    has_material,
     needs_curation,
     open_question_count,
     parse_questions,
@@ -187,9 +188,16 @@ def _app(tmp_path: Path) -> MinAgent:
     return app
 
 
+def _with_user_model(tmp_path: Path) -> MinAgent:
+    """An agent that knows something about its person, which is the point."""
+    (tmp_path / "agente").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "agente" / "USER.md").write_text("- Works on intelligence data.\n", encoding="utf-8")
+    return _app(tmp_path)
+
+
 async def test_a_pass_curates_the_queue_before_it_spends_one_on_answers(tmp_path: Path) -> None:
     """The whole design in one test: propose first, answer second."""
-    app = _app(tmp_path)
+    app = _with_user_model(tmp_path)
     app.web_search_client = object()
     app._ask_with_reflection_model = _replying(GOOD_ANSWER)
     answered: list[str] = []
@@ -208,7 +216,7 @@ async def test_a_pass_curates_the_queue_before_it_spends_one_on_answers(tmp_path
 
 
 async def test_a_full_queue_is_left_alone_and_no_request_is_made(tmp_path: Path) -> None:
-    app = _app(tmp_path)
+    app = _with_user_model(tmp_path)
     app.web_search_client = object()
     calls: list[str] = []
 
@@ -234,7 +242,7 @@ async def test_a_full_queue_is_left_alone_and_no_request_is_made(tmp_path: Path)
 
 
 async def test_an_unparsable_reply_spends_the_call_and_writes_nothing(tmp_path: Path) -> None:
-    app = _app(tmp_path)
+    app = _with_user_model(tmp_path)
     app.web_search_client = object()
     app._ask_with_reflection_model = _replying("I would rather not.")
     app._research_one_question = _silent
@@ -349,3 +357,78 @@ async def _silent() -> str:
 
 async def _no_sleep(_seconds: float) -> None:
     return None
+
+
+def test_no_hat_question_keeps_its_placeholder() -> None:
+    """A `{subject}` left in the prompt is a word the model copies out.
+
+    Seen by running the real pass: the queue filled with questions about a
+    literal brace, which reads as work and answers nothing.
+    """
+    prompt = build_prompt(
+        subject="the compaction thresholds",
+        user_model="",
+        lessons="",
+        already_asked="",
+    )
+
+    assert "{subject}" not in prompt
+    assert prompt.count("the compaction thresholds") >= 6
+
+
+def test_with_no_subject_the_prompt_names_how_to_choose_one() -> None:
+    prompt = build_prompt(subject="", user_model="", lessons="", already_asked="")
+
+    assert "{subject}" not in prompt
+    assert "named by you in one phrase" in prompt
+
+
+def test_a_question_that_still_carries_a_placeholder_is_rejected() -> None:
+    """The other half: catch it if the model ignores the instruction."""
+    reply = json.dumps(
+        [{"hat": "black", "question": "What would break {subject}?", "why": "It is the risk."}]
+    )
+
+    assert parse_questions(reply) == []
+
+
+def test_nothing_to_be_curious_about_is_recognised() -> None:
+    """The invented-interest failure, caught before it costs a request."""
+    assert has_material("", "", "") is False
+    assert has_material("  ", "", "") is False
+    assert has_material("x", "", "") is True
+    assert has_material("", "y", "") is True
+    assert has_material("", "", "z") is True
+
+
+async def test_nothing_is_proposed_when_there_is_nothing_to_be_curious_about(tmp_path: Path) -> None:
+    """No request, no user model, no lessons: no questions.
+
+    The failure this prevents was seen by running the pass for real - with an
+    empty subject the hats produced three confident questions about
+    zero-knowledge identity systems, which is not curiosity, it is invention
+    with a citation attached.
+    """
+    app = _app(tmp_path)
+    app.web_search_client = object()
+    calls: list[str] = []
+
+    async def ask(prompt: list[dict[str, str]]) -> str:
+        calls.append("asked")
+        return GOOD_ANSWER
+
+    app._ask_with_reflection_model = ask
+    app._research_one_question = _silent
+
+    assert await app.run_research_pass() == ""
+    assert calls == []
+    assert not _queue(tmp_path).exists()
+
+
+async def test_a_user_model_alone_is_enough_material(tmp_path: Path) -> None:
+    app = _with_user_model(tmp_path)
+    app.web_search_client = object()
+    app._ask_with_reflection_model = _replying(GOOD_ANSWER)
+    app._research_one_question = _silent
+
+    assert "curated 2 question(s)" in await app.run_research_pass()

@@ -17,6 +17,10 @@
 # Checkpointed long plans: they name this machine's paths and the state of a run.
 .minagent/flows.json
 
+# Which resident loop holds this project. It is a pid, so it is never the same
+# twice and never belongs in a repository.
+.minagent/resident.lock
+
 # Python / uv
 .venv/
 # The generation backends run on their own Python 3.12: Kokoro's misaki

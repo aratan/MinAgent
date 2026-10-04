@@ -393,6 +393,28 @@ Two deliberate deviations, both about money:
 - **The six hats are one request, not six.** Six requests per cycle is six requests nobody is around to audit. That is a reading of the method chosen for a budget, and it is why a hat that comes back empty is simply not asked about.
 - **A cycle funds at most three passes.** Two or three happen when the budget affords them and the queue has that many; the stop is always the budget. A queue holding two or more questions is left alone, because questions you wrote down outrank anything the agent would add.
 
+### Running it without a terminal
+
+The loop lives inside `minagent`, so closing the terminal closes it. `minagent resident` is the same loop with no editor, and it is meant to be a service:
+
+```ini
+# ~/.config/systemd/user/minagent-resident.service
+[Service]
+WorkingDirectory=/path/to/MinAgent
+ExecStart=/path/to/MinAgent/.venv/bin/python -m minagent resident
+Environment=PATH=/home/you/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=60
+[Install]
+WantedBy=default.target
+```
+
+`WorkingDirectory` is not decoration: the workspace root is the working directory, so the wrong one has the agent writing `agente/PREGUNTAS.md` and `salida/` into wherever systemd happened to start it. `Linger=yes` on your account (`loginctl enable-linger`) is what keeps it running when you are not logged in.
+
+**Only one loop runs per project.** The interactive session and the service read the same `.env`, so they would both work, each inside its own budget and neither knowing about the other. A lock in `.minagent/resident.lock` holds for the whole run: the second one says `another improvement loop already holds resident.lock` and exits 1 rather than starting a loop that never cycles. The file holds the pid of whoever has it.
+
+Two things the loop needs that the session already had and the service did not: the memory store opened, so the consistency critic has something to compare a new claim against, and a refusal reported instead of a silent hang. Both were found by running the real pass rather than by reading it.
+
 ### Validating the change
 
 The first version of this applied a change and never found out whether it was right, which is not a loop - it is a sequence of unverified edits and a growing pile of settings nobody chose. A change is now put on probation instead: the value moves, a baseline is taken, and at the end of a window of real turns it is judged and either kept or **reverted on its own**, with the verdict said out loud and `.env` left in the state the verdict implies.

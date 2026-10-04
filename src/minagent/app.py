@@ -2111,13 +2111,18 @@ class MinAgent:
             return ""
         if self.web_search_client is None:
             return ""
+        # Nothing to be curious *about*. Seen by running this for real: with no
+        # request in progress and no lessons loaded, the hats were handed an
+        # empty subject and confidently proposed questions about zero-knowledge
+        # identity systems, which is the one thing this pass must never do.
+        prompt = await self._curation_prompt(queued)
+        if prompt is None:
+            return ""
         reserved = self._reserve_resident_call()
         if not reserved:
             return ""
         try:
-            reply = await self._ask_with_reflection_model(
-                [{"role": "user", "content": await self._curation_prompt(queued)}]
-            )
+            reply = await self._ask_with_reflection_model([{"role": "user", "content": prompt}])
         except (AgentError, OSError, ValueError):
             return ""
         finally:
@@ -2131,8 +2136,13 @@ class MinAgent:
             return ""
         return f"curated {added} question(s) from the hats: {curiosity.describe(questions[:added])}"
 
-    async def _curation_prompt(self, queued: str) -> str:
-        """The one request that proposes what to ask about while nobody watches."""
+    async def _curation_prompt(self, queued: str) -> str | None:
+        """The one request that proposes what to ask about, or None for none.
+
+        ``None`` rather than a prompt nobody should answer: without a subject, a
+        user model or a single lesson, there is nothing here to be curious about,
+        and the hats would fill the gap with something plausible.
+        """
         store = self.memory_store
         known: list[Lesson] = []
         if store is not None:
@@ -2140,23 +2150,36 @@ class MinAgent:
         lessons = "\n".join(f"- {lesson.title}: {lesson.guideline}" for lesson in known)
         user_model = load_persona_file(
             os.path.join(self.application_root, "agente", "USER.md"), limit=2000
-        )
+        ) or ""
+        subject = await self._curation_subject(known)
+        if not curiosity.has_material(subject, user_model, lessons):
+            return None
         return curiosity.build_prompt(
-            subject=self._curation_subject(),
-            user_model=user_model or "",
+            subject=subject,
+            user_model=user_model,
             lessons=lessons,
             already_asked=curiosity.already_asked(queued),
         )
 
-    def _curation_subject(self) -> str:
-        """What the last turn was actually about, as the hats' starting point.
+    async def _curation_subject(self, lessons: Sequence[Lesson]) -> str:
+        """What the pass is about, as the hats' starting point.
 
         Deliberately short and factual: the subject is a seed, not a direction.
         The hats widen it, and a subject that arrived with a conclusion attached
         would hand the whole exercise its answer before it started.
+
+        A request in progress is the best seed there is, and the service has
+        none: a headless cycle runs with nothing typed, so without a fallback
+        the hats are handed an empty subject and answer with questions about
+        "the agent system referenced in this prompt" - true of everything, useful
+        about nothing. The lessons are the honest substitute, because they are
+        what the agent actually spent its last attention on.
         """
         request = (self._current_user_request or "").strip()
-        return request[:200]
+        if request:
+            return request[:200]
+        titles = ", ".join(lesson.title for lesson in lessons[:5])
+        return f"the recent work: {titles}"[:200] if titles else ""
 
     async def _recent_lessons(self, store: MemoryStore) -> list[Lesson]:
         """Recent lessons for the prompt, bounded, and never worth a failed cycle.
@@ -2216,10 +2239,18 @@ class MinAgent:
         question, why = queued[0]
         asked = ResearchQuestion(question=question, why=why)
 
+        # What is already believed, which is the only thing the consistency
+        # critic has to compare against. Without it the critic answers "there is
+        # no prior information that contradicts this" about everything, and a
+        # check that can only say yes is not a check.
+        known: list[Lesson] = []
+        if self.memory_store is not None:
+            known = await self._known_lessons(self.memory_store)
         worker = ResearchWorker(
             client=self.web_search_client,
             extract=self._research_extract,
             consistency=self._research_consistency,
+            known=known,
         )
         outcome = await worker.investigate(asked)
 

@@ -7,6 +7,7 @@ a model.
 
 import asyncio
 import json
+import os
 
 from minagent.idle import BUSY, IDLE, IdleState
 from minagent.memory import MemoryStore
@@ -17,6 +18,8 @@ from minagent.resident import (
     STOPPED,
     Budget,
     ResidentWorker,
+    _claim_exclusive,
+    _release,
     build_worker,
 )
 from tests.test_memory import _memory_app
@@ -756,3 +759,92 @@ def test_the_builder_notices_a_turn_in_flight():
 
     assert build_worker(Busy(), FakeConfig()).in_flight() is True
     assert build_worker(FakeAgent(), FakeConfig()).in_flight() is False
+
+
+# --- One loop per project, across processes ---------------------------------
+
+
+def test_a_lock_is_taken_by_one_process_and_refused_by_the_next(tmp_path):
+    """Two loops would each stay inside their own budget and spend twice."""
+    lock = str(tmp_path / ".minagent" / "resident.lock")
+
+    held, reason, handle = _claim_exclusive(lock)
+    try:
+        assert held and reason == ""
+        again, why, second_handle = _claim_exclusive(lock)
+        assert again is False
+        assert "resident.lock" in why
+        assert second_handle is None
+    finally:
+        _release(handle)
+
+
+def test_the_lock_file_names_the_pid_that_holds_it(tmp_path):
+    """An operator reading the file has to know whose loop this is."""
+    lock = tmp_path / "resident.lock"
+    held, _, handle = _claim_exclusive(str(lock))
+    try:
+        assert held
+        assert str(os.getpid()) in lock.read_text(encoding="utf-8")
+    finally:
+        _release(handle)
+
+
+def test_a_released_lock_can_be_taken_again(tmp_path):
+    lock = str(tmp_path / "resident.lock")
+    held, _, handle = _claim_exclusive(lock)
+    assert held
+    _release(handle)
+    assert _claim_exclusive(lock)[0] is True
+
+
+async def test_a_run_holds_the_lock_while_it_works_and_lets_it_go_after(tmp_path):
+    lock = str(tmp_path / "resident.lock")
+    built, _, clock = worker(lock_path=lock, cycle_seconds=900.0)
+    states = []
+
+    original = built._run_locked
+
+    async def watched():
+        states.append(("during", _claim_exclusive(lock)[0]))
+        return await original()
+
+    built._run_locked = watched
+    await drive(built, clock, 1)
+
+    assert states == [("during", False)], "the run itself should hold the lock"
+    assert _claim_exclusive(lock)[0] is True
+
+
+async def test_a_second_worker_does_nothing_at_all_while_one_is_running(tmp_path):
+    """Not a slower loop: no cycle, no reflection, no call."""
+    lock = str(tmp_path / "resident.lock")
+    held, _, handle = _claim_exclusive(lock)
+    try:
+        built, journal, clock = worker(lock_path=lock, cycle_seconds=0.01)
+        outcome = await asyncio.wait_for(built.run(), timeout=5)
+        assert outcome == DISABLED
+        assert "already holds" in built.detail
+        assert journal == []
+        assert clock.waits == []
+    finally:
+        _release(handle)
+
+
+async def test_no_lock_path_means_no_lock_and_no_complaint():
+    """A test or a one-shot run is not a second agent; it should just run."""
+    built, journal, clock = worker(cycle_seconds=0.01)
+    await drive(built, clock, 2)
+    # One wake is enough: the point is that it ran at all, without a lock to hold.
+    assert journal == ["worked"]
+    assert built.outcome != DISABLED
+
+
+async def test_a_lock_file_that_cannot_be_created_runs_unlocked_and_says_so(tmp_path):
+    """A read-only checkout must not silence the loop; two loops are the real risk."""
+    blocked = tmp_path / "blocked"
+    blocked.write_text("not a directory", encoding="utf-8")
+    built, journal, clock = worker(lock_path=str(blocked / "resident.lock"), cycle_seconds=0.01)
+    await drive(built, clock, 2)
+    assert journal == ["worked"]
+    assert built.outcome != DISABLED

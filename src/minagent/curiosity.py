@@ -93,10 +93,13 @@ ANSWER_SHAPE = (
     '"why": one sentence on what answering it would change}\n'
     f"At most {MAX_CURATED_QUESTIONS} elements. Write a question only where you have a reason to "
     "want it answered; an empty hat is a better answer than a vague question. Every question must "
-    "be answerable by looking things up, and must stand on its own without this conversation."
+    "be answerable by looking things up, must name the specific thing it is about rather than "
+    '"the system" or "the approach", and must stand on its own without this conversation. '
+    "Never leave a template placeholder - a word in curly braces - in a question."
 )
 
 _JSON_ARRAY = re.compile(r"\[.*\]", re.DOTALL)
+_PLACEHOLDER = re.compile(r"\{[a-z_]+\}")
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 # The queue's own markers, imported by text rather than by import so this module
@@ -113,11 +116,18 @@ def build_prompt(*, subject: str, user_model: str, lessons: str, already_asked: 
     here asks the model to invent an interest - an invented interest is the
     failure this whole module exists to prevent.
     """
-    hats = "\n".join(f"- {name}: {discipline} Ask: {template}" for name, discipline, template in HATS)
+    # The subject is filled into every hat, never shown as a placeholder: a
+    # `{subject}` left in the text is a word the model copies into its answer,
+    # and a queue full of questions about a literal brace is worse than no
+    # queue at all, because it looks like work.
+    topic = subject.strip() or "whatever the material below points at, named by you in one phrase"
+    hats = "\n".join(
+        f"- {name}: {discipline} Ask: {template.format(subject=topic)}" for name, discipline, template in HATS
+    )
     sections = [
         "Propose research questions for later. You are not answering them now.",
         "",
-        f"Subject: {subject or '(whatever the recent work suggests)'}",
+        f"Subject: {topic}",
         "",
         "Six hats, one discipline each:",
         hats,
@@ -163,6 +173,10 @@ def parse_questions(text: str) -> list[tuple[str, str, str]]:
         why = _clean(str(item.get("why", "")))
         if hat not in known or not question or not why:
             continue
+        if _PLACEHOLDER.search(question) or _PLACEHOLDER.search(why):
+            # A question the model filled in by copying the template is not a
+            # question, and answering it would spend a lookup to learn nothing.
+            continue
         key = question.lower()
         if key in seen:
             continue
@@ -180,6 +194,18 @@ def _clean(value: str) -> str:
     if len(text) > MAX_QUESTION_CHARS:
         text = text[: MAX_QUESTION_CHARS - 1].rstrip() + "…"
     return text
+
+
+def has_material(subject: str, user_model: str, lessons: str) -> bool:
+    """Whether there is anything real to be curious about.
+
+    The hats are good at questions and better at making them sound reasonable,
+    which is the problem: given nothing, they produce a confident set about a
+    subject nobody has. Seen by running this for real - the queue filled with
+    questions about zero-knowledge identity systems. So the question is asked of
+    the material rather than answered by it.
+    """
+    return bool(subject.strip() or user_model.strip() or lessons.strip())
 
 
 def open_question_count(text: str) -> int:

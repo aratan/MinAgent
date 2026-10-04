@@ -21,11 +21,57 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
+import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 from .idle import IdleReader, IdleState, should_run
+
+LOCK_FILENAME = "resident.lock"
+
+
+def _claim_exclusive(path: str) -> tuple[bool, str, Any]:
+    """Take an exclusive lock for this process, or say who is holding it.
+
+    Returns ``(held, reason, handle)``. An empty path means no lock was asked
+    for, which is the test path and not a failure. A lock file that cannot be
+    created is also not treated as a refusal: refusing there would turn a
+    read-only checkout into a machine that quietly never learns again, and the
+    thing worth stopping is two loops, not one.
+    """
+    if not path:
+        return True, "", None
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        handle = open(path, "a+", encoding="utf-8")  # noqa: SIM115 - held for the run
+    except OSError as error:
+        return True, f"lock unavailable, running unlocked: {error}", None
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return False, f"another improvement loop already holds {os.path.basename(path)}", None
+    try:
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"{os.getpid()}\n")
+        handle.flush()
+    except OSError:
+        # The lock is taken; failing to note the pid in it is not a reason to
+        # give it up and let a second loop in.
+        pass
+    return True, "", handle
+
+
+def _release(handle: Any) -> None:
+    if handle is None:
+        return
+    with contextlib.suppress(OSError):
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    with contextlib.suppress(OSError):
+        handle.close()
 
 #: The fewest calls that make a cycle worth starting: one for the reflection and
 #: one for the reviewer of the single hypothesis it produced.
@@ -253,6 +299,10 @@ class ResidentWorker:
     #: to supply a research callable it will never use.
     research: Callable[[], Awaitable[str]] | None = None
     enabled: bool = True
+    #: Where the cross-process lock lives. Empty means no lock, which is what a
+    #: test or a one-shot run wants; a live loop on a real project must set it.
+    lock_path: str = ""
+    _lock_handle: Any = None
     cycle_seconds: float = 900.0
     budget: Budget = field(default_factory=Budget)
     idle_reader: IdleReader | None = None
@@ -324,6 +374,25 @@ class ResidentWorker:
             self.outcome, self.detail = DISABLED, "autonomous improvement is switched off"
             return self.outcome
 
+        # One loop per project, across processes. The budget caps a single run
+        # very well and says nothing about a second one: an interactive session
+        # and a resident service both read the same .env, and two loops would
+        # spend roughly twice for half the attention. The lock is what makes the
+        # cap mean what it says, and it is held for the whole run rather than
+        # re-taken per cycle, so two of them cannot interleave either.
+        held, reason, handle = _claim_exclusive(self.lock_path)
+        if not held:
+            self.outcome, self.detail = DISABLED, reason
+            return self.outcome
+        self._lock_handle = handle
+        try:
+            return await self._run_locked()
+        finally:
+            _release(self._lock_handle)
+            self._lock_handle = None
+
+    async def _run_locked(self) -> str:
+        """The loop itself, with the cross-process lock already held."""
         while not self.stopped:
             if not self.budget.can_start_cycle():
                 self.outcome, self.detail = EXHAUSTED, _exhausted_detail(self.budget)
@@ -449,6 +518,7 @@ def build_worker(
     ``MinAgent`` is, and so a future non-interactive entrypoint can build the
     same worker from a different host without this module importing a terminal.
     """
+    application_root = str(getattr(agent, "application_root", "") or "")
     return ResidentWorker(
         reflect=lambda: agent.reflect_on_session("idle"),
         # The research hook, wired. It was left optional so a host that only
@@ -456,6 +526,12 @@ def build_worker(
         # use; this is that host, and the call it has been waiting for.
         research=lambda: agent.run_research_pass(),
         enabled=bool(getattr(config, "improvement_autonomous", False)),
+        # One loop per project. An interactive session and a resident service
+        # read the same configuration and would otherwise both work, each
+        # inside its own budget and neither knowing about the other. A host
+        # that names no project gets no lock rather than a lock on whatever
+        # directory it happened to be started in.
+        lock_path=os.path.join(application_root, ".minagent", LOCK_FILENAME) if application_root else "",
         cycle_seconds=float(getattr(config, "improvement_cycle_seconds", 900.0) or 900.0),
         budget=_budget_from(config),
         idle_reader=idle_reader or IdleReader(

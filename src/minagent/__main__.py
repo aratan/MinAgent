@@ -14,9 +14,14 @@ import asyncio
 import contextlib
 import signal
 import sys
+from typing import TYPE_CHECKING
 
 from .app import AgentError
 from .app import main as _run
+from .resident import DISABLED
+
+if TYPE_CHECKING:
+    from .app import MinAgent
 
 USAGE = """usage: minagent [resident]
 
@@ -35,6 +40,12 @@ async def _run_resident() -> int:
 
     agent = MinAgent()
     await agent.initialize_configuration()
+    # The optional features too, and not as an afterthought: the memory store is
+    # opened there, and without it the research pass has nothing to check a new
+    # claim against. A gate asked "does this contradict what we believe?" with
+    # nothing believed answers itself, and answers it "no".
+    for warning in await agent.initialize_optional_features():
+        print(warning, file=sys.stderr)
 
     worker = agent._start_resident_worker()  # noqa: SLF001 - the same door the session uses
     if worker is None or not worker.enabled:
@@ -62,11 +73,47 @@ async def _run_resident() -> int:
 
     print("Improvement loop running. Stop with SIGTERM or Ctrl-C.", file=sys.stderr, flush=True)
     try:
-        await stop.wait()
+        # Waiting on the loop as well as on the signal, because the loop can
+        # end on its own - out of budget, or because another one already holds
+        # the lock - and a process that waits only for a signal then reports
+        # "running" for a loop that stopped running at the start.
+        task = agent._resident_task
+        if task is None:
+            await stop.wait()
+        else:
+            # asyncio.wait takes futures, not coroutines: the wait for the
+            # signal has to be a task of its own or this waits for nothing.
+            stop_task = asyncio.ensure_future(stop.wait())
+            done, _ = await asyncio.wait({task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+            stop_task.cancel()
+            if task in done and not task.cancelled():
+                return await _report_finished_loop(agent, task)
     finally:
         # Not an `except`: the loop must also be shut down when the wait is
         # cancelled, because a cycle holding provider calls is still spending.
         await agent._stop_resident_worker()  # noqa: SLF001
+    return 0
+
+
+async def _report_finished_loop(agent: MinAgent, task: asyncio.Future[str]) -> int:
+    """Say why the loop ended on its own, and whether that is a failure.
+
+    A refusal is the one worth shouting about: it means another loop holds the
+    lock, this process did nothing, and systemd would otherwise sit there
+    reporting a healthy service that is not the one doing the work.
+    """
+    error = task.exception()
+    if error is not None:
+        print(f"The improvement loop failed: {type(error).__name__}: {error}", file=sys.stderr)
+        return 1
+    worker = agent.resident_worker
+    outcome = getattr(worker, "outcome", "") or ""
+    detail = getattr(worker, "detail", "") or ""
+    if outcome == DISABLED:
+        print(f"The improvement loop did not start: {detail}", file=sys.stderr)
+        return 1
+    if detail:
+        print(f"The improvement loop finished ({outcome}): {detail}", file=sys.stderr, flush=True)
     return 0
 
 
