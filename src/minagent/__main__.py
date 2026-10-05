@@ -67,6 +67,16 @@ async def _run_resident() -> int:
     # a single cycle ran, let alone why one did not.
     worker.report = lambda message: print(message, file=sys.stderr, flush=True)
 
+    # A copy before the first cycle, not after: the store is the one thing here
+    # that cannot be rebuilt from the workspace, and the loop is about to start
+    # writing hypotheses into it unattended. An empty store is skipped, because
+    # there is nothing to lose yet.
+    store = agent.memory_store
+    if store is not None:
+        taken = store.snapshot()
+        if taken:
+            print(f"Memory snapshot: {taken}", file=sys.stderr, flush=True)
+
     # systemd stops a service with SIGTERM, not SIGINT. Without this the loop
     # is killed mid-cycle and the shutdown handler that closes the trial
     # document never runs, leaving a half-written file for the next start.

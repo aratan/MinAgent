@@ -18,6 +18,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 from minagent.resident import _claim_exclusive, _release
@@ -166,6 +167,36 @@ def test_an_unknown_mode_never_reaches_the_session(monkeypatch):
 
     assert asyncio.run(entry._run_mode()) == 2
     assert not called.is_set()
+
+
+def test_the_service_takes_a_memory_snapshot_before_its_first_cycle(tmp_path):
+    """The store cannot be rebuilt from the workspace, so it is copied first.
+
+    A copy taken after the first cycle is a copy of whatever that cycle did.
+    The loop is about to write hypotheses unattended, and the failure this
+    guards is a write that empties the table in one statement.
+    """
+    project = _isolated_project(tmp_path, MEMORY_ENABLED="on")
+    process = subprocess.Popen(
+        [sys.executable, "-m", "minagent", "resident"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=project,
+        env={**os.environ, "PYTHONPATH": str(ROOT), "MINAGENT_ROOT": project},
+    )
+    try:
+        deadline = time.monotonic() + 90
+        snapshots: list[Path] = []
+        while time.monotonic() < deadline and not snapshots:
+            snapshots = list(Path(project).glob(".agents/memory/snapshots/memoria-*.db"))
+            if not snapshots:
+                time.sleep(1)
+    finally:
+        process.terminate()
+        process.wait(timeout=60)
+
+    assert snapshots, "no se tomo ninguna instantania de la memoria"
 
 
 def test_a_second_resident_says_why_it_did_not_start_and_exits(tmp_path):
