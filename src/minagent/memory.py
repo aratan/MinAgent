@@ -13,6 +13,7 @@ the event loop is never blocked and no connection crosses threads.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import re
 import sqlite3
@@ -27,6 +28,11 @@ from .reflection import ReviewAction
 
 MAX_TITLE_CHARS = 160
 MAX_CONTENT_CHARS = 8000
+
+#: Snapshots live beside the store and are pruned, so a knowledge base that
+#: cannot be restored is not made into a disk-space problem instead.
+SNAPSHOT_PREFIX = "memoria-"
+SNAPSHOT_KEEP = 5
 MAX_SOURCE_CHARS = 200
 MAX_TAGS = 12
 MAX_TAG_CHARS = 40
@@ -778,6 +784,53 @@ class MemoryStore:
         with self._connect() as connection:
             cursor = connection.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
             return cursor.rowcount > 0
+
+    # ---------------------------------------------------------- snapshots
+
+    def snapshot(self, directory: str | None = None, keep: int = SNAPSHOT_KEEP) -> str:
+        """Copy the store to a dated file, keeping the last ``keep`` of them.
+
+        A knowledge base nobody can restore is a log, and the failure this
+        guards against is not hypothetical: a mistake at the SQL level, where
+        the copy is written in the wrong direction, empties 475 KB of learned
+        context in one statement and there is nothing to go back to.
+
+        The copy goes through SQLite's own backup API rather than ``cp``, so a
+        write in flight cannot be captured half-applied, and the direction is
+        the one that reads backwards easily enough to be worth naming:
+        ``source.backup(target)`` - the method belongs to the database being
+        copied, not to the file being written.
+        """
+        target_directory = directory or os.path.join(os.path.dirname(self.path), "snapshots")
+        try:
+            os.makedirs(target_directory, exist_ok=True)
+        except OSError:
+            return ""
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        destination = os.path.join(target_directory, f"{SNAPSHOT_PREFIX}{stamp}.db")
+        try:
+            with self._connect() as source:
+                target = sqlite3.connect(destination)
+                try:
+                    source.backup(target)
+                finally:
+                    target.close()
+        except (sqlite3.Error, OSError):
+            return ""
+        self._prune_snapshots(target_directory, keep)
+        return destination
+
+    def _prune_snapshots(self, directory: str, keep: int) -> None:
+        """Keep the newest ``keep`` snapshots; an unbounded pile is a slow leak."""
+        try:
+            names = sorted(
+                name for name in os.listdir(directory) if name.startswith(SNAPSHOT_PREFIX)
+            )
+        except OSError:
+            return
+        for name in names[:-keep] if keep > 0 else names:
+            with contextlib.suppress(OSError):
+                os.remove(os.path.join(directory, name))
 
     # -------------------------------------------------------------- reads
 

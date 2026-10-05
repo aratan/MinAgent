@@ -80,3 +80,6 @@ Thumbs.db
 # Whoever writes these writes them on every run; untracked state that is not
 # ignored makes `git status` look clean when nothing is actually clean.
 .min_agent/
+
+# Instantaneas del almacen de memoria: copias de seguridad, no conocimiento versionado.
+.agents/memory/snapshots/

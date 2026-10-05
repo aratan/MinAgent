@@ -345,7 +345,7 @@ funcionaba.
 MinAgent publica `generate_music`, `generate_video` y compañía **nativamente**, y
 el servidor MCP `compute` publicaba **las mismas siete** otra vez. Pedí «pon
 música lo-fi» y el modelo respondió con **`mcp_0_2_compute_generate_video`**: la
-copia del vídeo, para una petición de música. Dosコピias de un nombre casi
+copia del vídeo, para una petición de música. Dos copias de un nombre casi
 parecido, y el 9B cogió la que no era.
 
 Esa copia además fallaba, por un segundo bug:
@@ -614,3 +614,33 @@ llega al techo sin recorte, así que un master más suave daría más margen.
 - **Evidencia:** heavy jobs run: 0; jobs refused for VRAM: 0; memory reviews: 0; reflections: 0; tool errors: 0; turns finished: 0
 - **Efecto esperado:** I should track and log every tool execution attempt or failure to verify progress, rather than assuming completion through silent zeros.
 - **Cómo comprobarla:** Non-empty lists of executed tools and steps per turn match non-zero counters.
+## Reflexión del 2026-10-05 10:02
+
+### Mejora · Task Refusal without Resource Failure
+*Ámbito:* agent
+*When the user provides a valid request for an action that requires the agent to perform the action, the agent should always execute the action rather than refuse it.*
+- **Evidencia:** Tasks refused for VRAM: 0
+- **Efecto esperado:** The agent should execute tasks even if there is insufficient VRAM, and only refuse when the request is invalid or unsafe.
+- **Cómo comprobarla:** Count the number of tasks refused for VRAM in the logs.
+
+### AJA · No Task Execution
+*Ámbito:* agent
+*There may be an issue with the agent's ability to execute tasks. Tasks run: 0, jobs refused for VRAM: 0, and tool errors: 0, which suggests that the agent is not executing any tasks.*
+- **Evidencia:** Tasks run: 0
+- **Efecto esperado:** The agent should execute tasks as they are requested by the user.
+- **Cómo comprobarla:** Count the number of tasks executed in the logs.
+
+### Mejora · No Tool Use
+*Ámbito:* agent
+*The agent should be using tools to complete tasks, as there are no tool errors reported.*
+- **Evidencia:** Tool errors: 0
+- **Efecto esperado:** The agent should be using tools to complete tasks, as there are no tool errors reported.
+- **Cómo comprobarla:** Count the number of times tools are used in the logs.
+## Reflexión del 2026-10-05 10:16
+
+### Mejora · Auto-reflection after heavy tasks
+*Ámbito:* agent
+*The agent should pause after completing or starting heavy tasks to log findings before proceeding to the next prompt.*
+- **Evidencia:** The user explicitly requests: 'pues aqui tienes un flujo de trabajo que aprender, captura la pantalla y ya sabes cual es, luego usa los input, planificalo si quieres'
+- **Efecto esperado:** After running a command that produces multiple outputs or complex results, the agent pauses, summarizes the outcome, and confirms the plan before continuing.
+- **Cómo comprobarla:** Observe if the agent pauses and summarizes after any command that produces multiple outputs or complex results.

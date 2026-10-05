@@ -8,8 +8,11 @@ down rather than trust.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
+import os
+import sqlite3
 
 import pytest
 
@@ -31,6 +34,7 @@ from minagent.improvement import (
     read_document,
     save_adjustment_log,
 )
+from minagent.memory import MemoryStore
 from tests.test_memory import _FakeOutput, _memory_app
 
 A_HYPOTHESIS = {
@@ -269,6 +273,58 @@ def test_a_corrupt_cooldown_file_does_not_stop_the_agent(tmp_path):
     # Worst case is one extra nudge, which is a far better outcome than refusing
     # to run because a log was damaged.
     assert load_adjustment_log(str(tmp_path)).entries == {}
+
+
+def test_a_run_of_the_wrong_script_welded_to_a_word_is_dropped(tmp_path):
+    """The model does emit tokens in the wrong script, and they are unreadable.
+
+    "Dosコピias" is in MEJORAS.md, committed: two katakana where the "c" of
+    "copias" should be. Nothing distinguishes it from content at a glance, so
+    it is removed at the boundary rather than left for a reader to puzzle over.
+    """
+    append_document(str(tmp_path), "## Una\n\nDosコピias de un nombre casi parecido")
+    text = (tmp_path / "MEJORAS.md").read_text()
+    assert "コピ" not in text
+    assert "Dos" in text and "de un nombre casi parecido" in text
+
+
+def test_quoted_text_in_another_script_survives(tmp_path):
+    """The rule is narrow on purpose: bounded runs are quoting, not corruption."""
+    section = "## Una\n\nun archivo 日本語 con espacios, y otro en 日本語とmixed"
+    append_document(str(tmp_path), section)
+    text = (tmp_path / "MEJORAS.md").read_text()
+    assert "日本語" in text
+    # Bounded by whitespace, so it is content the reader can use.
+    assert "café" not in text  # nothing was invented
+
+
+def test_a_snapshot_restores_a_store_after_a_bad_write(tmp_path):
+    """The safety net that was missing when one statement emptied the table.
+
+    A knowledge base nobody can restore is a log. This is the copy itself: it
+    goes through SQLite's backup API, in the direction that reads backwards -
+    source.backup(target), the method of the database being copied.
+    """
+    store = MemoryStore(str(tmp_path / "memoria.db"))
+    asyncio.run(store.initialize())
+    asyncio.run(store.remember("fact", "La GPU", "NVIDIA GeForce RTX 4060 Laptop GPU"))
+
+    shot = store.snapshot(str(tmp_path / "snapshots"))
+    assert shot and os.path.exists(shot)
+
+    asyncio.run(store.forget(1))
+    restored = sqlite3.connect(shot)
+    assert restored.execute("select count(*) from memories").fetchone()[0] == 1
+    restored.close()
+
+
+def test_snapshots_are_pruned_so_they_are_not_a_leak(tmp_path):
+    store = MemoryStore(str(tmp_path / "memoria.db"))
+    asyncio.run(store.initialize())
+    directory = tmp_path / "snapshots"
+    for _ in range(7):
+        store.snapshot(str(directory), keep=3)
+    assert len(list(directory.glob("memoria-*.db"))) <= 3
 
 
 # ------------------------------------------------------------------- document

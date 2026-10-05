@@ -495,6 +495,28 @@ reflexion lo anade al final y no toca lo que ya esta escrito.
 """
 
 
+#: Scripts that have no business appearing inside a Spanish sentence. A stray
+#: run of one of these glued to a word - "copias" written as "copias" with two
+#: katakana in front - is a token the model emitted in the wrong script, and it
+#: is worse than a typo because a reader cannot tell it from content.
+_STRAY_SCRIPT = re.compile(
+    r"(?<=[A-Za-zÀ-ɏ])([぀-ヿ㐀-鿿豈-﫿Ѐ-ԯ가-힯]+)|"
+    r"([぀-ヿ㐀-鿿豈-﫿Ѐ-ԯ가-힯]+)(?=[A-Za-zÀ-ɏ])"
+)
+
+
+def clean_stray_script(text: str) -> str:
+    """Drop non-Latin runs that are welded inside a Latin word.
+
+    Deliberately narrow. A reflection that legitimately quotes a Japanese
+    filename or a Russian title keeps every character, because those runs are
+    bounded by punctuation or whitespace; only the ones fused to a Latin word,
+    where no author would write them, are removed. Whatever is dropped was not
+    readable content to begin with, so the alternative is not "losing" it.
+    """
+    return _STRAY_SCRIPT.sub("", text)
+
+
 def append_document(application_root: str, section: str) -> str:
     """Add one reflection to the document, creating it with a header if needed.
 
@@ -502,6 +524,9 @@ def append_document(application_root: str, section: str) -> str:
     has not read yet is not one the agent may quietly delete on the next pass.
     """
     if not application_root or not section.strip():
+        return ""
+    section = clean_stray_script(section)
+    if not section.strip():
         return ""
     path = os.path.join(application_root, DOCUMENT_NAME)
     existing = ""
