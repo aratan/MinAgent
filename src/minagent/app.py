@@ -621,6 +621,16 @@ def _as_duration(seconds: float) -> str:
     return f"{value // 3600}h{value % 3600 // 60:02d}m"
 
 
+def _countdown(seconds: float) -> str:
+    """A wait as a countdown reads: ``4m``, ``12s``, and ``now`` at the end.
+
+    ``_as_duration`` would answer "0s" for the moment the gate is about to
+    fire, which is the one second where the reader most wants to be told.
+    """
+    value = int(round(seconds))
+    return "now" if value <= 0 else _as_duration(value)
+
+
 def model_context_hint(model: str) -> int | None:
     """The window a model name states, such as ``8k`` or ``32k``, or ``None``."""
     match = _MODEL_CONTEXT_HINT.search(model or "")
@@ -4714,6 +4724,26 @@ class MinAgent:
             "tools": float(breakdown["tool_tokens"]),
         }
 
+    def _resident_countdown(self) -> str:
+        """How long until the idle loop next looks at the machine.
+
+        The loop makes its decision off-screen, so without this the panel says
+        nothing about a process that is either working or dead. Read from the
+        worker when there is one, and from the configuration when there is not:
+        the panel is printed just before the loop starts, so the first check is
+        one interval away and saying so is true rather than a guess.
+        """
+        worker = self.resident_worker
+        if worker is None:
+            config = self.config
+            if not getattr(config, "improvement_autonomous", False):
+                return "off"
+            return _countdown(float(getattr(config, "improvement_cycle_seconds", 300.0) or 300.0))
+        if not worker.enabled:
+            return "off"
+        remaining = worker.seconds_until_next_check
+        return "starting" if remaining is None else _countdown(remaining)
+
     def print_startup_panel(self) -> None:
         """Print the session header before the first prompt."""
         usage = self._context_usage()
@@ -4749,6 +4779,7 @@ class MinAgent:
                     f"MCP {f'{len(self.mcp_connections.get('tool_lookup', {}))} tools' if self.mcp_enabled else 'Off'}",
                 )
             )
+        rows.append(("Next check", self._resident_countdown()))
         contents = ["Ara · SESSION"] + [f"{label:<10} {value}" for label, value in rows]
         max_inner_width = max(4, self.columns - 4)
         inner_width = min(max_inner_width, max([4] + [terminal_text_width(line) for line in contents]))

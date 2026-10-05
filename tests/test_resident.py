@@ -782,6 +782,34 @@ def test_the_builder_reads_which_signal_opens_the_gate():
     assert build_worker(FakeAgent(), Load()).idle_reader.signal == "load"
 
 
+def test_the_countdown_names_the_next_gate_evaluation():
+    """The gate is invisible by nature, so it has to show its own clock."""
+    now = {"t": 1000.0}
+    built = build_worker(FakeAgent(), FakeConfig(), sleep=Clock())
+    built._clock = lambda: now["t"]
+
+    async def run():
+        task = asyncio.ensure_future(built.run())
+        while not built._next_check_at:
+            await asyncio.sleep(0)
+        # The fixture's interval is sixty seconds, so one second in there are
+        # fifty-nine to go.
+        now["t"] = 1001.0
+        remaining = built.seconds_until_next_check
+        built.stop()
+        await task
+        return remaining
+
+    assert asyncio.run(run()) == 59.0
+    assert built.seconds_until_next_check is None
+
+
+def test_no_countdown_outside_a_run_rather_than_a_zero_that_looks_due():
+    built = build_worker(FakeAgent(), FakeConfig(), sleep=Clock())
+
+    assert built.seconds_until_next_check is None
+
+
 def test_the_builder_reflects_with_a_reason_the_transcript_can_show():
     agent = FakeAgent()
     built = build_worker(agent, FakeConfig(), sleep=Clock())

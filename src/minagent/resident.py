@@ -23,6 +23,7 @@ import asyncio
 import contextlib
 import fcntl
 import os
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -314,18 +315,25 @@ class ResidentWorker:
     #: test or a one-shot run wants; a live loop on a real project must set it.
     lock_path: str = ""
     _lock_handle: Any = None
-    cycle_seconds: float = 900.0
+    cycle_seconds: float = 300.0
     budget: Budget = field(default_factory=Budget)
     idle_reader: IdleReader | None = None
     idle_seconds: float = 120.0
     in_flight: Callable[[], bool] = lambda: False
     sleep: Callable[[float], Awaitable[None]] | None = None
+    #: The clock the countdown is read from. Injected for the same reason
+    #: ``sleep`` is: a test that has to wait five minutes to see "4m59s" is a
+    #: test nobody runs.
+    _clock: Callable[[], float] = time.time
     cycles: list[Cycle] = field(default_factory=list)
     outcome: str = ""
     detail: str = ""
     skipped_idle: int = 0
     skipped_in_flight: int = 0
     last_gate: IdleState | None = None
+    #: When the loop next looks at the machine. ``None`` outside a run, and
+    #: during a cycle, where there is nothing to wait for.
+    _next_check_at: float | None = field(default=None, repr=False)
     _stop: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
     def stop(self) -> None:
@@ -341,6 +349,21 @@ class ResidentWorker:
     @property
     def stopped(self) -> bool:
         return self._stop.is_set()
+
+    @property
+    def seconds_until_next_check(self) -> float | None:
+        """How long until the loop next asks whether the machine is free.
+
+        The gate is invisible from a terminal by nature: it is a decision made
+        every few minutes about a machine nobody is looking at, so the only way
+        to tell a working loop from a dead one is to show the clock. ``None``
+        while a cycle is running or before the loop has started, because
+        reporting zero there would look like a gate about to fire when what is
+        actually true is that one already did.
+        """
+        if self._next_check_at is None:
+            return None
+        return max(0.0, self._next_check_at - self._clock())
 
     def summary(self) -> str:
         """One line a transcript can show, answering 'why did it not run?'."""
@@ -413,8 +436,10 @@ class ResidentWorker:
             if not self.budget.can_start_cycle():
                 self.outcome, self.detail = EXHAUSTED, _exhausted_detail(self.budget)
                 break
+            self._next_check_at = self._clock() + self.cycle_seconds
 
             await self._wait(self.cycle_seconds)
+            self._next_check_at = None
             if self.stopped:
                 break
 
@@ -570,7 +595,7 @@ def build_worker(
         # that names no project gets no lock rather than a lock on whatever
         # directory it happened to be started in.
         lock_path=os.path.join(application_root, ".minagent", LOCK_FILENAME) if application_root else "",
-        cycle_seconds=float(getattr(config, "improvement_cycle_seconds", 900.0) or 900.0),
+        cycle_seconds=float(getattr(config, "improvement_cycle_seconds", 300.0) or 300.0),
         budget=_budget_from(config),
         idle_reader=idle_reader or IdleReader(
             cache_seconds=30.0,

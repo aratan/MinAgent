@@ -562,7 +562,7 @@ def load_configuration(
             environment.get("IMPROVEMENT_IDLE_SIGNAL"), "IMPROVEMENT_IDLE_SIGNAL", "logind"
         ),
         improvement_cycle_seconds=parse_positive_integer(
-            environment.get("IMPROVEMENT_CYCLE_SECONDS"), "IMPROVEMENT_CYCLE_SECONDS", 900
+            environment.get("IMPROVEMENT_CYCLE_SECONDS"), "IMPROVEMENT_CYCLE_SECONDS", 300
         ),
         improvement_max_cycles=parse_positive_integer(
             environment.get("IMPROVEMENT_MAX_CYCLES"), "IMPROVEMENT_MAX_CYCLES", 4
