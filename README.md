@@ -628,6 +628,14 @@ any MCP client generates under the same VRAM budget rather than a second, diverg
 uv run pytest
 ```
 
+And a separate review for code nothing calls:
+
+```bash
+uv run python scripts/review_dead_code.py
+```
+
+It runs `vulture` over the package **and** the tests, because a function only the tests call is not dead code. Findings are split in two: framework callbacks and settings read through a name built at runtime are listed in an allowlist in the script, each with the reason, and everything else exits non-zero. The allowlist is not a mute button - it names `handle_starttag` as an `HTMLParser` callback and `improvement_min_runs` as read via `_improvement_count()`, so adding a name to it means saying why.
+
 The tests use `pytest` and `pytest-asyncio` and cover workspace files and their safety checks, attachments, context chunking, streaming responses, tool rounds, skill discovery and authoring, the injected host clock, the startup prompt-overhead warning, and no-access recovery, terminal approval and timeouts, the editor, terminal rendering, a local MCP HTTP server, a streaming endpoint that answers a clock question by running `date`, the persistent memory store, its tools, its prompt hints, and its automatic experience capture, and the Ollama-backed web search and fetch client against a mock HTTP transport.
 
 Two of them check against something outside this repository, because a wrong answer there is invisible from the inside. The keyboard table is compared with `/usr/include/linux/input-event-codes.h`, the header the running kernel itself uses: a letter keycode that is wrong still presses *something*, so nothing in a unit test would notice. And the voice backend is run as a subprocess with an empty `PATH`, to keep the diagnosis it prints when `whisper.cpp` is missing honest about how to install it.

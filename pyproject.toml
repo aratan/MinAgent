@@ -36,6 +36,10 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.6",
     "mypy>=1.11",
+    # Finds what nothing calls. scripts/review_dead_code.py runs it with the
+    # allowlist of framework callbacks that static analysis cannot see, so a
+    # clean run means something rather than "you have an HTML parser".
+    "vulture>=2.16",
 ]
 
 [build-system]
