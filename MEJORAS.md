@@ -606,3 +606,11 @@ llega al techo sin recorte, así que un master más suave daría más margen.
 - **Evidencia:** Tool error: 'No tengo permisos para ver el sistema de archivos en esta respuesta...' after using grim/wmgrip. User correction: 'olvida grim + wmgrip esta mal usa spectacle'.
 - **Efecto esperado:** The agent will check the display server (Wayland/X11) and use `spectacle` for capturing images on Wayland systems.
 - **Cómo comprobarla:** Attempt to capture a screenshot in a future session; it should succeed without permission errors using `spectacle`.
+## Reflexión del 2026-10-05 01:46
+
+### Mejora · Empty Execution Tracking Traps
+*Ámbito:* agent
+*All recorded metrics are zero, indicating the agent never reached state where tools execute, memory reviews, or reflections occur.*
+- **Evidencia:** heavy jobs run: 0; jobs refused for VRAM: 0; memory reviews: 0; reflections: 0; tool errors: 0; turns finished: 0
+- **Efecto esperado:** I should track and log every tool execution attempt or failure to verify progress, rather than assuming completion through silent zeros.
+- **Cómo comprobarla:** Non-empty lists of executed tools and steps per turn match non-zero counters.
