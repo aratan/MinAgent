@@ -62,6 +62,11 @@ async def _run_resident() -> int:
         )
         return 1
 
+    # The journal is the only place a service's reader can look. Without this the
+    # loop is silent for the whole night and "active" says nothing about whether
+    # a single cycle ran, let alone why one did not.
+    worker.report = lambda message: print(message, file=sys.stderr, flush=True)
+
     # systemd stops a service with SIGTERM, not SIGINT. Without this the loop
     # is killed mid-cycle and the shutdown handler that closes the trial
     # document never runs, leaving a half-written file for the next start.

@@ -290,6 +290,13 @@ class ResidentWorker:
     resident process is expected to outlive the week, so the skips are counted
     rather than listed - an unbounded log in a process that never exits is a
     slow leak that only shows up on the host it has been leaking on.
+
+    The skips are counted, though, and a count nobody can read answers nothing.
+    A resident loop that runs for six hours with no output is indistinguishable
+    from one that spent those six hours asleep, and only one of them is the
+    product working. :attr:`report` is the fix: one line per cycle and one per
+    skipped check, which is one line per interval, and a night's silence then
+    means the machine was busy rather than meaning nothing happened.
     """
 
     reflect: Callable[[], Awaitable[Any]]
@@ -298,6 +305,10 @@ class ResidentWorker:
     #: ask". Kept optional so a host that wants the reflection alone is not made
     #: to supply a research callable it will never use.
     research: Callable[[], Awaitable[str]] | None = None
+    #: Where a human reads the loop. A callable rather than a logger so this
+    #: module keeps no opinion about handlers, and ``None`` so a test that only
+    #: wants the accounting stays silent.
+    report: Callable[[str], None] | None = None
     enabled: bool = True
     #: Where the cross-process lock lives. Empty means no lock, which is what a
     #: test or a one-shot run wants; a live loop on a real project must set it.
@@ -340,6 +351,11 @@ class ResidentWorker:
         if self.cycles:
             return f"ran {len(self.cycles)} cycle(s)"
         return "never ran"
+
+    def _say(self, message: str) -> None:
+        """One line to whoever is watching, if anyone is."""
+        if self.report is not None:
+            self.report(message)
 
     async def _wait(self, seconds: float) -> None:
         """Sleep, but wake up the moment we are asked to stop.
@@ -410,6 +426,7 @@ class ResidentWorker:
                 # machine that stayed busy for a week exhaust the budget
                 # without a single cycle of work.
                 self.skipped_idle += 1
+                self._say(f"skipped: {state.detail or 'the machine is not free'}")
                 continue
 
             if self.in_flight():
@@ -418,6 +435,7 @@ class ResidentWorker:
                 # running. Standing down costs a cycle of delay, which is the
                 # cheapest possible error.
                 self.skipped_in_flight += 1
+                self._say("skipped: a turn of yours was in flight")
                 continue
 
             self.budget.start_cycle()
@@ -502,6 +520,11 @@ class ResidentWorker:
                 self.cycles[-1].detail = (
                     f"{self.cycles[-1].detail}; {notice}" if self.cycles[-1].detail else notice
                 )
+            self._say(
+                f"cycle {self.cycles[-1].index}: {self.cycles[-1].outcome}, "
+                f"{self.cycles[-1].charged} model call(s), "
+                f"{self.cycles[-1].detail or 'nothing to report'}"
+            )
         else:
             self.outcome, self.detail = STOPPED, "stopped on request"
 

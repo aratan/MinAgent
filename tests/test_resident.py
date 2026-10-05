@@ -704,6 +704,43 @@ class FakeAgent:
         return ""
 
 
+def test_the_loop_says_out_loud_what_it_did_and_what_it_skipped():
+    """A resident loop nobody watches has to leave a trace.
+
+    Counted skips are not a report: a service that runs all night with an empty
+    journal is indistinguishable from one that spent the night asleep, and only
+    one of them is the product working. The line per cycle answers "did it run
+    and what did it find"; the line per skip answers "why not", which is the
+    question that has no other answer.
+    """
+    lines: list[str] = []
+    built = build_worker(FakeAgent(), FakeConfig(), sleep=Clock())
+    built.report = lines.append
+    built._gate = lambda: IdleState(IDLE, "logind")
+
+    asyncio.run(built.run())
+
+    assert len(lines) == built.budget.max_cycles
+    assert all(line.startswith(f"cycle {index}:") for index, line in enumerate(lines))
+    assert "nothing to report" in lines[0] or "model call(s)" in lines[0]
+
+
+def test_a_busy_machine_is_reported_rather_than_only_counted():
+    lines: list[str] = []
+    clock = Clock()
+    built = build_worker(FakeAgent(), FakeConfig(), sleep=clock)
+    built.report = lines.append
+    built._gate = lambda: IdleState(BUSY, "logind", 0.0, "logind reports recent user input")
+
+    # A gate that never opens never spends the budget, so the loop only ends
+    # when the test stops it: `drive`, not `run`.
+    asyncio.run(drive(built, clock, 5))
+
+    assert built.cycles == []
+    assert lines
+    assert all(line == "skipped: logind reports recent user input" for line in lines)
+
+
 def test_a_cycle_keeps_what_the_reflection_said():
     """The reflection's answer reaches the cycle that paid for it.
 
