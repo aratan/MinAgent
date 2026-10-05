@@ -787,8 +787,6 @@ class MinAgent:
         self.compacted_summary = ""
         self.workspace_snapshot = ""
         self.agents_context = ""
-        self.agents_file_content = ""
-        self.agents_file_exists = False
         self.workspace_files: list[str] = []
         self.available_skills: list[dict[str, Any]] = []
         self.skill_prompt_context = ""
@@ -809,7 +807,6 @@ class MinAgent:
         self._session_refusals = 0
         self._session_reviews = 0
         self._session_reflections = 0
-        self._session_job_failures = 0
         # The context the tools of this session have spent, which is the cost the
         # agent actually decides. Prompt tokens are deliberately not counted:
         # they mostly track how long the conversation is.
@@ -2199,7 +2196,9 @@ class MinAgent:
         a memory lookup nobody asked for.
         """
         try:
-            rows = await store.recent(limit=12)
+            rows = await store.recent(
+                limit=int(self._improvement_count("lesson_budget", 12)) or 12
+            )
         except (AgentError, OSError, ValueError):
             return []
         lessons: list[Lesson] = []
@@ -4268,8 +4267,6 @@ class MinAgent:
         self.workspace_snapshot = "" if self._minimal_context else inventory["snapshot"]
         self.workspace_files = inventory["files"]
         self.agents_context = "" if self._minimal_context else inventory["agents_context"]
-        self.agents_file_content = inventory["agents_content"]
-        self.agents_file_exists = inventory["agents_exists"]
         self.refresh_system_prompt()
 
     # -------------------------------------------------------------- tools
@@ -5219,7 +5216,6 @@ class MinAgent:
         self._session_refusals = 0
         self._session_reviews = 0
         self._session_reflections = 0
-        self._session_job_failures = 0
         self._window_tool_tokens = 0
         self._window_turns = 0
         # Refusals and failures live on the orchestrator and are never reset by a
@@ -5371,13 +5367,6 @@ class MinAgent:
         if self.context_window <= 0:
             return hint
         return min(self.context_window, hint)
-
-    def fixed_prompt_ratio(self) -> float:
-        """Fraction of the effective window taken by the fixed prompt before any conversation."""
-        window = self.effective_context_window()
-        if window <= 0:
-            return 0.0
-        return self.fixed_context_tokens() / window
 
     def context_window_mismatch_note(self) -> str:
         """Warn when OPENAI_CONTEXT_WINDOW exceeds the known model window, or return ""."""

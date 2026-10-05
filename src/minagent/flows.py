@@ -51,7 +51,6 @@ this is a sign the model is trying to guess a task it should ask about instead.
 """
 
 MAX_FLOW_ARG_CHARS = 40000
-MAX_OBJECTIVE_CHARS = 2000
 MAX_NOTE_CHARS = 300
 MAX_CONDITION_CHARS = 200
 MAX_ARG_DEPTH = 8

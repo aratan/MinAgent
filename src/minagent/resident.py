@@ -28,7 +28,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from .idle import IdleReader, IdleState, should_run
+from .idle import DEFAULT_CPU_THRESHOLD, IdleReader, IdleState, should_run
 
 LOCK_FILENAME = "resident.lock"
 
@@ -114,7 +114,6 @@ EXHAUSTED = "exhausted"
 DISABLED = "disabled"
 ERROR = "error"
 
-FOREVER = float("inf")
 
 
 @dataclass
@@ -257,10 +256,6 @@ class Budget:
     def kill(self) -> None:
         """Refuse every further call. The run is over."""
         self.live = False
-
-    @property
-    def exhausted(self) -> bool:
-        return self.remaining_cycles() == 0 or self.remaining_model_calls() == 0
 
 
 @dataclass
@@ -560,6 +555,11 @@ class ResidentWorker:
     def _gate(self) -> IdleState:
         return should_run(True, self.idle_reader, minimum_idle_seconds=self.idle_seconds)
 
+def _configured(value: float | None, fallback: float) -> float:
+    """A configured number, or the default - without treating 0.0 as unset."""
+    return fallback if value is None else float(value)
+
+
 def _exhausted_detail(budget: Budget) -> str:
     if budget.remaining_cycles() == 0:
         return f"ran {budget.cycles} of {budget.max_cycles} cycles"
@@ -599,6 +599,14 @@ def build_worker(
         budget=_budget_from(config),
         idle_reader=idle_reader or IdleReader(
             cache_seconds=30.0,
+            # Read from the configuration rather than from the reader's own
+            # default: the setting is documented, and a documented setting that
+            # is silently ignored is worse than one that does not exist.
+            threshold=float(
+                _configured(
+                    getattr(config, "improvement_cpu_threshold", None), DEFAULT_CPU_THRESHOLD
+                )
+            ),
             minimum_idle_seconds=float(
                 getattr(config, "improvement_idle_seconds", 120.0) or 120.0
             ),

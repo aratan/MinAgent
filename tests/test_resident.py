@@ -768,6 +768,30 @@ def test_a_cycle_keeps_what_the_reflection_said():
 
 
 
+def test_the_configured_cpu_threshold_reaches_the_gate():
+    """A documented setting that the reader ignored is worse than none.
+
+    The reader carried its own 0.25 and ``build_worker`` never passed the
+    configured value down, so editing ``IMPROVEMENT_CPU_THRESHOLD`` did nothing
+    at all. Zero has to survive too: "idle only when the machine has stopped"
+    is a real setting, and treating 0.0 as unset would quietly undo it.
+    """
+
+    class Threshold(FakeConfig):
+        improvement_cpu_threshold = 0.6
+
+    class Stopped(FakeConfig):
+        improvement_cpu_threshold = 0.0
+
+    class Absent(FakeConfig):
+        improvement_cpu_threshold = None
+
+    assert build_worker(FakeAgent(), Threshold()).idle_reader.threshold == 0.6
+    assert build_worker(FakeAgent(), Stopped()).idle_reader.threshold == 0.0
+    # And a config that never mentioned it still gets a working default.
+    assert build_worker(FakeAgent(), Absent()).idle_reader.threshold > 0
+
+
 def test_the_builder_reads_which_signal_opens_the_gate():
     """A desktop whose session manager never reports idleness needs a way out.
 

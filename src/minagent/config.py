@@ -375,9 +375,6 @@ class Config:
     input_enabled: bool
     senses_enabled: bool
     camera_device: str
-    camera_max_frames: int
-    microphone_device: str
-    microphone_max_seconds: int
     ollama_models_enabled: bool
     ollama_push_enabled: bool
     ollama_models_base_url: str
@@ -611,11 +608,6 @@ def load_configuration(
         input_enabled=parse_boolean_setting(environment.get("INPUT_ENABLED"), "INPUT_ENABLED", False),
         senses_enabled=parse_boolean_setting(environment.get("SENSES_ENABLED"), "SENSES_ENABLED", False),
         camera_device=(environment.get("CAMERA_DEVICE") or "/dev/video0").strip(),
-        camera_max_frames=parse_positive_integer(environment.get("CAMERA_MAX_FRAMES"), "CAMERA_MAX_FRAMES", 8),
-        microphone_device=(environment.get("MICROPHONE_DEVICE") or "").strip(),
-        microphone_max_seconds=parse_positive_integer(
-            environment.get("MICROPHONE_MAX_SECONDS"), "MICROPHONE_MAX_SECONDS", 30
-        ),
         ollama_models_enabled=parse_boolean_setting(
             environment.get("OLLAMA_MODELS_ENABLED"), "OLLAMA_MODELS_ENABLED", False
         ),

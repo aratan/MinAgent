@@ -35,7 +35,6 @@ from __future__ import annotations
 import json
 import os
 import re
-from typing import Any
 
 #: How many questions one curation pass may add to the queue.
 MAX_CURATED_QUESTIONS = 3
@@ -290,19 +289,6 @@ def already_asked(text: str, limit: int = 12) -> str:
     return "\n".join(answered[-limit:])
 
 
-def hat_question(hat: str, subject: str) -> str:
-    """The question one hat would ask about ``subject``, for logs and tests."""
-    for name, _, template in HATS:
-        if name == hat:
-            return template.format(subject=subject)
-    return ""
-
-
 def describe(questions: list[tuple[str, str, str]]) -> str:
     """One line per curated question, for the cycle record."""
     return "; ".join(f"[{hat}] {question}" for hat, question, _ in questions)
-
-
-def as_dicts(questions: list[tuple[str, str, str]]) -> list[dict[str, Any]]:
-    """The same questions as records, for callers that log rather than print."""
-    return [{"hat": hat, "question": question, "why": why} for hat, question, why in questions]

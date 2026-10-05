@@ -57,7 +57,6 @@ STATUS_TOOL_NAME = "compute_status"
 QUEUE_TOOL_NAME = "queue_job"
 RESULT_TOOL_NAME = "compute_result"
 
-COMPUTE_CAPABILITY_NAME = "compute"
 
 DEFAULT_VRAM_TOTAL_MIB = 8188
 """A 4060 Laptop, which is the card this was written against."""
@@ -95,7 +94,6 @@ MAX_AUDIO_BYTES = 100 * 1024 * 1024
 AUDIO_SUFFIXES = {".wav", ".mp3", ".m4a", ".flac", ".ogg", ".opus", ".mp4", ".webm", ".aac", ".aiff"}
 VIDEO_SUFFIXES = {".mp4", ".webm", ".mkv", ".mov", ".avi", ".gif"}
 
-OLLAMA_UNLOAD_MODES = ("off", "ask", "auto")
 """How far the orchestrator may go to evict a resident Ollama model.
 
 ``off`` never touches it. ``ask`` is not implemented here - the decision

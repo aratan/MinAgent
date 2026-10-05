@@ -32,7 +32,6 @@ DEFAULT_MAX_ANSWER_CHARS = 8_000
 """A description longer than this is the model padding, not more information."""
 
 MAX_PROMPT_CHARS = 2_000
-MAX_PATH_CHARS = 1_000
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 """Refuse anything larger; a base64 body that big will time out or blow memory."""
 

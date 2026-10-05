@@ -469,9 +469,6 @@ class EvidenceLedger:
                 return before
         return ""
 
-    def runs_for(self, setting: str, value: str) -> int:
-        return self.arm(setting, value=value).runs()
-
     def to_json(self) -> str:
         import json
 

@@ -281,11 +281,6 @@ def describe_trial(trial: Trial | None) -> str:
     )
 
 
-def trial_to_memory(trial: Trial) -> dict[str, Any]:
-    """The trial as a memory-shaped record, for the log and for tests."""
-    return {"setting": trial.setting, "previous": trial.previous, "proposed": trial.proposed,
-            "verdict": trial.verdict, "kept": trial.kept, "turns": trial.after.turns}
-
 # --- Evidence-backed trials -------------------------------------------------
 # What a single window is judged on. Each case can independently be fine or
 # broken, so a change that fixes one and breaks another shows up as two

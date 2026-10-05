@@ -128,7 +128,6 @@ DUPLICATE_COSINE = 0.80
 # request is made - and that costs nothing, because the measured negatives score
 # zero shared tokens anyway. It is a filter, not a decision: the cosine above
 # still has the final word.
-MIN_CANDIDATE_TOKENS = 1
 
 _QUERY_TOKEN = re.compile(r"[0-9A-Za-z_]{2,}")
 _WORD = re.compile(r"[^a-z0-9]+")

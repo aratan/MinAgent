@@ -120,12 +120,6 @@ class LineEditor:
         """Register a listener for keypresses the prompt has not handled."""
         self._listeners.append(listener)
 
-    def remove_keypress(self, listener: Callable[[str, Any], None]) -> None:
-        """Remove a listener registered with either ``on`` or ``prepend``."""
-        for collection in (self._capture_listeners, self._listeners):
-            if listener in collection:
-                collection.remove(listener)
-
     def on_interrupt(self, callback: Callable[[], None]) -> None:
         """Called when the user presses Ctrl+C."""
         self._on_interrupt = callback

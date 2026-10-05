@@ -318,5 +318,41 @@ async def test_a_pass_without_a_web_client_says_why(tmp_path) -> None:
     assert await app._research_one_question() == "research: no web client configured"
 
 
+async def test_the_configured_lesson_budget_bounds_the_prompt(tmp_path) -> None:
+    """`IMPROVEMENT_LESSON_BUDGET` is read, not just parsed.
+
+    The number of lessons handed to the curation prompt was a literal 12 that
+    the setting never touched, which is the shape of a knob that does nothing.
+    The store is a stub on purpose: what is being checked is the limit the
+    agent asks for, and counting stored memories would only be measuring how
+    many rows happen to survive deduplication.
+    """
+    from minagent.app import MinAgent  # noqa: PLC0415
+
+    asked: list[int] = []
+
+    class _Store:
+        async def recent(self, limit: int = 10) -> list[dict[str, object]]:
+            asked.append(limit)
+            return []
+
+    app = MinAgent(stdout=_FakeOutput())
+    app.application_root = str(tmp_path)
+    app.root_directory = str(tmp_path)
+
+    class _Budget:
+        improvement_lesson_budget = 2
+
+    class _Unset:
+        improvement_lesson_budget = None
+
+    app.config = _Budget()
+    assert await app._recent_lessons(_Store()) == []
+    app.config = _Unset()
+    assert await app._recent_lessons(_Store()) == []
+
+    assert asked == [2, 12]
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))

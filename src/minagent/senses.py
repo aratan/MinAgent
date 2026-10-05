@@ -35,7 +35,6 @@ FFMPEG_BINARY = "ffmpeg"
 DEFAULT_CAMERA_DEVICE = "/dev/video0"
 DEFAULT_TIMEOUT_SECONDS = 60
 DEFAULT_MICROPHONE_SECONDS = 30
-DEFAULT_CAMERA_FRAMES = 8
 
 OUTPUT_DIRNAME = "salida"
 """Where captures land, alongside generated media and downloads."""
@@ -49,7 +48,6 @@ DARK_FRAME_MEAN = 24.0
 SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 """Captured names are built from a timestamp, but the model may add a stem."""
 
-MAX_CAMERA_FRAMES = 32
 MAX_MICROPHONE_SECONDS = 120
 
 
