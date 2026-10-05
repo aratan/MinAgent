@@ -102,6 +102,11 @@ class IdleReader:
     threshold: float = DEFAULT_CPU_THRESHOLD
     minimum_idle_seconds: float = DEFAULT_MIN_IDLE_SECONDS
     cache_seconds: float = DEFAULT_CACHE_SECONDS
+    #: Which signal answers the question. ``logind`` is the default and the
+    #: honest one; ``load`` is the escape hatch for a desktop whose session
+    #: manager never reports idleness at all, where the logind reading is a
+    #: permanent ``False`` and the loop therefore never starts.
+    signal: str = SOURCE_LOGIND
     now: object = time.time
 
     _cached: IdleState | None = None
@@ -113,7 +118,9 @@ class IdleReader:
         moment = float(self.now())  # type: ignore[operator]
         if self._cached is not None and moment - self._cached_at < self.cache_seconds:
             return self._cached
-        state = _read_uncached(moment, self.threshold, self.minimum_idle_seconds)
+        state = _read_uncached(
+            moment, self.threshold, self.minimum_idle_seconds, self.signal == SOURCE_LOGIND
+        )
         if not state.idle:
             # Leaving the running idle clock early is deliberate: the moment the
             # user comes back, the agent owes them the machine immediately, not
@@ -150,8 +157,10 @@ def _apply_minimum(
     )
 
 
-def _read_uncached(moment: float, threshold: float, minimum: float) -> IdleState:
-    hint = _logind_idle_hint()
+def _read_uncached(
+    moment: float, threshold: float, minimum: float, use_logind: bool = True
+) -> IdleState:
+    hint = _logind_idle_hint() if use_logind else None
     if hint is not None:
         if hint:
             return IdleState(IDLE, SOURCE_LOGIND, 0.0, "logind reports no user input")

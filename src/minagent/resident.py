@@ -577,6 +577,7 @@ def build_worker(
             minimum_idle_seconds=float(
                 getattr(config, "improvement_idle_seconds", 120.0) or 120.0
             ),
+            signal=str(getattr(config, "improvement_idle_signal", "logind") or "logind"),
         ),
         idle_seconds=float(getattr(config, "improvement_idle_seconds", 120.0) or 120.0),
         in_flight=lambda: bool(getattr(agent, "_active_request_in_flight", False)),

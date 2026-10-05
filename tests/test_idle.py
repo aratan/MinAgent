@@ -94,6 +94,32 @@ def test_an_unreadable_session_bus_falls_back_to_load(monkeypatch):
     assert state.state == IDLE
 
 
+def test_the_load_signal_ignores_logind_entirely(monkeypatch):
+    """The escape hatch has to be a real switch, not a fallback.
+
+    logind is consulted first and believed absolutely, so a desktop whose
+    session manager reports `False` forever pins the answer there no matter what
+    the scheduler says. Choosing `load` means the session manager is not asked
+    at all - and it must be visible that it was not asked, since the only symptom
+    of getting this wrong is a loop that never runs.
+    """
+    asked = []
+
+    def spy(command):
+        asked.append(command)
+        return SESSIONS
+
+    monkeypatch.setattr(idle, "_run", spy)
+    monkeypatch.setattr(idle, "_normalised_load", lambda: 0.02)
+
+    reader = IdleReader(cache_seconds=0.0, minimum_idle_seconds=0.0, signal=SOURCE_LOAD)
+    state = reader.read()
+
+    assert state.source == SOURCE_LOAD
+    assert state.state == IDLE
+    assert asked == []
+
+
 # --- Failing closed ----------------------------------------------------------
 
 

@@ -48,6 +48,10 @@ _ASSIGNMENT = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
 _POSITIVE_INTEGER = re.compile(r"^\d+$")
 _DIRECTORY_ENTRY_LIMIT = re.compile(r"^-?\d+$")
 _RATIO = re.compile(r"^\d*\.?\d+$")
+
+#: The signals that may open the improvement loop's idle gate. See
+#: :func:`parse_idle_signal`.
+IDLE_SIGNALS = frozenset({"logind", "load"})
 # Anchored at both ends so "0.5 seconds" or a trailing comment is refused rather
 # than silently parsed as 0.5 - a settings file edited by hand fails loudly or it
 # is not worth editing by hand.
@@ -164,6 +168,27 @@ def parse_approval_mode(value: str | None, name: str, fallback: str) -> str:
     if normalized in ("auto", "ask", "off"):
         return normalized
     raise AgentError(f"{name} must be lowercase: auto, ask, or off.")
+
+
+def parse_idle_signal(value: str | None, name: str, fallback: str) -> str:
+    """Parse which signal answers "is anyone at the machine".
+
+    ``logind`` asks the session manager, which knows about keyboard and mouse
+    activity no load average ever will. ``load`` asks the scheduler instead,
+    which is a worse question but the only one that works on a desktop whose
+    session manager never reports idleness at all - where the logind reading is
+    a permanent ``False`` and the improvement loop never starts.
+
+    Rejecting anything else matters more than usual here: a typo would otherwise
+    be read as "not a known signal", and the only safe thing to do with that is
+    refuse the setting rather than quietly choose.
+    """
+    normalized = (value or "").strip()
+    if not normalized:
+        return fallback
+    if normalized in IDLE_SIGNALS:
+        return normalized
+    raise AgentError(f"{name} must be one of: {', '.join(sorted(IDLE_SIGNALS))}.")
 
 
 def parse_ratio_setting(value: str | None, name: str, fallback: float) -> float:
@@ -324,6 +349,8 @@ class Config:
     # can decide it is finished while still making things worse.
     improvement_autonomous: bool
     improvement_idle_seconds: int
+    # Which signal opens the gate. See ``parse_idle_signal``.
+    improvement_idle_signal: str
     improvement_cycle_seconds: int
     improvement_max_cycles: int
     improvement_model_calls_per_cycle: int
@@ -530,6 +557,9 @@ def load_configuration(
         ),
         improvement_idle_seconds=parse_positive_integer(
             environment.get("IMPROVEMENT_IDLE_SECONDS"), "IMPROVEMENT_IDLE_SECONDS", 120
+        ),
+        improvement_idle_signal=parse_idle_signal(
+            environment.get("IMPROVEMENT_IDLE_SIGNAL"), "IMPROVEMENT_IDLE_SIGNAL", "logind"
         ),
         improvement_cycle_seconds=parse_positive_integer(
             environment.get("IMPROVEMENT_CYCLE_SECONDS"), "IMPROVEMENT_CYCLE_SECONDS", 900

@@ -768,6 +768,20 @@ def test_a_cycle_keeps_what_the_reflection_said():
 
 
 
+def test_the_builder_reads_which_signal_opens_the_gate():
+    """A desktop whose session manager never reports idleness needs a way out.
+
+    logind is right by default and wrong forever on such a machine, so the
+    setting is a real switch rather than a tuning knob, and it has to reach the
+    reader the builder creates.
+    """
+    class Load(FakeConfig):
+        improvement_idle_signal = "load"
+
+    assert build_worker(FakeAgent(), FakeConfig()).idle_reader.signal == "logind"
+    assert build_worker(FakeAgent(), Load()).idle_reader.signal == "load"
+
+
 def test_the_builder_reflects_with_a_reason_the_transcript_can_show():
     agent = FakeAgent()
     built = build_worker(agent, FakeConfig(), sleep=Clock())
